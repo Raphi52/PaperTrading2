@@ -153,11 +153,17 @@ function renderEngine(st) {
   const dot = $("#engine-dot");
   dot.className = "dot " + (st.last_error ? "err" : st.busy ? "busy" : st.running ? "on" : "");
   const last = st.last_tick ? new Date(st.last_tick).toLocaleTimeString("fr-FR") : "jamais";
-  $("#engine-text").textContent = st.running
+  $("#engine-text").textContent = st.elsewhere
+    ? "Mode direct assuré par une autre fenêtre · affichage seul"
+    : st.running
     ? (st.busy ? "Mode direct : passage en cours…" : `Mode direct actif · dernier passage ${last}`)
     : "Mode direct arrêté";
-  $("#engine-text").title = st.last_error || "";
+  $("#engine-text").title = st.elsewhere
+    ? "Une autre fenêtre de PaperTrading2 fait avancer les portefeuilles. Celle-ci affiche la même base, et prendra le relais si l'autre se ferme."
+    : st.last_error || "";
+  if (st.elsewhere) dot.className = "dot on";
   const btn = $("#engine-toggle");
+  btn.hidden = !!st.elsewhere;
   btn.textContent = st.running ? "Arrêter" : "Démarrer";
   btn.onclick = async () => renderEngine(await call("set_engine_running", { running: !st.running }));
 }

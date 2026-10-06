@@ -98,6 +98,9 @@ impl Store {
     pub fn open(path: impl AsRef<Path>) -> Result<Store> {
         let conn = Connection::open(path.as_ref()).with_context(|| format!("ouverture {}", path.as_ref().display()))?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
+        // Une seconde fenêtre de l'application lit la même base : on attend
+        // qu'une écriture se termine au lieu d'échouer sur « base verrouillée ».
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
         Self::init(conn)
     }
 

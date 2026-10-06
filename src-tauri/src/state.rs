@@ -53,6 +53,9 @@ pub struct EngineStatus {
     pub last_error: Option<String>,
     pub ticks: u64,
     pub bars_processed: u64,
+    /// Une autre fenêtre de l'application fait déjà avancer les portefeuilles :
+    /// celle-ci ne fait qu'afficher, et prendra le relais si l'autre se ferme.
+    pub elsewhere: bool,
 }
 
 /// Historique Fear & Greed et instant de son téléchargement.

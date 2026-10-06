@@ -4,7 +4,9 @@
 //! - un seul processus écrit l'état, dans une base transactionnelle ;
 //! - au redémarrage, les bougies clôturées pendant l'arrêt sont rejouées dans
 //!   l'ordre (l'ancien bot ignorait tout ce qui s'était passé pendant l'arrêt) ;
-//! - le moteur est EXACTEMENT celui du backtest (`Engine::advance`).
+//! - le moteur est EXACTEMENT celui du backtest (`Engine::advance`) ;
+//! - un verrou de fichier garantit qu'une seule instance fait avancer les
+//!   portefeuilles : deux fenêtres ouvertes ne traitent jamais deux fois la même bougie.
 
 use crate::state::AppState;
 use anyhow::Result;
@@ -13,6 +15,8 @@ use pt_core::{External, Timeframe};
 use pt_data::Recent;
 use pt_store::{EquityRow, LivePortfolio};
 use std::collections::{BTreeMap, BTreeSet};
+use std::fs::{File, OpenOptions};
+use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter};
@@ -22,10 +26,34 @@ const WINDOW: usize = 1000;
 /// Un point de courbe de valeur au plus toutes les 5 minutes, sauf nouvelle bougie.
 const EQUITY_EVERY_MS: i64 = 5 * 60_000;
 
+/// Verrou exclusif du mode direct, tenu tant que le fichier rendu est ouvert
+/// (le système le libère aussi si l'application plante). `None` : une autre
+/// instance le détient déjà.
+pub fn acquire_live_lock(path: &Path) -> Option<File> {
+    let file = OpenOptions::new().create(true).write(true).truncate(false).open(path).ok()?;
+    file.try_lock().ok().map(|()| file)
+}
+
 pub async fn run_loop(state: Arc<AppState>, app: AppHandle) {
+    let lock_path = state.data_dir.join("mode-direct.lock");
+    let mut lock: Option<File> = None;
     loop {
+        if lock.is_none() {
+            lock = acquire_live_lock(&lock_path);
+            let elsewhere = lock.is_none();
+            let mut st = state.status.lock().expect("statut");
+            if st.elsewhere != elsewhere {
+                st.elsewhere = elsewhere;
+                let snapshot = st.clone();
+                drop(st);
+                let _ = app.emit("engine-status", snapshot);
+            }
+        }
         let running = state.status.lock().expect("statut").running;
-        if running {
+        if lock.is_none() {
+            // Affichage seul : l'autre instance écrit dans la base, on relit.
+            let _ = app.emit("portfolios-changed", ());
+        } else if running {
             state.status.lock().expect("statut").busy = true;
             let _ = app.emit("engine-status", state.status.lock().expect("statut").clone());
             let started = Instant::now();
@@ -174,6 +202,20 @@ mod tests {
     use super::*;
     use pt_core::{find, CostModel, Engine};
     use pt_store::Store;
+
+    /// Deux instances ouvertes : la seconde n'obtient pas le verrou, puis le
+    /// reprend dès que la première se ferme.
+    #[test]
+    fn only_one_instance_runs_the_live_loop() {
+        let dir = std::env::temp_dir().join(format!("pt2-lock-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mode-direct.lock");
+        let first = acquire_live_lock(&path).expect("première instance");
+        assert!(acquire_live_lock(&path).is_none(), "la seconde instance ne doit pas avancer les portefeuilles");
+        drop(first);
+        assert!(acquire_live_lock(&path).is_some(), "le relais doit être possible après fermeture");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// Passage complet sur le VRAI marché (réseau) : `cargo test -p papertrading2 -- --ignored`.
     /// Le départ est volontairement antidaté de 10 jours pour que le moteur ait des bougies à traiter.
