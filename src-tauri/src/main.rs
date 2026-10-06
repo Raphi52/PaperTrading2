@@ -38,7 +38,6 @@ fn main() {
             commands::delete_portfolio,
             commands::run_backtest,
             commands::run_comparison,
-            commands::run_validation,
             commands::app_info,
         ])
         .run(tauri::generate_context!())

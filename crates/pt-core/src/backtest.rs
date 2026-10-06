@@ -14,6 +14,7 @@ use crate::catalog;
 use crate::engine::{Engine, Feed};
 use crate::portfolio::{ClosedTrade, CostModel};
 use crate::strategy::{External, Preset};
+use crate::validation::{matched_return_pct, rolling_validation, Robustness, RollingConfig, RollingReport};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -71,7 +72,10 @@ pub fn compute_metrics(curve: &[CurvePoint], trades: &[ClosedTrade], tf: Timefra
     let k = tf.bars_per_year().sqrt();
     m.sharpe = if sd > 1e-12 { mean / sd * k } else { 0.0 };
     m.volatility_pct = sd * k * 100.0;
-    m.exposure_pct = curve.iter().map(|p| p.exposure).sum::<f64>() / curve.len() as f64 * 100.0;
+    // Le rendement entre deux points est gagné avec les positions détenues pendant la
+    // bougie du SECOND point : le premier point (avant tout achat) ne compte pas.
+    let held = &curve[1..];
+    m.exposure_pct = held.iter().map(|p| p.exposure).sum::<f64>() / held.len() as f64 * 100.0;
 
     m.trades = trades.len();
     if !trades.is_empty() {
@@ -94,17 +98,29 @@ pub fn compute_metrics(curve: &[CurvePoint], trades: &[ClosedTrade], tf: Timefra
     m
 }
 
+/// Verdict d'une stratégie.
+///
+/// « Solide » ne peut sortir QUE d'une validation sur fenêtres glissantes : un
+/// backtest sur une seule période ne distingue pas le talent de la chance. La
+/// comparaison se fait contre « acheter et garder » ramené à la même exposition
+/// (voir `validation`), jamais contre son Sharpe brut, qui favorise les stratégies
+/// peu investies dans les marchés baissiers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Verdict {
     /// La référence elle-même.
     Reference,
-    /// Bat la référence (rendement ajusté du risque) sur toute la période ET hors échantillon.
+    /// Bat un timing au hasard de même exposition, et la validation montre que ce
+    /// n'est pas de la chance, même en comptant toutes les stratégies essayées.
     Solide,
-    /// Ne bat la référence que sur une des deux périodes.
-    Fragile,
-    /// Ne bat pas la référence.
+    /// Significative seule, mais plus une fois comptées toutes les stratégies essayées.
+    Prometteuse,
+    /// Gagne de l'argent, mais rien ne la distingue d'un timing au hasard.
+    Hasard,
+    /// Bat la référence à exposition égale sur la période ; validation pas encore faite.
+    AValider,
+    /// Perd de l'argent, ou fait moins bien qu'un timing au hasard de même exposition.
     Perdante,
-    /// Trop peu de trades pour distinguer la stratégie du hasard.
+    /// Trop peu de trades ou de fenêtres pour juger.
     Insuffisant,
 }
 
@@ -113,9 +129,24 @@ impl Verdict {
         match self {
             Verdict::Reference => "Référence",
             Verdict::Solide => "Solide",
-            Verdict::Fragile => "Fragile",
+            Verdict::Prometteuse => "Prometteuse",
+            Verdict::Hasard => "Indiscernable du hasard",
+            Verdict::AValider => "À valider",
             Verdict::Perdante => "Perdante",
-            Verdict::Insuffisant => "Trop peu de trades",
+            Verdict::Insuffisant => "Trop peu de données",
+        }
+    }
+
+    /// Ordre de classement : le plus convaincant d'abord.
+    pub fn rank(&self) -> u8 {
+        match self {
+            Verdict::Solide => 0,
+            Verdict::Prometteuse => 1,
+            Verdict::Reference => 2,
+            Verdict::AValider => 3,
+            Verdict::Hasard => 4,
+            Verdict::Perdante => 5,
+            Verdict::Insuffisant => 6,
         }
     }
 }
@@ -140,6 +171,12 @@ pub struct BacktestReport {
     pub benchmark_oos: Metrics,
     /// Rendement du même backtest sans aucun frais.
     pub gross_return_pct: f64,
+    /// « Acheter et garder » ramené à l'exposition moyenne de la stratégie : (1 + R)^f − 1.
+    pub matched_return_pct: f64,
+    /// Validation sur fenêtres glissantes, quand elle a été demandée et a pu se faire.
+    pub validation: Option<RollingReport>,
+    /// Pourquoi la validation demandée n'a pas pu se faire.
+    pub validation_error: Option<String>,
     pub verdict: Verdict,
     pub verdict_reason: String,
     pub curve: Vec<CurvePoint>,
@@ -238,8 +275,9 @@ pub fn backtest(
     let oos = compute_metrics(segment(&curve, split), &oos_trades, tf);
     let benchmark_oos = compute_metrics(segment(&bench.curve, split), &[], tf);
     let gross_return_pct = gross.curve.last().map(|p| (p.equity / initial_cash - 1.0) * 100.0).unwrap_or(0.0);
+    let matched_return_pct = matched_return_pct(benchmark.total_return_pct, metrics.exposure_pct / 100.0);
 
-    let (verdict, verdict_reason) = judge(preset, &metrics, &benchmark, &oos, &benchmark_oos);
+    let (verdict, verdict_reason) = judge(preset, &metrics, &benchmark, None);
     debug_assert!(main.engine.portfolio.check_invariants().is_ok());
 
     Ok(BacktestReport {
@@ -257,6 +295,9 @@ pub fn backtest(
         oos,
         benchmark_oos,
         gross_return_pct,
+        matched_return_pct,
+        validation: None,
+        validation_error: None,
         verdict,
         verdict_reason,
         curve,
@@ -265,48 +306,112 @@ pub fn backtest(
     })
 }
 
+/// Juge une stratégie : sur la période affichée contre la référence à exposition
+/// égale, puis — si elle a été faite — d'après la validation sur fenêtres glissantes.
+/// Sans validation, le meilleur verdict possible est « À valider ».
 pub fn judge(
     preset: &Preset,
     full: &Metrics,
     bench: &Metrics,
-    oos: &Metrics,
-    bench_oos: &Metrics,
+    validation: Option<&RollingReport>,
 ) -> (Verdict, String) {
     if preset.is_benchmark() {
         return (Verdict::Reference, "C'est la référence.".into());
     }
-    if full.trades < MIN_TRADES_FOR_VERDICT {
-        return (
-            Verdict::Insuffisant,
-            format!(
-                "{} trades seulement : il en faut au moins {MIN_TRADES_FOR_VERDICT} pour écarter le hasard.",
-                full.trades
-            ),
-        );
-    }
-    let beats_full = full.sharpe > bench.sharpe;
-    let beats_oos = oos.sharpe > bench_oos.sharpe && oos.total_return_pct > 0.0;
-    // Une stratégie qui perd de l'argent, ou dont les gains ne couvrent pas les
-    // pertes, est perdante quel que soit son comportement sur un sous-segment.
-    let makes_money = full.total_return_pct > 0.0 && full.profit_factor.is_none_or(|p| p > 1.0);
-    let pf_strong = full.profit_factor.is_none_or(|p| p > 1.1);
-    let v = if !makes_money || (!beats_full && !beats_oos) {
-        Verdict::Perdante
-    } else if beats_full && beats_oos && pf_strong {
-        Verdict::Solide
-    } else {
-        Verdict::Fragile
-    };
-    let reason = format!(
-        "Sharpe {:.2} contre {:.2} pour la référence sur toute la période ; {:.2} contre {:.2} hors échantillon (rendement {:+.1} %). Facteur de profit {}.",
-        full.sharpe,
-        bench.sharpe,
-        oos.sharpe,
-        bench_oos.sharpe,
-        oos.total_return_pct,
-        full.profit_factor.map(|p| format!("{p:.2}")).unwrap_or_else(|| "sans perte".into())
+    let f = full.exposure_pct / 100.0;
+    let matched = matched_return_pct(bench.total_return_pct, f);
+    let pf_text = full.profit_factor.map(|p| format!("{p:.2}")).unwrap_or_else(|| "sans perte".into());
+    let period = format!(
+        "Sur la période : {:+.1} % contre {:+.1} % pour un achat au hasard investi {:.0} % du temps (« acheter et garder » : {:+.1} %). Facteur de profit {pf_text}.",
+        full.total_return_pct,
+        matched,
+        f * 100.0,
+        bench.total_return_pct,
     );
-    (v, reason)
+    // Perd de l'argent, gains qui ne couvrent pas les pertes, ou moins bien qu'un
+    // timing au hasard de même exposition.
+    let period_fails = full.total_return_pct <= 0.0
+        || full.profit_factor.is_some_and(|p| p <= 1.0)
+        || full.total_return_pct <= matched;
+    match validation {
+        None => {
+            if full.trades < MIN_TRADES_FOR_VERDICT {
+                let why = format!(
+                    "{} trades seulement : il en faut au moins {MIN_TRADES_FOR_VERDICT} pour juger.",
+                    full.trades
+                );
+                (Verdict::Insuffisant, format!("{why} {period}"))
+            } else if period_fails {
+                (Verdict::Perdante, period)
+            } else {
+                (
+                    Verdict::AValider,
+                    format!("{period} Un seul historique ne distingue pas le talent de la chance : lance la validation sur fenêtres glissantes."),
+                )
+            }
+        }
+        Some(v) => {
+            // Perdre la majorité des fenêtres contre le hasard, c'est faire moins bien
+            // que le hasard : perdante, même si la période affichée finit en gain.
+            let loses_most_windows = v.sign_test.losses > v.sign_test.wins;
+            let verdict = match v.verdict {
+                Robustness::PasDeLaChance => Verdict::Solide,
+                Robustness::Prometteuse => Verdict::Prometteuse,
+                Robustness::TropPeuDeFenetres => Verdict::Insuffisant,
+                Robustness::CompatibleAvecLaChance if period_fails || loses_most_windows => Verdict::Perdante,
+                Robustness::CompatibleAvecLaChance => Verdict::Hasard,
+            };
+            (verdict, format!("{} {period}", v.verdict_reason))
+        }
+    }
+}
+
+/// Bougies postérieures ou égales à `start`, pour chaque symbole.
+pub fn since(series: &BTreeMap<String, Vec<Candle>>, start: i64) -> BTreeMap<String, Vec<Candle>> {
+    series.iter().map(|(s, c)| (s.clone(), c[c.partition_point(|x| x.open_time < start)..].to_vec())).collect()
+}
+
+/// Réglages d'une évaluation complète.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct EvalSettings {
+    pub costs: CostModel,
+    pub initial_cash: f64,
+    /// Part finale de la période affichée gardée hors échantillon (informatif).
+    pub oos_fraction: f64,
+    /// Début de la période affichée.
+    pub period_start: i64,
+    /// Validation sur fenêtres glissantes ; sans elle, le verdict plafonne à « À valider ».
+    pub rolling: Option<RollingConfig>,
+}
+
+/// Ce qui est montré à l'utilisateur ET ce qui décide du verdict : un backtest sur la
+/// période affichée (depuis `period_start`), plus, si `rolling` est fourni, une
+/// validation sur fenêtres glissantes sur TOUT l'historique fourni.
+pub fn evaluate(
+    preset: &Preset,
+    history: &BTreeMap<String, Vec<Candle>>,
+    ext: &External,
+    s: EvalSettings,
+) -> Result<BacktestReport, BacktestError> {
+    let costs = s.costs;
+    let period = since(history, s.period_start);
+    let mut report = backtest(preset, &period, ext, costs, s.initial_cash, s.oos_fraction)?;
+    if preset.is_benchmark() {
+        return Ok(report);
+    }
+    if let Some(cfg) = s.rolling {
+        match rolling_validation(preset, history, ext, costs, cfg) {
+            Ok(v) => report.validation = Some(v),
+            Err(e) => report.validation_error = Some(e.to_string()),
+        }
+        let (verdict, mut reason) = judge(preset, &report.metrics, &report.benchmark, report.validation.as_ref());
+        if let Some(e) = &report.validation_error {
+            reason = format!("Validation impossible : {e}. {reason}");
+        }
+        report.verdict = verdict;
+        report.verdict_reason = reason;
+    }
+    Ok(report)
 }
 
 #[cfg(test)]
@@ -370,30 +475,142 @@ mod tests {
         let expected = qty * c.last().unwrap().close;
         assert!((rep.metrics.final_equity - expected).abs() < 1e-6, "{} vs {}", rep.metrics.final_equity, expected);
         assert_eq!(rep.verdict, Verdict::Reference);
+        // La référence est investie en permanence : exposition 100 %, et la
+        // référence à exposition égale est donc la référence elle-même.
+        assert!((rep.metrics.exposure_pct - 100.0).abs() < 1e-9, "{}", rep.metrics.exposure_pct);
+        assert!((rep.matched_return_pct - rep.benchmark.total_return_pct).abs() < 1e-9);
+    }
+
+    fn mk(ret: f64, sharpe: f64, pf: Option<f64>, exposure_pct: f64) -> Metrics {
+        Metrics { total_return_pct: ret, sharpe, trades: 100, profit_factor: pf, exposure_pct, ..Metrics::default() }
+    }
+
+    fn rolling(verdict: Robustness) -> RollingReport {
+        RollingReport {
+            preset_id: "x".into(),
+            preset_name: "x".into(),
+            timeframe: Timeframe::D1,
+            config: RollingConfig::default(),
+            costs: CostModel::default(),
+            windows: vec![],
+            stride: 2,
+            sign_test: crate::validation::SignTest { phase: 0, wins: 0, losses: 0, ties: 0, p_value: 1.0 },
+            p_adjusted: 1.0,
+            positive_windows: 0,
+            beats_benchmark_sharpe: 0,
+            median_excess_pct: 0.0,
+            worst_return_pct: 0.0,
+            worst_benchmark_return_pct: 0.0,
+            verdict,
+            verdict_reason: "validation".into(),
+        }
+    }
+
+    /// Un seul historique ne peut JAMAIS rendre « Solide » : c'était le défaut du
+    /// premier comparateur, qui classait « Solide » ce que la validation a ensuite
+    /// montré compatible avec la chance.
+    #[test]
+    fn a_single_period_can_never_be_solide() {
+        let p = catalog::find("macd_1d").unwrap();
+        let bench = mk(94.0, 0.71, None, 100.0);
+        let (v, reason) = judge(&p, &mk(35.0, 0.87, Some(1.6), 15.0), &bench, None);
+        assert_eq!(v, Verdict::AValider);
+        assert!(reason.contains("validation"), "{reason}");
+    }
+
+    /// Le biais corrigé : en marché haussier, une stratégie peu investie qui gagne
+    /// moins qu'un achat au hasard de même exposition est perdante, même si son
+    /// Sharpe dépasse celui d'« acheter et garder ».
+    #[test]
+    fn judged_against_the_same_exposure_not_the_raw_sharpe() {
+        let p = catalog::find("stoch_rsi_4h").unwrap();
+        let bench = mk(100.0, 0.7, None, 100.0);
+        // 30 % investi quand la référence double : un achat au hasard ferait 2^0,3 − 1 ≈ +23,1 %.
+        let (v, _) = judge(&p, &mk(20.0, 1.2, Some(1.5), 30.0), &bench, None);
+        assert_eq!(v, Verdict::Perdante, "Sharpe meilleur, mais moins bien que le hasard à exposition égale");
+        let (v, _) = judge(&p, &mk(30.0, 1.2, Some(1.5), 30.0), &bench, None);
+        assert_eq!(v, Verdict::AValider);
+        // Perte d'argent, ou gains qui ne couvrent pas les pertes : perdante.
+        let bear = mk(-50.0, -0.8, None, 100.0);
+        assert_eq!(judge(&p, &mk(-3.0, -0.1, Some(0.8), 10.0), &bear, None).0, Verdict::Perdante);
+        assert_eq!(judge(&p, &mk(5.0, 0.8, Some(0.9), 10.0), &bench, None).0, Verdict::Perdante);
     }
 
     #[test]
-    fn a_losing_strategy_is_always_perdante() {
-        let p = catalog::find("stoch_rsi_4h").unwrap();
-        let mk = |ret: f64, sharpe: f64, pf: Option<f64>| Metrics {
-            total_return_pct: ret,
-            sharpe,
-            trades: 100,
-            profit_factor: pf,
-            ..Metrics::default()
-        };
-        let bench = mk(90.0, 0.7, None);
-        let bench_oos = mk(-20.0, -0.2, None);
-        // Perd 38 % au total mais gagne un peu sur la fin : reste perdante.
-        let (v, _) = judge(&p, &mk(-38.0, -0.9, Some(0.8)), &bench, &mk(2.0, 0.1, Some(1.1)), &bench_oos);
-        assert_eq!(v, Verdict::Perdante);
-        // Gagne de l'argent mais avec un facteur de profit < 1 : impossible, donc perdante.
-        let (v, _) = judge(&p, &mk(5.0, 0.8, Some(0.9)), &bench, &mk(2.0, 0.1, Some(1.1)), &bench_oos);
-        assert_eq!(v, Verdict::Perdante);
-        let (v, _) = judge(&p, &mk(40.0, 0.9, Some(1.5)), &bench, &mk(8.0, 0.9, Some(1.5)), &bench_oos);
-        assert_eq!(v, Verdict::Solide);
-        let (v, _) = judge(&p, &mk(40.0, 0.5, Some(1.5)), &bench, &mk(8.0, 0.9, Some(1.5)), &bench_oos);
-        assert_eq!(v, Verdict::Fragile);
+    fn validation_decides_the_verdict() {
+        let p = catalog::find("macd_1d").unwrap();
+        let bench = mk(94.0, 0.71, None, 100.0);
+        let good = mk(35.0, 0.87, Some(1.6), 15.0);
+        let bad = mk(5.0, 0.3, Some(1.2), 15.0); // sous les +10,4 % du hasard à 15 %
+        let cases = [
+            (Robustness::PasDeLaChance, &good, Verdict::Solide),
+            (Robustness::Prometteuse, &good, Verdict::Prometteuse),
+            (Robustness::CompatibleAvecLaChance, &good, Verdict::Hasard),
+            (Robustness::CompatibleAvecLaChance, &bad, Verdict::Perdante),
+            (Robustness::TropPeuDeFenetres, &good, Verdict::Insuffisant),
+        ];
+        for (robustness, m, expected) in cases {
+            let (v, reason) = judge(&p, m, &bench, Some(&rolling(robustness)));
+            assert_eq!(v, expected, "{robustness:?}");
+            assert!(reason.starts_with("validation"), "la raison commence par celle de la validation");
+        }
+        // Finit en gain sur la période, mais perd 10 fenêtres sur 14 contre le hasard
+        // (cas réel du RSI(2) de Connors) : perdante, pas « indiscernable du hasard ».
+        let mut mostly_lost = rolling(Robustness::CompatibleAvecLaChance);
+        mostly_lost.sign_test.wins = 4;
+        mostly_lost.sign_test.losses = 10;
+        assert_eq!(judge(&p, &good, &bench, Some(&mostly_lost)).0, Verdict::Perdante);
+        mostly_lost.sign_test.wins = 9;
+        mostly_lost.sign_test.losses = 8;
+        assert_eq!(judge(&p, &good, &bench, Some(&mostly_lost)).0, Verdict::Hasard);
+    }
+
+    /// Propriété sur tout le catalogue : « Solide » si et seulement si la validation
+    /// conclut « pas un coup de chance » ; jamais sans validation.
+    #[test]
+    fn solide_only_ever_comes_from_the_validation() {
+        let day = 86_400_000;
+        let history: BTreeMap<String, Vec<Candle>> = [7u64, 8]
+            .iter()
+            .map(|s| {
+                let c = synthetic(1500, *s)
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, mut c)| {
+                        c.open_time = i as i64 * day;
+                        c.close_time = c.open_time + day - 1;
+                        c
+                    })
+                    .collect();
+                (format!("S{s}USDT"), c)
+            })
+            .collect();
+        let period_start = 700 * day;
+        let cfg = RollingConfig { window_days: 120, step_days: 60, tested_strategies: 29, initial_cash: 10_000.0 };
+        let costs = CostModel::default();
+        let ext = External::default();
+        for p in catalog::catalog().into_iter().filter(|p| p.timeframe == Timeframe::D1) {
+            let base = EvalSettings { costs, initial_cash: 10_000.0, oos_fraction: 0.3, period_start, rolling: None };
+            let alone = evaluate(&p, &history, &ext, base).unwrap();
+            assert!(
+                matches!(
+                    alone.verdict,
+                    Verdict::AValider | Verdict::Perdante | Verdict::Insuffisant | Verdict::Reference
+                ),
+                "{} : {:?} sans validation",
+                p.id,
+                alone.verdict
+            );
+            let full = evaluate(&p, &history, &ext, EvalSettings { rolling: Some(cfg), ..base }).unwrap();
+            if p.is_benchmark() {
+                assert!(full.validation.is_none());
+                continue;
+            }
+            let v = full.validation.as_ref().expect("validation faite");
+            assert_eq!(full.verdict == Verdict::Solide, v.verdict == Robustness::PasDeLaChance, "{}", p.id);
+            // Le backtest affiché ne dépend pas de la validation.
+            assert_eq!(full.metrics, alone.metrics, "{}", p.id);
+        }
     }
 
     #[test]

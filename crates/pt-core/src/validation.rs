@@ -300,10 +300,16 @@ pub fn run_window(
 ) -> Option<WindowResult> {
     let warmup = preset.warmup();
     // Un symbole entre dans la fenêtre s'il a déjà assez d'historique au départ.
+    // Chaque fenêtre ne garde que `warmup` bougies avant son début : c'est le même
+    // préchauffage que le backtest principal, et cela évite de rejouer tout
+    // l'historique à chaque fenêtre (80 000 bougies par symbole en 1h sur 10 ans).
     let sliced: BTreeMap<String, Vec<Candle>> = series
         .iter()
         .filter(|(_, c)| c.len() > warmup && c[warmup].open_time <= start)
-        .map(|(s, c)| (s.clone(), before(c, end).to_vec()))
+        .map(|(s, c)| {
+            let first = c.partition_point(|x| x.open_time < start).saturating_sub(warmup);
+            (s.clone(), before(c, end)[first..].to_vec())
+        })
         .filter(|(_, c)| c.last().is_some_and(|x| x.open_time >= start))
         .collect();
     if sliced.is_empty() {
@@ -318,10 +324,7 @@ pub fn run_window(
     let tf = preset.timeframe;
     let m = compute_metrics(&strat.curve, &strat.engine.portfolio.closed, tf);
     let b = compute_metrics(&bench.curve, &[], tf);
-    // Le rendement entre deux points est gagné avec les positions détenues pendant
-    // la bougie du SECOND point : le premier point (avant tout achat) ne compte pas.
-    let held = &strat.curve[1..];
-    let exposure = held.iter().map(|p| p.exposure).sum::<f64>() / held.len() as f64;
+    let exposure = m.exposure_pct / 100.0;
     let matched = matched_return_pct(b.total_return_pct, exposure);
     let excess = m.total_return_pct - matched;
     let outcome = if excess.abs() <= TIE_EPSILON_PCT {

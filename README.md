@@ -21,24 +21,33 @@ C'est la réécriture complète de [PaperTrading](https://github.com/Raphi52/Pap
 | Martingale « NO LIMIT », renforcement sans stop | Risque de ruine | Interdit par validation : stop obligatoire, 5 couches max, exposition ≤ 50 % | `catalog_is_consistent` |
 | Taille = % de la trésorerie **restante** | Positions de plus en plus petites, sans lien avec le risque | Taille = risque fixe (1 %) du capital total entre l'entrée et le stop | `engine::entry_notional` |
 | Backtest et bot avec deux logiques différentes | Un backtest ne prédisait rien du bot | Un seul moteur (`Engine::advance`) pour les deux | `live_increments_equal_one_shot_backtest` |
-| Aucune référence fiable, optimisation sur 16 jours | Les « meilleures » stratégies étaient de la chance | Comparaison à « acheter et garder » + période **hors échantillon** + 20 trades minimum | `a_losing_strategy_is_always_perdante` |
+| Aucune référence fiable, optimisation sur 16 jours | Les « meilleures » stratégies étaient de la chance | Barre à battre : un **achat au hasard de même exposition**. Verdict décidé par une **validation sur fenêtres glissantes**, corrigée pour toutes les stratégies essayées | `a_single_period_can_never_be_solide`, `solide_only_ever_comes_from_the_validation` |
+| Comparaison au Sharpe brut d'« acheter et garder » (première version de ce dépôt) | Une stratégie peu investie « gagnait » mécaniquement les marchés baissiers : MACD 1j et Turtle étaient classées « Solides » à tort | Même barre et même validation partout : comparateur, backtest et ligne de commande | `judged_against_the_same_exposure_not_the_raw_sharpe` |
 | Historique tronqué à 500 trades, JSON de 33 Mo partagé entre processus | Rapports et optimiseur sur données partielles | SQLite transactionnelle, exécutions jamais tronquées, état revérifié au chargement | `tampered_state_is_refused`, `roundtrip_keeps_everything` |
 | Glissement aléatoire | Deux backtests identiques donnaient deux résultats | Coûts fixes et documentés | `backtest_is_deterministic_and_consistent` |
 | Clés d'API en clair dans `data/settings.json`, dépôt public | Clés compromises | Aucune clé nécessaire : données publiques seulement | — |
 | Filtre horaire 23h-9h « basé sur l'analyse » de 16 jours | Surajustement | Supprimé | — |
 | Rien ne se passait pendant que le bot était arrêté | Trous dans l'historique | Au redémarrage, les bougies manquées sont rejouées dans l'ordre | `live.rs` (rattrapage) |
 
-## Ce que disent les données (3 ans, frais compris)
+## Ce que disent les données (frais compris)
 
-Mesuré le 6 octobre 2026 sur BTC, ETH, SOL, BNB et XRP. Frais de 0,1 % par côté et glissement de 0,02 %. Les 30 % finaux de la période sont gardés hors échantillon. Tableau complet : [`docs/comparaison-2026-10-06.md`](docs/comparaison-2026-10-06.md).
+Mesuré le 6 octobre 2026 sur BTC, ETH, SOL, BNB et XRP. Frais de 0,1 % par côté et glissement de 0,02 %. Résultats affichés sur 3 ans ; verdicts décidés par la validation sur fenêtres glissantes de fin 2017 à 2026. Tableau complet : [`docs/comparaison-2026-10-06.md`](docs/comparaison-2026-10-06.md).
 
-- **2 stratégies « Solides » sur cette période** : le croisement **MACD journalier** et la cassure **Donchian 55/20 journalière** (« Turtle »). Elles gagnent moins que la référence (+35 % contre +94 %), mais avec une pire baisse de **14 % au lieu de 61 %**. **La validation sur 9 ans ci-dessous montre que ce n'est pas prouvé.**
+| Verdict | Nombre | Stratégies |
+|---|---:|---|
+| **Solide** | **0** | — |
+| Prometteuse | 1 | Cassure Keltner 4h : 13 fenêtres indépendantes gagnées sur 17 (2,5 % seule, 71 % une fois comptées les 29 stratégies) |
+| Indiscernable du hasard | 6 | MACD 1j, Ichimoku 4h, Donchian 20/10 4h, Supertrend 1j, EMA 20/50 4h, Turtle 55/20 1j |
+| Perdante | 22 | dont **toutes** les stratégies 1h |
+
+- **Aucune stratégie du catalogue ne prouve qu'elle fait mieux qu'un achat au hasard investi la même part du temps.** Ce qu'elles apportent, c'est une pire baisse bien plus faible, parce qu'elles sont peu investies.
+- **MACD 1j et Turtle 55/20**, classées « Solides » par la première version du comparateur, sont **indiscernables du hasard** (détail ci-dessous).
 - **Les frais tuent les stratégies rapides.** Le croisement EMA 9/21 en 1h ferait **+171 % sans frais**, mais il tombe à **−45 % avec frais** (2 750 trades). Les stratégies 1h sont toutes perdantes.
 - **Aucune stratégie ne bat « acheter et garder » en rendement brut** sur cette période haussière.
 
 ## Coup de chance ou pas ? Validation sur fenêtres glissantes
 
-Les deux « Solides » ont été rejouées de fin 2017 à juillet 2026, sur des fenêtres de 180 jours décalées de 90 jours (34 fenêtres). Chaque fenêtre repart de zéro. Chaque fenêtre se compare à « acheter et garder » **ramené à la même exposition** : `(1 + R)^f − 1`. C'est ce qu'obtient en moyenne un timing au hasard investi la fraction `f` du temps. Rapport complet : [`docs/validation-2026-10-06.md`](docs/validation-2026-10-06.md).
+Les deux stratégies que la première version du comparateur classait « Solides » ont été rejouées de fin 2017 à juillet 2026, sur des fenêtres de 180 jours décalées de 90 jours (34 fenêtres). Chaque fenêtre repart de zéro. Chaque fenêtre se compare à « acheter et garder » **ramené à la même exposition** : `(1 + R)^f − 1`. C'est ce qu'obtient en moyenne un timing au hasard investi la fraction `f` du temps. Rapport complet : [`docs/validation-2026-10-06.md`](docs/validation-2026-10-06.md).
 
 | Stratégie | Fenêtres indépendantes gagnées | Probabilité à pile ou face | Corrigée pour 29 essais | Verdict |
 |---|---:|---:|---:|---|
@@ -56,7 +65,7 @@ Pourquoi ne pas comparer simplement au Sharpe d'« acheter et garder » ? Parce 
 
 - **Portefeuilles** : suivi en direct sur les prix réels. Chaque portefeuille a sa référence « acheter et garder » démarrée au même instant. Il démarre à la première bougie clôturée après sa création : aucun trade antidaté.
 - **Backtest** : courbe de valeur contre la référence, avec la frontière hors échantillon, les mesures (rendement, pire baisse, Sharpe, facteur de profit), le résultat « sans frais » et tous les trades. Le panneau **« Est-ce un coup de chance ? »** rejoue la stratégie sur des fenêtres glissantes et rend le verdict ci-dessus.
-- **Comparateur** : tout le catalogue d'un coup, classé par verdict.
+- **Comparateur** : tout le catalogue d'un coup, validé sur fenêtres glissantes et classé par verdict : Solide, Prometteuse, Indiscernable du hasard, Perdante. Environ 1 minute une fois l'historique en cache.
 - **Stratégies** : ce que chaque stratégie calcule, ses sorties et sa taille de position.
 - **Réglages** : frais, glissement, capital par défaut, part hors échantillon.
 
@@ -69,7 +78,7 @@ cargo run -p papertrading2            # l'application de bureau
 cargo test --workspace                # les tests
 cargo run --release -p pt-cli -- presets
 cargo run --release -p pt-cli -- backtest --preset macd_1d --symbols BTCUSDT,ETHUSDT --days 1095
-cargo run --release -p pt-cli -- compare --days 1095 --md rapport.md
+cargo run --release -p pt-cli -- compare --days 1095 --validation-days 3650 --window 180 --step 90 --md rapport.md
 cargo run --release -p pt-cli -- validate --preset macd_1d --preset donchian_55_20_1d --days 3650 --window 180 --step 90 --md validation.md
 ```
 

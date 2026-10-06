@@ -1,9 +1,9 @@
 //! Commandes appelées par l'interface.
 
 use crate::state::{AppState, EngineStatus, Settings};
-use pt_core::backtest::{backtest, BacktestReport, CurvePoint, Metrics, Verdict};
+use pt_core::backtest::{evaluate, BacktestReport, CurvePoint, EvalSettings, Metrics, Verdict};
 use pt_core::portfolio::{ClosedTrade, Fill};
-use pt_core::validation::{rolling_validation, tested_strategies_in_catalog, RollingConfig, RollingReport};
+use pt_core::validation::{tested_strategies_in_catalog, RollingConfig, RollingReport};
 use pt_core::{catalog as all_presets, find, Engine, External, Preset, Timeframe};
 use pt_data::HistoryCache;
 use pt_store::{EquityRow, LivePortfolio};
@@ -288,12 +288,39 @@ pub fn delete_portfolio(state: St, id: i64) -> Res<()> {
     state.store.lock().expect("base").delete(id).map_err(err)
 }
 
+/// Validation demandée par l'interface ; sans elle, aucun verdict ne dépasse « À valider ».
+#[derive(Debug, Clone, Deserialize)]
+pub struct ValidationParams {
+    /// Historique de la validation, en jours.
+    pub days: i64,
+    pub window_days: i64,
+    pub step_days: i64,
+}
+
+impl ValidationParams {
+    fn config(&self, cash: f64) -> Res<RollingConfig> {
+        if !(365..=3650).contains(&self.days) {
+            return Err("l'historique de validation doit couvrir de 1 à 10 ans".into());
+        }
+        if !(30..=730).contains(&self.window_days) || !(1..=self.window_days).contains(&self.step_days) {
+            return Err("une fenêtre doit durer de 30 à 730 jours, et le décalage ne pas dépasser la fenêtre".into());
+        }
+        Ok(RollingConfig {
+            window_days: self.window_days,
+            step_days: self.step_days,
+            tested_strategies: tested_strategies_in_catalog(),
+            initial_cash: cash,
+        })
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct BacktestRequest {
     pub preset_id: String,
     pub symbols: Vec<String>,
     pub days: i64,
     pub cash: f64,
+    pub validation: Option<ValidationParams>,
 }
 
 async fn load(
@@ -315,45 +342,45 @@ async fn load(
     Ok((series, ext))
 }
 
-#[tauri::command]
-pub async fn run_validation(state: St<'_>, req: ValidationRequest) -> Res<RollingReport> {
-    let preset = find(&req.preset_id).ok_or_else(|| format!("stratégie inconnue : {}", req.preset_id))?;
-    let symbols = clean_symbols(&req.symbols)?;
-    if !(30..=730).contains(&req.window_days) || !(1..=req.window_days).contains(&req.step_days) {
-        return Err("la fenêtre doit durer de 30 à 730 jours, et le pas ne pas dépasser la fenêtre".into());
-    }
-    let costs = state.settings().costs;
-    let (series, ext) = load(&state, &preset, &symbols, req.days).await?;
-    let cfg = RollingConfig {
-        window_days: req.window_days,
-        step_days: req.step_days,
-        tested_strategies: tested_strategies_in_catalog(),
-        initial_cash: req.cash,
-    };
-    // Calcul long (une exécution par fenêtre) : hors du fil qui sert l'interface et le mode direct.
-    tauri::async_runtime::spawn_blocking(move || rolling_validation(&preset, &series, &ext, costs, cfg))
-        .await
-        .map_err(err)?
-        .map_err(err)
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct ValidationRequest {
-    pub preset_id: String,
-    pub symbols: Vec<String>,
-    pub days: i64,
-    pub window_days: i64,
-    pub step_days: i64,
-    pub cash: f64,
+/// Backtest sur la période affichée + validation sur tout l'historique, hors du fil
+/// qui sert l'interface et le mode direct (une exécution par fenêtre : c'est long).
+async fn evaluate_one(
+    state: &AppState,
+    preset: Preset,
+    symbols: &[String],
+    days: i64,
+    cash: f64,
+    validation: Option<&ValidationParams>,
+) -> Res<BacktestReport> {
+    let settings = state.settings();
+    let rolling = validation.map(|v| v.config(cash)).transpose()?;
+    let history_days = validation.map_or(days, |v| days.max(v.days));
+    let (history, ext) = load(state, &preset, symbols, history_days).await?;
+    let period_start = pt_data::now_ms() - days * 86_400_000;
+    tauri::async_runtime::spawn_blocking(move || {
+        evaluate(
+            &preset,
+            &history,
+            &ext,
+            EvalSettings {
+                costs: settings.costs,
+                initial_cash: cash,
+                oos_fraction: settings.oos_fraction,
+                period_start,
+                rolling,
+            },
+        )
+    })
+    .await
+    .map_err(err)?
+    .map_err(err)
 }
 
 #[tauri::command]
 pub async fn run_backtest(state: St<'_>, req: BacktestRequest) -> Res<BacktestReport> {
     let preset = find(&req.preset_id).ok_or_else(|| format!("stratégie inconnue : {}", req.preset_id))?;
     let symbols = clean_symbols(&req.symbols)?;
-    let settings = state.settings();
-    let (series, ext) = load(&state, &preset, &symbols, req.days).await?;
-    let mut r = backtest(&preset, &series, &ext, settings.costs, req.cash, settings.oos_fraction).map_err(err)?;
+    let mut r = evaluate_one(&state, preset, &symbols, req.days, req.cash, req.validation.as_ref()).await?;
     r.curve = downsample::<CurvePoint>(&r.curve, 1500);
     r.benchmark_curve = downsample::<CurvePoint>(&r.benchmark_curve, 1500);
     Ok(r)
@@ -364,6 +391,7 @@ pub struct CompareRequest {
     pub symbols: Vec<String>,
     pub days: i64,
     pub cash: f64,
+    pub validation: Option<ValidationParams>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -374,13 +402,12 @@ pub struct CompareRow {
     pub timeframe: Timeframe,
     pub start_time: i64,
     pub end_time: i64,
-    pub split_time: i64,
     pub metrics: Metrics,
     pub benchmark: Metrics,
-    pub oos: Metrics,
-    pub benchmark_oos: Metrics,
+    pub matched_return_pct: f64,
     pub gross_return_pct: f64,
     pub fees_paid: f64,
+    pub validation: Option<RollingReport>,
     pub verdict: Verdict,
     pub verdict_label: String,
     pub verdict_reason: String,
@@ -397,18 +424,15 @@ struct Progress {
 #[tauri::command]
 pub async fn run_comparison(app: AppHandle, state: St<'_>, req: CompareRequest) -> Res<Vec<CompareRow>> {
     let symbols = clean_symbols(&req.symbols)?;
-    let settings = state.settings();
+    if let Some(v) = &req.validation {
+        v.config(req.cash)?; // refuse les paramètres invalides avant 30 calculs
+    }
     let presets = all_presets();
     let total = presets.len();
     let mut rows = Vec::new();
     for (i, p) in presets.iter().enumerate() {
         let _ = app.emit("comparison-progress", Progress { done: i, total, current: p.name.clone() });
-        let res = match load(&state, p, &symbols, req.days).await {
-            Ok((series, ext)) => {
-                backtest(p, &series, &ext, settings.costs, req.cash, settings.oos_fraction).map_err(err)
-            }
-            Err(e) => Err(e),
-        };
+        let res = evaluate_one(&state, p.clone(), &symbols, req.days, req.cash, req.validation.as_ref()).await;
         rows.push(match res {
             Ok(r) => CompareRow {
                 preset_id: r.preset_id,
@@ -417,13 +441,15 @@ pub async fn run_comparison(app: AppHandle, state: St<'_>, req: CompareRequest) 
                 timeframe: r.timeframe,
                 start_time: r.start_time,
                 end_time: r.end_time,
-                split_time: r.split_time,
                 metrics: r.metrics,
                 benchmark: r.benchmark,
-                oos: r.oos,
-                benchmark_oos: r.benchmark_oos,
+                matched_return_pct: r.matched_return_pct,
                 gross_return_pct: r.gross_return_pct,
                 fees_paid: r.fees_paid,
+                validation: r.validation.map(|mut v| {
+                    v.windows.clear(); // le détail par fenêtre s'ouvre dans le backtest
+                    v
+                }),
                 verdict_label: r.verdict.label().to_string(),
                 verdict: r.verdict,
                 verdict_reason: r.verdict_reason,
@@ -436,13 +462,12 @@ pub async fn run_comparison(app: AppHandle, state: St<'_>, req: CompareRequest) 
                 timeframe: p.timeframe,
                 start_time: 0,
                 end_time: 0,
-                split_time: 0,
                 metrics: Metrics::default(),
                 benchmark: Metrics::default(),
-                oos: Metrics::default(),
-                benchmark_oos: Metrics::default(),
+                matched_return_pct: 0.0,
                 gross_return_pct: 0.0,
                 fees_paid: 0.0,
+                validation: None,
                 verdict: Verdict::Insuffisant,
                 verdict_label: "Erreur".into(),
                 verdict_reason: e.clone(),

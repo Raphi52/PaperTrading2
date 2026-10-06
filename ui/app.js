@@ -304,6 +304,7 @@ function renderBacktest(r) {
         ${metricRow("Rendement hors échantillon", r.oos.total_return_pct, r.benchmark_oos.total_return_pct, pct, "high")}
         ${metricRow("Volatilité annualisée", m.volatility_pct, b.volatility_pct, pct, "low")}
         ${metricRow("Temps investi", m.exposure_pct, b.exposure_pct, pct)}
+        <tr><td>Achat au hasard, <b>même exposition</b></td><td class="num">${pct(r.matched_return_pct)}</td><td class="num muted">barre à battre</td></tr>
       </table></div>
       <div class="panel"><h2>Trades</h2><table>
         <tr><td>Nombre de trades</td><td class="num">${m.trades}</td></tr>
@@ -317,23 +318,42 @@ function renderBacktest(r) {
       </table></div>
     </div>
     <div class="panel"><h2>Trades clos (${r.trades.length})</h2>${tradesTable([...r.trades].reverse())}</div>`;
+  if (r.validation) renderValidation(r.validation);
+  else if (r.validation_error) $("#val-result").innerHTML = `<div class="notice err" style="margin-top:12px">Validation impossible : ${esc(r.validation_error)}</div>`;
+  else $("#val-result").innerHTML = "";
 }
+const VERDICTS = {
+  Solide: "Solide",
+  Prometteuse: "Prometteuse",
+  Hasard: "Indiscernable du hasard",
+  AValider: "À valider",
+  Perdante: "Perdante",
+  Reference: "Référence",
+  Insuffisant: "Trop peu de données",
+};
 function verdictLabel(v) {
-  return { Solide: "Solide", Fragile: "Fragile", Perdante: "Perdante", Reference: "Référence", Insuffisant: "Trop peu de trades" }[v] || v;
+  return VERDICTS[v] || v;
 }
+// Paramètres de validation lus dans le panneau « Est-ce un coup de chance ? ».
+function validationParams(formSelector = "#val-form") {
+  const f = $(formSelector);
+  return { days: Number(f.vdays.value), window_days: Number(f.window.value), step_days: Number(f.step.value) };
+}
+// Un backtest est TOUJOURS accompagné de sa validation : c'est elle qui décide du verdict.
 async function runBacktest(presetId, symbols, days, cash) {
-  const btn = $("#bt-run");
-  btn.disabled = true;
-  btn.textContent = "Calcul…";
-  $("#bt-result").innerHTML = `<div class="empty">Téléchargement de l'historique (mis en cache après le premier passage) puis calcul…</div>`;
+  const buttons = [$("#bt-run"), $("#val-run")];
+  buttons.forEach((b) => (b.disabled = true));
+  $("#bt-run").textContent = "Calcul…";
+  $("#val-result").innerHTML = "";
+  $("#bt-result").innerHTML = `<div class="empty">Téléchargement de l'historique long (une seule fois, ensuite en cache), backtest de la période, puis une exécution par fenêtre de validation…</div>`;
   try {
-    const r = await call("run_backtest", { req: { preset_id: presetId, symbols, days, cash } });
+    const r = await call("run_backtest", { req: { preset_id: presetId, symbols, days, cash, validation: validationParams() } });
     renderBacktest(r);
   } catch (e) {
     $("#bt-result").innerHTML = `<div class="notice err">${esc(e)}</div>`;
   } finally {
-    btn.disabled = false;
-    btn.textContent = "Lancer";
+    buttons.forEach((b) => (b.disabled = false));
+    $("#bt-run").textContent = "Lancer";
   }
 }
 $("#bt-form").addEventListener("submit", (e) => {
@@ -352,7 +372,7 @@ function openBacktest(presetId, symbols) {
 // ---------- validation sur fenêtres glissantes ----------
 const ROBUSTNESS = {
   PasDeLaChance: { label: "Pas un coup de chance", cls: "Solide" },
-  Prometteuse: { label: "Prometteuse, pas prouvée", cls: "Fragile" },
+  Prometteuse: { label: "Prometteuse, pas prouvée", cls: "Prometteuse" },
   CompatibleAvecLaChance: { label: "Compatible avec la chance", cls: "Perdante" },
   TropPeuDeFenetres: { label: "Trop peu de fenêtres", cls: "Insuffisant" },
 };
@@ -407,60 +427,60 @@ function renderValidation(r) {
         <td><span class="verdict v-${w.outcome === "Win" ? "Solide" : w.outcome === "Loss" ? "Perdante" : "Insuffisant"}">${OUTCOME[w.outcome]}</span></td></tr>`).join("")}
     </table></div></details>`;
 }
-$("#val-form").addEventListener("submit", async (e) => {
+$("#val-form").addEventListener("submit", (e) => {
   e.preventDefault();
-  const f = e.target;
-  const btn = $("#val-run");
-  btn.disabled = true;
-  btn.textContent = "Calcul…";
-  $("#val-result").innerHTML = `<div class="empty" style="margin-top:12px">Téléchargement de l'historique long (une seule fois, ensuite en cache) puis une exécution par fenêtre…</div>`;
-  try {
-    const r = await call("run_validation", { req: {
-      preset_id: $("#bt-preset").value, symbols: btPicker.get(), days: Number(f.days.value),
-      window_days: Number(f.window.value), step_days: Number(f.step.value), cash: Number($("#bt-form").cash.value),
-    } });
-    renderValidation(r);
-  } catch (err) {
-    $("#val-result").innerHTML = `<div class="notice err" style="margin-top:12px">${esc(err)}</div>`;
-  } finally {
-    btn.disabled = false;
-    btn.textContent = "Valider";
-  }
+  const f = $("#bt-form");
+  runBacktest(f.preset.value, btPicker.get(), Number(f.days.value), Number(f.cash.value));
 });
 $("#bt-preset").addEventListener("change", () => ($("#val-result").innerHTML = ""));
-
 // ---------- comparateur ----------
 let cmpPicker;
-const RANK = { Solide: 0, Fragile: 1, Reference: 2, Perdante: 3, Insuffisant: 4 };
+const RANK = { Solide: 0, Prometteuse: 1, Reference: 2, AValider: 3, Hasard: 4, Perdante: 5, Insuffisant: 6 };
+const pAdj = (r) => (r.validation ? r.validation.p_adjusted : 1);
+const pRaw = (r) => (r.validation ? r.validation.sign_test.p_value : 1);
 $("#cmp-form").addEventListener("submit", async (e) => {
   e.preventDefault();
   if (state.comparing) return;
   const f = e.target;
   const symbols = cmpPicker.get();
+  const validation = validationParams("#cmp-form");
   state.comparing = true;
   $("#cmp-run").disabled = true;
   $("#cmp-progress").hidden = false;
   $("#cmp-result").innerHTML = "";
   try {
-    const rows = await call("run_comparison", { req: { symbols, days: Number(f.days.value), cash: Number(f.cash.value) } });
-    rows.sort((a, b) => (RANK[a.verdict] - RANK[b.verdict]) || (b.oos.sharpe - a.oos.sharpe));
+    const rows = await call("run_comparison", { req: { symbols, days: Number(f.days.value), cash: Number(f.cash.value), validation } });
+    rows.sort((a, b) => (RANK[a.verdict] - RANK[b.verdict]) || (pAdj(a) - pAdj(b)) || (pRaw(a) - pRaw(b))
+      || ((b.metrics.total_return_pct - b.matched_return_pct) - (a.metrics.total_return_pct - a.matched_return_pct)));
     const counts = rows.reduce((acc, r) => ((acc[r.verdict] = (acc[r.verdict] || 0) + 1), acc), {});
+    const tested = rows.find((r) => r.validation)?.validation.config.tested_strategies ?? rows.length - 1;
     $("#cmp-result").innerHTML = `<div class="panel">
-      <p><b>${counts.Solide || 0}</b> solide(s), <b>${counts.Fragile || 0}</b> fragile(s), <b>${counts.Perdante || 0}</b> perdante(s), <b>${counts.Insuffisant || 0}</b> sans assez de trades, sur ${rows.length} stratégies. Clique une ligne pour voir son backtest détaillé.</p>
+      <p><b>${counts.Solide || 0}</b> solide(s), <b>${counts.Prometteuse || 0}</b> prometteuse(s), <b>${counts.Hasard || 0}</b> indiscernable(s) du hasard, <b>${counts.Perdante || 0}</b> perdante(s), <b>${counts.Insuffisant || 0}</b> sans assez de données, sur ${rows.length} stratégies. Clique une ligne pour voir son backtest et ses fenêtres.</p>
       <div class="table-wrap" style="max-height:none"><table>
-      <tr><th>Stratégie</th><th>UT</th><th class="num">Trades</th><th class="num">Rendement</th><th class="num">Réf.</th><th class="num">Sharpe</th><th class="num">Réf.</th><th class="num">Sharpe hors éch.</th><th class="num">Réf.</th><th class="num">Pire baisse</th><th class="num">Réf.</th><th class="num">Sans frais</th><th>Verdict</th></tr>
-      ${rows.map((r) => `<tr class="click" data-id="${esc(r.preset_id)}" title="${esc(r.verdict_reason)}">
+      <tr><th>Stratégie</th><th>UT</th><th class="num">Trades</th><th class="num">Rendement</th><th class="num">Acheter-garder</th><th class="num">Expo.</th><th class="num">Hasard à expo. égale</th><th class="num">Pire baisse</th><th class="num">Réf.</th><th class="num">Sans frais</th><th class="num">Fenêtres gagnées</th><th class="num">p corrigé</th><th>Verdict</th></tr>
+      ${rows.map((r) => {
+        const v = r.validation;
+        const won = v ? `${v.sign_test.wins} / ${v.sign_test.wins + v.sign_test.losses}` : "—";
+        const p = v ? `${num(v.p_adjusted * 100, 1)} %` : "—";
+        return `<tr class="click" data-id="${esc(r.preset_id)}" title="${esc(r.verdict_reason)}">
         <td>${esc(r.preset_name)}</td><td>${esc(r.timeframe)}</td><td class="num">${r.error ? "—" : r.metrics.trades}</td>
         <td class="num">${signed(r.metrics.total_return_pct)}</td><td class="num muted">${pct(r.benchmark.total_return_pct)}</td>
-        <td class="num">${num(r.metrics.sharpe, 2)}</td><td class="num muted">${num(r.benchmark.sharpe, 2)}</td>
-        <td class="num">${num(r.oos.sharpe, 2)}</td><td class="num muted">${num(r.benchmark_oos.sharpe, 2)}</td>
+        <td class="num">${num(r.metrics.exposure_pct, 0)} %</td><td class="num">${pct(r.matched_return_pct)}</td>
         <td class="num">${pct(r.metrics.max_drawdown_pct).replace("+", "")}</td><td class="num muted">${pct(r.benchmark.max_drawdown_pct).replace("+", "")}</td>
-        <td class="num">${signed(r.gross_return_pct)}</td>
-        <td><span class="verdict v-${r.error ? "Insuffisant" : r.verdict}">${esc(r.error ? "Erreur" : verdictLabel(r.verdict))}</span></td></tr>`).join("")}
+        <td class="num">${signed(r.gross_return_pct)}</td><td class="num">${won}</td><td class="num">${p}</td>
+        <td><span class="verdict v-${r.error ? "Insuffisant" : r.verdict}">${esc(r.error ? "Erreur" : verdictLabel(r.verdict))}</span></td></tr>`;
+      }).join("")}
       </table></div>
-      <p class="muted small">« Réf. » = acheter et garder les mêmes symboles sur la même période, avec les mêmes frais. La période varie selon l'unité de temps et le préchauffage des indicateurs. « Sans frais » montre ce que la stratégie ferait si le trading était gratuit : l'écart, c'est ce que coûtent les frais.</p>
+      <p class="muted small">« Hasard à expo. égale » : ce qu'un achat au hasard, investi la même part du temps, obtient en moyenne sur la période — c'est la barre à battre, pas « acheter et garder » à 100 %. « Fenêtres gagnées » : fenêtres indépendantes où la stratégie bat cette barre, sur tout l'historique de validation. « p corrigé » : probabilité de faire au moins aussi bien à pile ou face, multipliée par les ${tested} stratégies essayées. « Solide » exige p corrigé &lt; 5 %.</p>
     </div>`;
-    $("#cmp-result").querySelectorAll("tr.click").forEach((tr) => tr.addEventListener("click", () => openBacktest(tr.dataset.id, symbols)));
+    $("#cmp-result").querySelectorAll("tr.click").forEach((tr) => tr.addEventListener("click", () => {
+      const fv = $("#val-form");
+      fv.vdays.value = validation.days;
+      fv.window.value = validation.window_days;
+      fv.step.value = validation.step_days;
+      $("#bt-form").days.value = f.days.value;
+      openBacktest(tr.dataset.id, symbols);
+    }));
   } finally {
     state.comparing = false;
     $("#cmp-run").disabled = false;

@@ -8,7 +8,7 @@
 
 use anyhow::{bail, Result};
 use clap::{Parser, Subcommand};
-use pt_core::backtest::{backtest, BacktestReport, Verdict};
+use pt_core::backtest::{evaluate, BacktestReport, EvalSettings};
 use pt_core::validation::{rolling_validation, tested_strategies_in_catalog, Outcome, RollingConfig, RollingReport};
 use pt_core::{catalog, CostModel, External, Preset, Timeframe};
 use pt_data::{fetch_fear_greed, BinanceClient, HistoryCache};
@@ -44,6 +44,37 @@ struct Common {
     slippage_bps: f64,
     #[arg(long, default_value_t = 10_000.0)]
     cash: f64,
+    /// Historique de la validation sur fenêtres glissantes, en jours.
+    #[arg(long, default_value_t = 3650)]
+    validation_days: i64,
+    /// Durée d'une fenêtre de validation, en jours.
+    #[arg(long, default_value_t = 180)]
+    window: i64,
+    /// Décalage entre deux fenêtres de validation, en jours.
+    #[arg(long, default_value_t = 90)]
+    step: i64,
+    /// Sans validation : plus rapide, mais le verdict ne peut pas dépasser « À valider ».
+    #[arg(long = "sans-validation")]
+    no_validation: bool,
+}
+
+fn rolling_cfg(c: &Common) -> Option<RollingConfig> {
+    (!c.no_validation).then(|| RollingConfig {
+        window_days: c.window,
+        step_days: c.step,
+        tested_strategies: tested_strategies_in_catalog(),
+        initial_cash: c.cash,
+    })
+}
+
+fn settings(c: &Common, period_start: i64) -> EvalSettings {
+    EvalSettings { costs: costs(c), initial_cash: c.cash, oos_fraction: c.oos, period_start, rolling: rolling_cfg(c) }
+}
+
+/// Début de l'historique à charger : la période affichée, ou plus pour la validation.
+fn history_start(c: &Common, now: i64) -> i64 {
+    let days = if c.no_validation { c.days } else { c.days.max(c.validation_days) };
+    now - days * 86_400_000
 }
 
 #[derive(Subcommand)]
@@ -224,48 +255,80 @@ fn print_report(r: &BacktestReport) {
     println!("{:<28}{:>14}", "Facteur de profit", m.profit_factor.map(|p| format!("{p:.2}")).unwrap_or("—".into()));
     println!("{:<28}{:>13.2}%{:>13.2}%", "Gain moyen / perte moyenne", m.avg_win_pct, m.avg_loss_pct);
     println!("{:<28}{:>13.1}%", "Temps investi", m.exposure_pct);
+    println!("{:<28}{:>13.1}%", "Hasard à exposition égale", r.matched_return_pct);
     println!("{:<28}{:>14.2}", "Frais payés", r.fees_paid);
     println!("{:<28}{:>13.1}%", "Rendement sans frais", r.gross_return_pct);
+    if let Some(v) = &r.validation {
+        let t = &v.sign_test;
+        println!(
+            "Validation : {} fenêtres indépendantes gagnées sur {} · probabilité {:.1} % · corrigée {:.1} %",
+            t.wins,
+            t.wins + t.losses,
+            t.p_value * 100.0,
+            v.p_adjusted * 100.0
+        );
+    }
     println!("Verdict : {} — {}", r.verdict.label(), r.verdict_reason);
 }
 
-fn verdict_rank(v: Verdict) -> u8 {
-    match v {
-        Verdict::Solide => 0,
-        Verdict::Fragile => 1,
-        Verdict::Reference => 2,
-        Verdict::Perdante => 3,
-        Verdict::Insuffisant => 4,
-    }
+/// Classement : verdict, puis probabilité corrigée, puis écart avec le hasard.
+fn by_conviction(a: &BacktestReport, b: &BacktestReport) -> std::cmp::Ordering {
+    let p = |r: &BacktestReport| r.validation.as_ref().map_or(1.0, |v| v.p_adjusted);
+    let raw = |r: &BacktestReport| r.validation.as_ref().map_or(1.0, |v| v.sign_test.p_value);
+    let edge = |r: &BacktestReport| r.metrics.total_return_pct - r.matched_return_pct;
+    a.verdict
+        .rank()
+        .cmp(&b.verdict.rank())
+        .then(p(a).total_cmp(&p(b)))
+        .then(raw(a).total_cmp(&raw(b)))
+        .then(edge(b).total_cmp(&edge(a)))
 }
 
 fn markdown(rows: &[BacktestReport], syms: &[String], c: &Common) -> String {
     let mut s = String::new();
     s.push_str(&format!(
-        "# Comparaison du catalogue — {}\n\nFrais {:.2} % par côté, glissement {} pb, {} jours, dernière {:.0} % de la période gardée hors échantillon.\n\n",
+        "# Comparaison du catalogue — {}\n\nFrais {:.2} % par côté, glissement {} pb. Résultats affichés sur {} jours. ",
         syms.join(", "),
         c.fee,
         c.slippage_bps,
         c.days,
-        c.oos * 100.0
     ));
-    s.push_str("| Stratégie | UT | Trades | Rendement | Réf. | Sharpe | Réf. | Sharpe hors éch. | Réf. | Pire baisse | Réf. | Sans frais | Verdict |\n");
+    if c.no_validation {
+        s.push_str("**Sans validation** : aucun verdict ne peut dépasser « À valider ».\n\n");
+    } else {
+        s.push_str(&format!(
+            "Verdict décidé par une validation sur {} jours : fenêtres de {} jours décalées de {} jours, chacune comparée à un achat au hasard de même exposition, test du signe sur fenêtres indépendantes, corrigé pour {} stratégies essayées.\n\n",
+            c.validation_days,
+            c.window,
+            c.step,
+            tested_strategies_in_catalog()
+        ));
+    }
+    s.push_str("« Hasard à expo. égale » = `(1 + R)^f − 1` : ce qu'un achat au hasard, investi la même part du temps `f`, obtient en moyenne quand « acheter et garder » fait `R`.\n\n");
+    s.push_str("| Stratégie | UT | Trades | Rendement | Acheter-garder | Expo. | Hasard à expo. égale | Pire baisse | Réf. | Sans frais | Fenêtres gagnées | p corrigé | Verdict |\n");
     s.push_str("|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|\n");
     for r in rows {
+        let (windows, p_adj) = match &r.validation {
+            Some(v) => (
+                format!("{} / {}", v.sign_test.wins, v.sign_test.wins + v.sign_test.losses),
+                format!("{:.1} %", v.p_adjusted * 100.0),
+            ),
+            None => ("—".into(), "—".into()),
+        };
         s.push_str(&format!(
-            "| {} | {} | {} | {:+.1} % | {:+.1} % | {:.2} | {:.2} | {:.2} | {:.2} | {:.1} % | {:.1} % | {:+.1} % | **{}** |\n",
+            "| {} | {} | {} | {:+.1} % | {:+.1} % | {:.0} % | {:+.1} % | {:.1} % | {:.1} % | {:+.1} % | {} | {} | **{}** |\n",
             r.preset_name,
             r.timeframe,
             r.metrics.trades,
             r.metrics.total_return_pct,
             r.benchmark.total_return_pct,
-            r.metrics.sharpe,
-            r.benchmark.sharpe,
-            r.oos.sharpe,
-            r.benchmark_oos.sharpe,
+            r.metrics.exposure_pct,
+            r.matched_return_pct,
             r.metrics.max_drawdown_pct,
             r.benchmark.max_drawdown_pct,
             r.gross_return_pct,
+            windows,
+            p_adj,
             r.verdict.label()
         ));
     }
@@ -290,9 +353,9 @@ async fn main() -> Result<()> {
         Cmd::Backtest { preset, common, json } => {
             let Some(p) = pt_core::find(&preset) else { bail!("stratégie inconnue : {preset} (voir `pt presets`)") };
             let syms = symbols(&common);
-            let start = now - common.days * 86_400_000;
-            let (series, ext) = loader.get(&p, &syms, start).await?;
-            let r = backtest(&p, &series, &ext, costs(&common), common.cash, common.oos)?;
+            let (history, ext) = loader.get(&p, &syms, history_start(&common, now)).await?;
+            let period_start = now - common.days * 86_400_000;
+            let r = evaluate(&p, &history, &ext, settings(&common, period_start))?;
             print_report(&r);
             if let Some(path) = json {
                 std::fs::write(&path, serde_json::to_string_pretty(&r)?)?;
@@ -301,11 +364,13 @@ async fn main() -> Result<()> {
         }
         Cmd::Compare { common, md } => {
             let syms = symbols(&common);
-            let start = now - common.days * 86_400_000;
+            let start = history_start(&common, now);
+            let period_start = now - common.days * 86_400_000;
             let mut rows = Vec::new();
             for p in catalog() {
-                let (series, ext) = loader.get(&p, &syms, start).await?;
-                match backtest(&p, &series, &ext, costs(&common), common.cash, common.oos) {
+                let (history, ext) = loader.get(&p, &syms, start).await?;
+                let res = evaluate(&p, &history, &ext, settings(&common, period_start));
+                match res {
                     Ok(r) => {
                         eprintln!("  {:<26} {:>8.1} %  {}", p.id, r.metrics.total_return_pct, r.verdict.label());
                         rows.push(r);
@@ -313,11 +378,7 @@ async fn main() -> Result<()> {
                     Err(e) => eprintln!("  {:<26} ignorée : {e}", p.id),
                 }
             }
-            rows.sort_by(|a, b| {
-                verdict_rank(a.verdict)
-                    .cmp(&verdict_rank(b.verdict))
-                    .then(b.oos.sharpe.partial_cmp(&a.oos.sharpe).unwrap_or(std::cmp::Ordering::Equal))
-            });
+            rows.sort_by(by_conviction);
             let text = markdown(&rows, &syms, &common);
             println!("{text}");
             if let Some(path) = md {

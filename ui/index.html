@@ -80,12 +80,12 @@
       <div id="bt-result"></div>
       <div class="panel" id="val-panel">
         <h2>Est-ce un coup de chance ?</h2>
-        <p class="muted small">Rejoue la stratégie choisie ci-dessus, sur les mêmes symboles, dans des fenêtres successives. Chaque fenêtre repart de zéro et se compare à « acheter et garder » <b>ramené à la même exposition</b> : une stratégie investie 20 % du temps doit battre ce qu'un achat au hasard, investi 20 % du temps, obtiendrait en moyenne. Le test ne garde que des fenêtres qui ne se chevauchent pas, et tient compte de toutes les stratégies du catalogue essayées avant de retenir celle-ci.</p>
+        <p class="muted small">C'est cette validation qui décide du verdict ci-dessus, et elle accompagne chaque backtest. La stratégie est rejouée sur les mêmes symboles, dans des fenêtres successives. Chaque fenêtre repart de zéro et se compare à « acheter et garder » <b>ramené à la même exposition</b> : une stratégie investie 20 % du temps doit battre ce qu'un achat au hasard, investi 20 % du temps, obtiendrait en moyenne. Le test ne garde que des fenêtres qui ne se chevauchent pas, et tient compte de toutes les stratégies du catalogue essayées avant de retenir celle-ci.</p>
         <form id="val-form" class="grid-4">
-          <label>Historique (jours)<input name="days" type="number" min="365" max="3650" value="3650"></label>
+          <label>Historique de validation (jours)<input name="vdays" type="number" min="365" max="3650" value="3650"></label>
           <label>Durée d'une fenêtre (jours)<input name="window" type="number" min="30" max="730" value="180"></label>
           <label>Décalage entre fenêtres (jours)<input name="step" type="number" min="1" max="730" value="90"></label>
-          <div class="form-actions"><button type="submit" id="val-run">Valider</button></div>
+          <div class="form-actions"><button type="submit" id="val-run">Revalider avec ces fenêtres</button></div>
         </form>
         <div id="val-result"></div>
       </div>
@@ -96,15 +96,19 @@
       <div class="section-head">
         <div>
           <h1>Comparateur</h1>
-          <p class="muted">Backteste tout le catalogue sur les mêmes symboles et classe les stratégies. <b>Solide</b> = bat « acheter et garder » en rendement ajusté du risque sur toute la période ET hors échantillon, avec au moins 20 trades. Avec 30 stratégies testées, une ou deux peuvent passer par chance : une stratégie « Solide » mérite un suivi en direct, pas une confiance aveugle.</p>
+          <p class="muted">Backteste tout le catalogue sur les mêmes symboles, puis valide chaque stratégie sur des fenêtres glissantes. La barre à battre est un <b>achat au hasard de même exposition</b>, pas « acheter et garder » à 100 %. <b>Solide</b> exige de battre cette barre dans assez de fenêtres indépendantes pour que la chance soit exclue, même en comptant les 29 stratégies essayées en même temps. Un seul historique ne suffit jamais.</p>
         </div>
       </div>
       <form id="cmp-form" class="panel">
         <div class="grid-4">
-          <label>Période (jours)<input name="days" type="number" min="90" max="3650" value="1095"></label>
+          <label>Période affichée (jours)<input name="days" type="number" min="90" max="3650" value="1095"></label>
           <label>Capital (USDT)<input name="cash" type="number" min="100" step="100" value="10000"></label>
           <div></div>
           <div class="form-actions"><button type="submit" id="cmp-run">Tout comparer</button></div>
+          <label>Historique de validation (jours)<input name="vdays" type="number" min="365" max="3650" value="3650"></label>
+          <label>Durée d'une fenêtre (jours)<input name="window" type="number" min="30" max="730" value="180"></label>
+          <label>Décalage entre fenêtres (jours)<input name="step" type="number" min="1" max="730" value="90"></label>
+          <div class="muted small">Premier passage : téléchargement de 10 ans d'historique (quelques minutes), ensuite en cache.</div>
         </div>
         <div class="label">Symboles</div>
         <div class="symbol-picker" id="cmp-symbols"></div>
