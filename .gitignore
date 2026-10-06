@@ -1,0 +1,9 @@
+/target
+/data/
+*.sqlite
+*.sqlite-journal
+.env
+.env.*
+!.env.example
+/src-tauri/gen/
+node_modules/

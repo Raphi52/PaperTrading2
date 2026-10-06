@@ -1,0 +1,25 @@
+[workspace]
+resolver = "2"
+members = ["crates/pt-core", "crates/pt-data", "crates/pt-store", "crates/pt-cli", "src-tauri"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["Raph"]
+license = "MIT"
+
+[workspace.dependencies]
+pt-core = { path = "crates/pt-core" }
+pt-data = { path = "crates/pt-data" }
+pt-store = { path = "crates/pt-store" }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["float_roundtrip"] }
+thiserror = "2"
+anyhow = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
+reqwest = { version = "0.12", features = ["json"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 4

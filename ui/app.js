@@ -1,0 +1,477 @@
+// PaperTrading2 — interface. Aucune dépendance, aucun appel réseau direct :
+// tout passe par les commandes du serveur Rust.
+"use strict";
+
+const TAURI = window.__TAURI__;
+const invoke = (cmd, args) => TAURI.core.invoke(cmd, args);
+const listen = (ev, fn) => TAURI.event.listen(ev, fn);
+
+const COMMON_SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT", "ADAUSDT", "AVAXUSDT", "DOGEUSDT", "LINKUSDT", "DOTUSDT"];
+const DEFAULT_SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT"];
+
+const state = { presets: [], settings: null, view: "portfolios", detailId: null, comparing: false };
+
+// ---------- utilitaires ----------
+const $ = (sel, root = document) => root.querySelector(sel);
+const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+const nf = (d) => new Intl.NumberFormat("fr-FR", { minimumFractionDigits: d, maximumFractionDigits: d });
+const money = (v) => (v == null || !isFinite(v) ? "—" : nf(2).format(v) + " $");
+const num = (v, d = 2) => (v == null || !isFinite(v) ? "—" : nf(d).format(v));
+const pct = (v, d = 1) => (v == null || !isFinite(v) ? "—" : (v > 0 ? "+" : "") + nf(d).format(v) + " %");
+const cls = (v) => (v > 0 ? "pos" : v < 0 ? "neg" : "");
+const signed = (v, f = pct) => `<span class="${cls(v)}">${f(v)}</span>`;
+function price(v) {
+  if (v == null || !isFinite(v)) return "—";
+  const d = v >= 1000 ? 2 : v >= 1 ? 4 : v >= 0.01 ? 5 : 8;
+  return nf(d).format(v);
+}
+const date = (ms) => (ms ? new Date(ms).toLocaleDateString("fr-FR", { year: "numeric", month: "2-digit", day: "2-digit" }) : "—");
+const dateTime = (ms) => (ms ? new Date(ms).toLocaleString("fr-FR", { year: "2-digit", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit" }) : "—");
+const preset = (id) => state.presets.find((p) => p.id === id);
+
+let toastTimer;
+function toast(msg, isErr = false) {
+  const t = $("#toast");
+  t.textContent = msg;
+  t.className = "show" + (isErr ? " err" : "");
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => (t.className = ""), isErr ? 7000 : 3500);
+}
+async function call(cmd, args) {
+  try {
+    return await invoke(cmd, args);
+  } catch (e) {
+    toast(String(e), true);
+    throw e;
+  }
+}
+
+function distance(d) {
+  if (!d) return "";
+  return d.type === "atr" ? `${num(d.value, 1)} ATR` : `${num(d.value, 1)} %`;
+}
+function exitsText(p) {
+  const e = p.exits;
+  const parts = [];
+  if (e.stop) parts.push(`stop ${distance(e.stop)}`);
+  if (e.trailing) parts.push(`stop suiveur ${distance(e.trailing.distance)}${e.trailing.activation_pct > 0 ? ` dès +${num(e.trailing.activation_pct, 1)} %` : ""}`);
+  if (e.take_profit) parts.push(e.take_profit.type === "r_multiple" ? `objectif ${num(e.take_profit.value, 1)}× le risque` : `objectif +${num(e.take_profit.value, 1)} %`);
+  if (e.max_bars) parts.push(`durée max ${e.max_bars} bougies`);
+  if (!parts.length) parts.push("ne vend jamais");
+  return parts.join(" · ");
+}
+function sizingText(p) {
+  const s = p.sizing;
+  let t = s.type === "risk" ? `risque ${num(s.risk_pct, 1)} % du capital par trade (position ≤ ${num(s.max_position_pct, 0)} %)`
+    : s.type === "fixed" ? `${num(s.position_pct, 0)} % du capital par ${p.pyramid ? "couche" : "position"}`
+    : "parts égales entre les symboles";
+  if (p.pyramid) t += ` · renforcement tous les −${num(p.pyramid.step_pct, 0)} %, ${p.pyramid.max_layers} couches max`;
+  if (p.trend_sma) t += ` · seulement au-dessus de la SMA ${p.trend_sma}`;
+  return t;
+}
+function presetOptions(selectEl, includeBenchmark = true) {
+  const families = [...new Set(state.presets.map((p) => p.family))];
+  selectEl.innerHTML = families.map((f) => `<optgroup label="${esc(f)}">${state.presets
+    .filter((p) => p.family === f && (includeBenchmark || p.rule.type !== "buy_hold"))
+    .map((p) => `<option value="${esc(p.id)}">${esc(p.name)}</option>`).join("")}</optgroup>`).join("");
+}
+
+// ---------- sélecteur de symboles ----------
+function symbolPicker(el, initial) {
+  const chosen = new Set(initial);
+  const extra = new Set(initial.filter((s) => !COMMON_SYMBOLS.includes(s)));
+  function render() {
+    const all = [...COMMON_SYMBOLS, ...extra];
+    el.innerHTML = all.map((s) => `<span class="chip ${chosen.has(s) ? "on" : ""}" data-s="${esc(s)}">${esc(s.replace(/USDT$/, ""))}</span>`).join("")
+      + `<input placeholder="Autre : ex. NEARUSDT" maxlength="20">`;
+  }
+  el.addEventListener("click", (e) => {
+    const s = e.target.dataset?.s;
+    if (!s) return;
+    chosen.has(s) ? chosen.delete(s) : chosen.add(s);
+    render();
+  });
+  el.addEventListener("keydown", (e) => {
+    if (e.target.tagName !== "INPUT" || e.key !== "Enter") return;
+    e.preventDefault();
+    let s = e.target.value.trim().toUpperCase();
+    if (!s) return;
+    if (!/USDT$|USDC$|BTC$|EUR$/.test(s)) s += "USDT";
+    extra.add(s);
+    chosen.add(s);
+    render();
+    el.querySelector("input").focus();
+  });
+  render();
+  return { get: () => [...chosen], set: (list) => { chosen.clear(); list.forEach((s) => { chosen.add(s); if (!COMMON_SYMBOLS.includes(s)) extra.add(s); }); render(); } };
+}
+
+// ---------- graphique ----------
+function lineChart(series, opts = {}) {
+  const W = 1000, H = 300, L = 70, R = 14, T = 12, B = 26;
+  const pts = series.flatMap((s) => s.points);
+  if (pts.length < 2) return `<div class="empty">Pas encore assez de points pour tracer une courbe.</div>`;
+  let x0 = Math.min(...pts.map((p) => p[0])), x1 = Math.max(...pts.map((p) => p[0]));
+  let y0 = Math.min(...pts.map((p) => p[1])), y1 = Math.max(...pts.map((p) => p[1]));
+  if (x1 === x0) x1 = x0 + 1;
+  const pad = (y1 - y0) * 0.06 || Math.abs(y0) * 0.01 || 1;
+  y0 -= pad; y1 += pad;
+  const X = (x) => L + ((x - x0) / (x1 - x0)) * (W - L - R);
+  const Y = (y) => T + (1 - (y - y0) / (y1 - y0)) * (H - T - B);
+  const ticks = 5;
+  let grid = "";
+  for (let i = 0; i <= ticks; i++) {
+    const v = y0 + ((y1 - y0) * i) / ticks;
+    grid += `<line x1="${L}" x2="${W - R}" y1="${Y(v)}" y2="${Y(v)}"/><text x="${L - 6}" y="${Y(v) + 4}" text-anchor="end">${esc(opts.yFormat ? opts.yFormat(v) : num(v, 0))}</text>`;
+  }
+  for (let i = 0; i <= 4; i++) {
+    const t = x0 + ((x1 - x0) * i) / 4;
+    grid += `<text x="${X(t)}" y="${H - 6}" text-anchor="${i === 0 ? "start" : i === 4 ? "end" : "middle"}">${esc(date(t))}</text>`;
+  }
+  let split = "";
+  if (opts.split && opts.split > x0 && opts.split < x1) {
+    split = `<line x1="${X(opts.split)}" x2="${X(opts.split)}" y1="${T}" y2="${H - B}" stroke="#7aa2f7" stroke-dasharray="4 4"/>`
+      + `<text x="${X(opts.split) + 6}" y="${T + 12}" fill="#7aa2f7">hors échantillon →</text>`;
+  }
+  const lines = series.map((s) => `<polyline fill="none" stroke="${s.color}" stroke-width="${s.width || 1.8}" stroke-linejoin="round" points="${s.points.map((p) => `${X(p[0]).toFixed(1)},${Y(p[1]).toFixed(1)}`).join(" ")}"/>`).join("");
+  const legend = `<div class="legend">${series.map((s) => `<span><i style="background:${s.color}"></i>${esc(s.name)}</span>`).join("")}</div>`;
+  return legend + `<svg class="chart" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none"><g class="grid">${grid}</g>${split}${lines}</svg>`;
+}
+
+// ---------- navigation ----------
+function show(view) {
+  state.view = view;
+  document.querySelectorAll(".view").forEach((v) => (v.hidden = v.id !== `view-${view}`));
+  document.querySelectorAll("#tabs button").forEach((b) => b.classList.toggle("active", b.dataset.view === view || (view === "detail" && b.dataset.view === "portfolios")));
+  if (view === "portfolios") refreshPortfolios();
+  if (view === "detail") refreshDetail();
+}
+$("#tabs").addEventListener("click", (e) => e.target.dataset.view && show(e.target.dataset.view));
+
+// ---------- moteur ----------
+function renderEngine(st) {
+  const dot = $("#engine-dot");
+  dot.className = "dot " + (st.last_error ? "err" : st.busy ? "busy" : st.running ? "on" : "");
+  const last = st.last_tick ? new Date(st.last_tick).toLocaleTimeString("fr-FR") : "jamais";
+  $("#engine-text").textContent = st.running
+    ? (st.busy ? "Mode direct : passage en cours…" : `Mode direct actif · dernier passage ${last}`)
+    : "Mode direct arrêté";
+  $("#engine-text").title = st.last_error || "";
+  const btn = $("#engine-toggle");
+  btn.textContent = st.running ? "Arrêter" : "Démarrer";
+  btn.onclick = async () => renderEngine(await call("set_engine_running", { running: !st.running }));
+}
+
+// ---------- portefeuilles ----------
+let npPicker;
+async function refreshPortfolios() {
+  const list = await call("list_portfolios");
+  const el = $("#portfolio-list");
+  if (!list.length) {
+    el.innerHTML = `<div class="empty">Aucun portefeuille. Crée-en un, ou commence par le <b>Comparateur</b> pour voir quelles stratégies tiennent la route sur l'historique.</div>`;
+    return;
+  }
+  el.innerHTML = list.map((p) => {
+    const diff = p.return_pct - p.benchmark_return_pct;
+    return `<div class="card">
+      <div class="card-head">
+        <div>
+          <div class="card-title">${esc(p.name)}</div>
+          <div class="badges"><span class="badge gold">${esc(p.preset_name)}</span><span class="badge">${esc(p.timeframe)}</span>
+          <span class="badge">${p.symbols.map((s) => esc(s.replace(/USDT$/, ""))).join(" · ")}</span>${p.active ? "" : `<span class="badge paused">en pause</span>`}</div>
+        </div>
+        <div class="vs">créé le ${date(p.created_at)}</div>
+      </div>
+      <div class="kpis">
+        <div class="kpi"><div class="v">${money(p.equity)}</div><div class="l">valeur (capital ${money(p.initial_cash)})</div></div>
+        <div class="kpi"><div class="v ${cls(p.return_pct)}">${pct(p.return_pct, 2)}</div><div class="l">stratégie</div></div>
+        <div class="kpi"><div class="v ${cls(p.benchmark_return_pct)}">${pct(p.benchmark_return_pct, 2)}</div><div class="l">acheter et garder</div></div>
+      </div>
+      <div class="vs">Écart avec la référence : ${signed(diff, (v) => pct(v, 2))} · ${p.open_positions} position(s) ouverte(s) · ${p.trades} trade(s) clos${p.win_rate_pct != null ? ` (${num(p.win_rate_pct, 0)} % gagnants)` : ""} · frais ${money(p.fees_paid)}</div>
+      ${p.waiting ? `<div class="notice">${esc(p.waiting)}</div>` : ""}
+      ${p.last_error ? `<div class="notice err">${esc(p.last_error)}</div>` : ""}
+      <div class="card-actions">
+        <button class="ghost small" data-act="detail" data-id="${p.id}">Détail</button>
+        <button class="ghost small" data-act="toggle" data-id="${p.id}" data-active="${p.active}">${p.active ? "Mettre en pause" : "Reprendre"}</button>
+        <button class="danger small" data-act="delete" data-id="${p.id}" data-name="${esc(p.name)}">Supprimer</button>
+      </div>
+    </div>`;
+  }).join("");
+}
+$("#portfolio-list").addEventListener("click", async (e) => {
+  const b = e.target.closest("button");
+  if (!b) return;
+  const id = Number(b.dataset.id);
+  if (b.dataset.act === "detail") { state.detailId = id; show("detail"); }
+  if (b.dataset.act === "toggle") { await call("set_portfolio_active", { id, active: b.dataset.active !== "true" }); refreshPortfolios(); }
+  if (b.dataset.act === "delete") {
+    if (!confirm(`Supprimer « ${b.dataset.name} » et tout son historique ? Cette action est définitive.`)) return;
+    await call("delete_portfolio", { id });
+    toast("Portefeuille supprimé.");
+    refreshPortfolios();
+  }
+});
+$("#new-portfolio-btn").onclick = () => { $("#new-portfolio").hidden = false; $("#new-portfolio [name=cash]").value = state.settings.default_cash; };
+$("#np-cancel").onclick = () => ($("#new-portfolio").hidden = true);
+$("#np-preset").addEventListener("change", () => {
+  const p = preset($("#np-preset").value);
+  $("#np-hint").textContent = p ? `${p.description} Sorties : ${exitsText(p)}. Taille : ${sizingText(p)}.` : "";
+});
+$("#new-portfolio").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const f = e.target;
+  const btn = f.querySelector("button[type=submit]");
+  btn.disabled = true;
+  try {
+    await call("create_portfolio", { req: { name: f.name.value, preset_id: f.preset.value, symbols: npPicker.get(), cash: Number(f.cash.value) } });
+    toast("Portefeuille créé. Il démarrera à la prochaine clôture de bougie.");
+    f.hidden = true;
+    f.name.value = "";
+    refreshPortfolios();
+  } finally { btn.disabled = false; }
+});
+
+// ---------- détail ----------
+async function refreshDetail() {
+  if (state.detailId == null) return show("portfolios");
+  const d = await call("portfolio_detail", { id: state.detailId });
+  const s = d.summary;
+  const curve = d.curve;
+  const chart = lineChart([
+    { name: "Acheter et garder", color: "#8b93a6", points: curve.map((p) => [p.time, p.benchmark]) },
+    { name: s.preset_name, color: "#e3ba55", width: 2.2, points: curve.map((p) => [p.time, p.equity]) },
+  ], { yFormat: (v) => nf(0).format(v) });
+  $("#detail").innerHTML = `
+    <div class="section-head" style="margin-top:10px"><div><h1>${esc(s.name)}</h1>
+      <p class="muted">${esc(d.preset.name)} · ${esc(s.timeframe)} · ${s.symbols.map(esc).join(", ")} · créé le ${dateTime(s.created_at)}</p>
+      <p class="muted small">${esc(d.preset.description)} Sorties : ${esc(exitsText(d.preset))}. Taille : ${esc(sizingText(d.preset))}.</p></div></div>
+    ${s.waiting ? `<div class="notice">${esc(s.waiting)}</div>` : ""}
+    <div class="panel"><div class="grid-5">
+      <div class="kpi"><div class="v">${money(s.equity)}</div><div class="l">valeur</div></div>
+      <div class="kpi"><div class="v ${cls(s.return_pct)}">${pct(s.return_pct, 2)}</div><div class="l">stratégie</div></div>
+      <div class="kpi"><div class="v ${cls(s.benchmark_return_pct)}">${pct(s.benchmark_return_pct, 2)}</div><div class="l">acheter et garder</div></div>
+      <div class="kpi"><div class="v ${cls(s.realized_pnl)}">${money(s.realized_pnl)}</div><div class="l">gains réalisés (frais déduits)</div></div>
+      <div class="kpi"><div class="v">${money(s.fees_paid)}</div><div class="l">frais payés</div></div>
+    </div></div>
+    <div class="panel">${chart}</div>
+    <div class="panel"><h2>Positions ouvertes</h2>${d.positions.length ? `<div class="table-wrap"><table>
+      <tr><th>Symbole</th><th class="num">Quantité</th><th class="num">Prix moyen</th><th class="num">Prix actuel</th><th class="num">Valeur</th><th class="num">Latent</th><th class="num">Stop</th><th class="num">Objectif</th><th class="num">Couches</th><th>Entrée</th></tr>
+      ${d.positions.map((p) => `<tr><td>${esc(p.symbol)}</td><td class="num">${num(p.qty, 6)}</td><td class="num">${price(p.avg_price)}</td><td class="num">${price(p.mark)}</td><td class="num">${money(p.value)}</td>
+        <td class="num">${signed(p.unrealized_pnl, money)} (${signed(p.unrealized_pct)})</td><td class="num">${price(p.stop)}</td><td class="num">${price(p.take_profit)}</td><td class="num">${p.layers}</td><td>${dateTime(p.entry_time)}</td></tr>`).join("")}
+      </table></div>` : `<p class="muted">Aucune position ouverte.</p>`}</div>
+    <div class="panel"><h2>Trades clos (${d.trades.length})</h2>${tradesTable(d.trades)}</div>
+    <details class="panel"><summary>Toutes les exécutions (${d.fills.length})</summary>${d.fills.length ? `<div class="table-wrap"><table>
+      <tr><th>Date</th><th>Symbole</th><th>Sens</th><th class="num">Quantité</th><th class="num">Prix</th><th class="num">Frais</th><th class="num">Trésorerie</th><th>Motif</th></tr>
+      ${d.fills.map((f) => `<tr><td>${dateTime(f.time)}</td><td>${esc(f.symbol)}</td><td>${f.side === "Buy" ? "Achat" : "Vente"}</td><td class="num">${num(f.qty, 6)}</td><td class="num">${price(f.price)}</td><td class="num">${money(f.fee)}</td><td class="num">${signed(f.cash_delta, money)}</td><td>${esc(f.reason)}</td></tr>`).join("")}
+      </table></div>` : `<p class="muted">Aucune exécution.</p>`}</details>`;
+}
+function tradesTable(trades, limit = 400) {
+  if (!trades.length) return `<p class="muted">Aucun trade clos.</p>`;
+  const rows = trades.slice(0, limit);
+  return `<div class="table-wrap"><table>
+    <tr><th>Symbole</th><th>Entrée</th><th>Sortie</th><th class="num">Prix moyen</th><th class="num">Prix de sortie</th><th class="num">Gain net</th><th class="num">%</th><th class="num">Bougies</th><th>Motif de sortie</th></tr>
+    ${rows.map((t) => `<tr><td>${esc(t.symbol)}</td><td>${dateTime(t.entry_time)}</td><td>${dateTime(t.exit_time)}</td><td class="num">${price(t.avg_entry_price)}</td><td class="num">${price(t.exit_price)}</td>
+      <td class="num">${signed(t.pnl, money)}</td><td class="num">${signed(t.return_pct, (v) => pct(v, 2))}</td><td class="num">${t.bars_held}</td><td>${esc(t.exit_reason)}</td></tr>`).join("")}
+  </table></div>${trades.length > limit ? `<p class="muted small">${limit} premiers sur ${trades.length}.</p>` : ""}`;
+}
+$("#detail-back").onclick = () => show("portfolios");
+
+// ---------- backtest ----------
+let btPicker;
+function metricRow(label, a, b, f, better) {
+  const good = better == null ? "" : (better === "high" ? a > b : a < b) ? "pos" : "neg";
+  return `<tr><td>${label}</td><td class="num ${good}">${f(a)}</td><td class="num">${f(b)}</td></tr>`;
+}
+function renderBacktest(r) {
+  const m = r.metrics, b = r.benchmark;
+  const chart = lineChart([
+    { name: "Acheter et garder", color: "#8b93a6", points: r.benchmark_curve.map((p) => [p.time, p.equity]) },
+    { name: r.preset_name, color: "#e3ba55", width: 2.2, points: r.curve.map((p) => [p.time, p.equity]) },
+  ], { split: r.split_time, yFormat: (v) => nf(0).format(v) });
+  const fees = m.start_equity ? (r.fees_paid / m.start_equity) * 100 : 0;
+  $("#bt-result").innerHTML = `
+    <div class="verdict-banner"><span class="verdict v-${r.verdict} big">${esc(verdictLabel(r.verdict))}</span>
+      <div><div>${esc(r.verdict_reason)}</div><div class="muted small">${esc(r.symbols.join(", "))} · ${esc(r.timeframe)} · du ${date(r.start_time)} au ${date(r.end_time)} · hors échantillon depuis le ${date(r.split_time)}</div></div></div>
+    <div class="panel">${chart}</div>
+    <div class="metrics-grid">
+      <div class="panel"><h2>Comparaison</h2><table>
+        <tr><th></th><th class="num">Stratégie</th><th class="num">Acheter et garder</th></tr>
+        ${metricRow("Rendement total", m.total_return_pct, b.total_return_pct, pct, "high")}
+        ${metricRow("Rendement annualisé", m.cagr_pct, b.cagr_pct, pct, "high")}
+        ${metricRow("Pire baisse depuis un sommet", m.max_drawdown_pct, b.max_drawdown_pct, pct, "low")}
+        ${metricRow("Sharpe (rendement / risque)", m.sharpe, b.sharpe, (v) => num(v, 2), "high")}
+        ${metricRow("Sharpe hors échantillon", r.oos.sharpe, r.benchmark_oos.sharpe, (v) => num(v, 2), "high")}
+        ${metricRow("Rendement hors échantillon", r.oos.total_return_pct, r.benchmark_oos.total_return_pct, pct, "high")}
+        ${metricRow("Volatilité annualisée", m.volatility_pct, b.volatility_pct, pct, "low")}
+        ${metricRow("Temps investi", m.exposure_pct, b.exposure_pct, pct)}
+      </table></div>
+      <div class="panel"><h2>Trades</h2><table>
+        <tr><td>Nombre de trades</td><td class="num">${m.trades}</td></tr>
+        <tr><td>Trades gagnants</td><td class="num">${pct(m.win_rate_pct, 1).replace("+", "")}</td></tr>
+        <tr><td>Facteur de profit (gains / pertes)</td><td class="num">${m.profit_factor == null ? "—" : num(m.profit_factor, 2)}</td></tr>
+        <tr><td>Gain moyen / perte moyenne</td><td class="num">${signed(m.avg_win_pct, (v) => pct(v, 2))} / ${signed(m.avg_loss_pct, (v) => pct(v, 2))}</td></tr>
+        <tr><td>Espérance par trade</td><td class="num">${signed(m.expectancy_pct, (v) => pct(v, 2))}</td></tr>
+        <tr><td>Durée moyenne</td><td class="num">${num(m.avg_bars_held, 1)} bougies</td></tr>
+        <tr><td>Frais payés</td><td class="num">${money(r.fees_paid)} (${num(fees, 1)} % du capital)</td></tr>
+        <tr><td>Même stratégie <b>sans aucun frais</b></td><td class="num">${signed(r.gross_return_pct)}</td></tr>
+      </table></div>
+    </div>
+    <div class="panel"><h2>Trades clos (${r.trades.length})</h2>${tradesTable([...r.trades].reverse())}</div>`;
+}
+function verdictLabel(v) {
+  return { Solide: "Solide", Fragile: "Fragile", Perdante: "Perdante", Reference: "Référence", Insuffisant: "Trop peu de trades" }[v] || v;
+}
+async function runBacktest(presetId, symbols, days, cash) {
+  const btn = $("#bt-run");
+  btn.disabled = true;
+  btn.textContent = "Calcul…";
+  $("#bt-result").innerHTML = `<div class="empty">Téléchargement de l'historique (mis en cache après le premier passage) puis calcul…</div>`;
+  try {
+    const r = await call("run_backtest", { req: { preset_id: presetId, symbols, days, cash } });
+    renderBacktest(r);
+  } catch (e) {
+    $("#bt-result").innerHTML = `<div class="notice err">${esc(e)}</div>`;
+  } finally {
+    btn.disabled = false;
+    btn.textContent = "Lancer";
+  }
+}
+$("#bt-form").addEventListener("submit", (e) => {
+  e.preventDefault();
+  const f = e.target;
+  runBacktest(f.preset.value, btPicker.get(), Number(f.days.value), Number(f.cash.value));
+});
+function openBacktest(presetId, symbols) {
+  show("backtest");
+  $("#bt-preset").value = presetId;
+  if (symbols) btPicker.set(symbols);
+  const f = $("#bt-form");
+  runBacktest(presetId, btPicker.get(), Number(f.days.value), Number(f.cash.value));
+}
+
+// ---------- comparateur ----------
+let cmpPicker;
+const RANK = { Solide: 0, Fragile: 1, Reference: 2, Perdante: 3, Insuffisant: 4 };
+$("#cmp-form").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  if (state.comparing) return;
+  const f = e.target;
+  const symbols = cmpPicker.get();
+  state.comparing = true;
+  $("#cmp-run").disabled = true;
+  $("#cmp-progress").hidden = false;
+  $("#cmp-result").innerHTML = "";
+  try {
+    const rows = await call("run_comparison", { req: { symbols, days: Number(f.days.value), cash: Number(f.cash.value) } });
+    rows.sort((a, b) => (RANK[a.verdict] - RANK[b.verdict]) || (b.oos.sharpe - a.oos.sharpe));
+    const counts = rows.reduce((acc, r) => ((acc[r.verdict] = (acc[r.verdict] || 0) + 1), acc), {});
+    $("#cmp-result").innerHTML = `<div class="panel">
+      <p><b>${counts.Solide || 0}</b> solide(s), <b>${counts.Fragile || 0}</b> fragile(s), <b>${counts.Perdante || 0}</b> perdante(s), <b>${counts.Insuffisant || 0}</b> sans assez de trades, sur ${rows.length} stratégies. Clique une ligne pour voir son backtest détaillé.</p>
+      <div class="table-wrap" style="max-height:none"><table>
+      <tr><th>Stratégie</th><th>UT</th><th class="num">Trades</th><th class="num">Rendement</th><th class="num">Réf.</th><th class="num">Sharpe</th><th class="num">Réf.</th><th class="num">Sharpe hors éch.</th><th class="num">Réf.</th><th class="num">Pire baisse</th><th class="num">Réf.</th><th class="num">Sans frais</th><th>Verdict</th></tr>
+      ${rows.map((r) => `<tr class="click" data-id="${esc(r.preset_id)}" title="${esc(r.verdict_reason)}">
+        <td>${esc(r.preset_name)}</td><td>${esc(r.timeframe)}</td><td class="num">${r.error ? "—" : r.metrics.trades}</td>
+        <td class="num">${signed(r.metrics.total_return_pct)}</td><td class="num muted">${pct(r.benchmark.total_return_pct)}</td>
+        <td class="num">${num(r.metrics.sharpe, 2)}</td><td class="num muted">${num(r.benchmark.sharpe, 2)}</td>
+        <td class="num">${num(r.oos.sharpe, 2)}</td><td class="num muted">${num(r.benchmark_oos.sharpe, 2)}</td>
+        <td class="num">${pct(r.metrics.max_drawdown_pct).replace("+", "")}</td><td class="num muted">${pct(r.benchmark.max_drawdown_pct).replace("+", "")}</td>
+        <td class="num">${signed(r.gross_return_pct)}</td>
+        <td><span class="verdict v-${r.error ? "Insuffisant" : r.verdict}">${esc(r.error ? "Erreur" : verdictLabel(r.verdict))}</span></td></tr>`).join("")}
+      </table></div>
+      <p class="muted small">« Réf. » = acheter et garder les mêmes symboles sur la même période, avec les mêmes frais. La période varie selon l'unité de temps et le préchauffage des indicateurs. « Sans frais » montre ce que la stratégie ferait si le trading était gratuit : l'écart, c'est ce que coûtent les frais.</p>
+    </div>`;
+    $("#cmp-result").querySelectorAll("tr.click").forEach((tr) => tr.addEventListener("click", () => openBacktest(tr.dataset.id, symbols)));
+  } finally {
+    state.comparing = false;
+    $("#cmp-run").disabled = false;
+    $("#cmp-progress").hidden = true;
+  }
+});
+
+// ---------- stratégies ----------
+function renderStrategies() {
+  const families = [...new Set(state.presets.map((p) => p.family))];
+  $("#strategy-list").innerHTML = families.map((f) => `<div class="family"><h2>${esc(f)}</h2>${state.presets.filter((p) => p.family === f).map((p) => `
+    <div class="panel strategy"><div>
+      <h3>${esc(p.name)} <span class="badge">${esc(p.timeframe)}</span></h3>
+      <div class="desc">${esc(p.description)}</div>
+      <div class="rules">Sorties : ${esc(exitsText(p))} · Taille : ${esc(sizingText(p))}</div>
+    </div><div class="form-actions">
+      <button class="ghost small" data-bt="${esc(p.id)}">Backtester</button>
+      ${p.rule.type === "buy_hold" ? `<span class="muted small">incluse dans chaque portefeuille</span>` : `<button class="small" data-new="${esc(p.id)}">Suivre en direct</button>`}
+    </div></div>`).join("")}</div>`).join("");
+}
+$("#strategy-list").addEventListener("click", (e) => {
+  const b = e.target.closest("button");
+  if (!b) return;
+  if (b.dataset.bt) openBacktest(b.dataset.bt);
+  if (b.dataset.new) {
+    show("portfolios");
+    $("#new-portfolio").hidden = false;
+    $("#np-preset").value = b.dataset.new;
+    $("#np-preset").dispatchEvent(new Event("change"));
+    $("#new-portfolio [name=name]").value = preset(b.dataset.new).name;
+    $("#new-portfolio [name=cash]").value = state.settings.default_cash;
+  }
+});
+
+// ---------- réglages ----------
+function renderSettings() {
+  const s = state.settings;
+  const f = $("#settings-form");
+  f.fee.value = +(s.costs.fee_rate * 100).toFixed(4);
+  f.slip.value = s.costs.slippage_bps;
+  f.cash.value = s.default_cash;
+  f.oos.value = Math.round(s.oos_fraction * 100);
+  f.tick.value = s.tick_seconds;
+  $("#rt-cost").textContent = pct(2 * s.costs.fee_rate * 100 + (2 * s.costs.slippage_bps) / 100, 2).replace("+", "");
+}
+$("#settings-form").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const f = e.target;
+  const settings = {
+    costs: { fee_rate: Number(f.fee.value) / 100, slippage_bps: Number(f.slip.value) },
+    default_cash: Number(f.cash.value),
+    oos_fraction: Number(f.oos.value) / 100,
+    tick_seconds: Number(f.tick.value),
+  };
+  state.settings = await call("save_settings", { settings });
+  renderSettings();
+  toast("Réglages enregistrés.");
+});
+
+// ---------- démarrage ----------
+async function boot() {
+  if (!TAURI) {
+    document.body.innerHTML = `<main><div class="empty">Cette interface doit être ouverte dans l'application PaperTrading2.</div></main>`;
+    return;
+  }
+  state.presets = await call("catalog");
+  state.settings = await call("get_settings");
+  presetOptions($("#np-preset"), false);
+  presetOptions($("#bt-preset"));
+  $("#bt-preset").value = "macd_1d";
+  $("#np-preset").dispatchEvent(new Event("change"));
+  npPicker = symbolPicker($("#np-symbols"), DEFAULT_SYMBOLS.slice(0, 3));
+  btPicker = symbolPicker($("#bt-symbols"), DEFAULT_SYMBOLS);
+  cmpPicker = symbolPicker($("#cmp-symbols"), DEFAULT_SYMBOLS);
+  renderStrategies();
+  renderSettings();
+  const info = await call("app_info");
+  $("#app-info").innerHTML = `Version ${esc(info.version)} · données dans <span class="mono">${esc(info.data_dir)}</span> · bougies : <span class="mono">${esc(info.binance_url)}</span>`;
+  renderEngine(await call("engine_status"));
+  await listen("engine-status", (e) => renderEngine(e.payload));
+  await listen("portfolios-changed", () => {
+    if (state.view === "portfolios") refreshPortfolios();
+    if (state.view === "detail") refreshDetail();
+  });
+  await listen("comparison-progress", (e) => {
+    const p = e.payload;
+    $("#cmp-bar").max = p.total;
+    $("#cmp-bar").value = p.done;
+    $("#cmp-current").textContent = p.current ? `${p.done + 1}/${p.total} · ${p.current}` : "";
+  });
+  const start = new URLSearchParams(location.search).get("vue");
+  show(start || "portfolios");
+}
+boot();

@@ -1,0 +1,19 @@
+[package]
+name = "papertrading2"
+description = "Application de bureau PaperTrading2 (Tauri)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+pt-core.workspace = true
+pt-data.workspace = true
+pt-store.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+anyhow.workspace = true
