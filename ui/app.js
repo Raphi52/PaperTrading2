@@ -549,7 +549,7 @@ $("#settings-form").addEventListener("submit", async (e) => {
 function renderAutostart(s) {
   $("#autostart").checked = s.enabled;
   $("#autostart-info").innerHTML = s.enabled
-    ? `À chaque ouverture de session, Windows lance <span class="mono">${esc(s.exe)}</span>, réduit dans la barre des tâches : les portefeuilles avancent sans que tu ouvres l'application. Fermer sa fenêtre arrête le mode direct jusqu'au prochain démarrage.`
+    ? `À chaque ouverture de session, Windows lance <span class="mono">${esc(s.exe)}</span>, réduit dans la barre des tâches : les portefeuilles avancent sans que tu ouvres l'application.`
     : `Désactivé : les portefeuilles n'avancent que lorsque l'application est ouverte. Fermée, elle ne perd rien : à la réouverture, elle rejoue dans l'ordre les bougies clôturées entretemps.`;
 }
 $("#autostart").addEventListener("change", async (e) => {

@@ -41,6 +41,15 @@ pub async fn run_loop(state: Arc<AppState>, app: AppHandle) {
         if lock.is_none() {
             lock = acquire_live_lock(&lock_path);
             let elsewhere = lock.is_none();
+            if !elsewhere {
+                // Seule l'instance qui fait avancer les portefeuilles a une icône près de l'horloge.
+                let handle = app.clone();
+                let _ = app.run_on_main_thread(move || {
+                    if let Err(e) = crate::tray::install(&handle) {
+                        eprintln!("icône de notification indisponible : {e}");
+                    }
+                });
+            }
             let mut st = state.status.lock().expect("statut");
             if st.elsewhere != elsewhere {
                 st.elsewhere = elsewhere;

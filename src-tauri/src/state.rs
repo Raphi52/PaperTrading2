@@ -69,6 +69,8 @@ pub struct AppState {
     pub data_dir: PathBuf,
     pub fear_greed: Mutex<FearGreedCache>,
     pub wake: tokio::sync::Notify,
+    /// « Quitter » a été choisi dans le menu de l'icône : la fermeture n'est plus interceptée.
+    pub quitting: std::sync::atomic::AtomicBool,
 }
 
 impl AppState {
@@ -82,6 +84,7 @@ impl AppState {
             data_dir,
             fear_greed: Mutex::new(None),
             wake: tokio::sync::Notify::new(),
+            quitting: std::sync::atomic::AtomicBool::new(false),
         }
     }
 

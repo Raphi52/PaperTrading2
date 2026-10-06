@@ -4,6 +4,7 @@
 mod commands;
 mod live;
 mod state;
+mod tray;
 
 use state::AppState;
 use std::sync::Arc;
@@ -21,6 +22,7 @@ fn launched_at_login(args: impl IntoIterator<Item = String>) -> bool {
 fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_autostart::init(MacosLauncher::LaunchAgent, Some(vec![LOGIN_ARG])))
+        .on_window_event(tray::on_window_event)
         .setup(|app| {
             // `PT_DATA_DIR` permet de lancer une instance isolée (démo, tests).
             let dir = match std::env::var("PT_DATA_DIR") {
