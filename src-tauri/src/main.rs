@@ -8,9 +8,19 @@ mod state;
 use state::AppState;
 use std::sync::Arc;
 use tauri::Manager;
+use tauri_plugin_autostart::MacosLauncher;
+
+/// Argument de l'entrée de démarrage de Windows : l'application s'ouvre alors
+/// réduite dans la barre des tâches, sans fenêtre devant l'utilisateur.
+const LOGIN_ARG: &str = "--demarrage";
+
+fn launched_at_login(args: impl IntoIterator<Item = String>) -> bool {
+    args.into_iter().skip(1).any(|a| a == LOGIN_ARG)
+}
 
 fn main() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_autostart::init(MacosLauncher::LaunchAgent, Some(vec![LOGIN_ARG])))
         .setup(|app| {
             // `PT_DATA_DIR` permet de lancer une instance isolée (démo, tests).
             let dir = match std::env::var("PT_DATA_DIR") {
@@ -22,6 +32,11 @@ fn main() {
             let state = Arc::new(AppState::new(store, dir));
             app.manage(state.clone());
             tauri::async_runtime::spawn(live::run_loop(state, app.handle().clone()));
+            if launched_at_login(std::env::args()) {
+                if let Some(window) = app.get_webview_window("main") {
+                    let _ = window.minimize();
+                }
+            }
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -39,7 +54,23 @@ fn main() {
             commands::run_backtest,
             commands::run_comparison,
             commands::app_info,
+            commands::get_autostart,
+            commands::set_autostart,
         ])
         .run(tauri::generate_context!())
         .expect("impossible de démarrer PaperTrading2");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_the_login_entry_opens_minimized() {
+        let args = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert!(launched_at_login(args(&["papertrading2.exe", "--demarrage"])));
+        assert!(!launched_at_login(args(&["papertrading2.exe"])));
+        // Le chemin de l'exécutable n'est jamais pris pour l'argument.
+        assert!(!launched_at_login(args(&["--demarrage"])));
+    }
 }

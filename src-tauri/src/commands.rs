@@ -10,6 +10,7 @@ use pt_store::{EquityRow, LivePortfolio};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tauri::{AppHandle, Emitter, State};
+use tauri_plugin_autostart::ManagerExt;
 
 type St<'a> = State<'a, Arc<AppState>>;
 type Res<T> = Result<T, String>;
@@ -488,6 +489,42 @@ pub struct AppInfo {
     pub version: &'static str,
     pub data_dir: String,
     pub binance_url: String,
+}
+
+/// Lancement au démarrage de Windows : entrée `PaperTrading2` de
+/// `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`, pour l'utilisateur courant.
+#[derive(Debug, Clone, Serialize)]
+pub struct AutostartStatus {
+    pub enabled: bool,
+    /// Exécutable que Windows lancera : celui de l'application ouverte.
+    pub exe: String,
+}
+
+fn autostart_status(app: &AppHandle) -> Res<AutostartStatus> {
+    Ok(AutostartStatus {
+        enabled: app.autolaunch().is_enabled().map_err(err)?,
+        exe: std::env::current_exe().map(|p| p.display().to_string()).unwrap_or_default(),
+    })
+}
+
+#[tauri::command]
+pub fn get_autostart(app: AppHandle) -> Res<AutostartStatus> {
+    autostart_status(&app)
+}
+
+#[tauri::command]
+pub fn set_autostart(app: AppHandle, enabled: bool) -> Res<AutostartStatus> {
+    let manager = app.autolaunch();
+    let current = manager.is_enabled().map_err(err)?;
+    if enabled != current {
+        if enabled { manager.enable() } else { manager.disable() }
+            .map_err(|e| format!("impossible de modifier le lancement au démarrage : {e}"))?;
+    }
+    let status = autostart_status(&app)?;
+    if status.enabled != enabled {
+        return Err("Windows n'a pas pris en compte le changement de lancement au démarrage".into());
+    }
+    Ok(status)
 }
 
 #[tauri::command]

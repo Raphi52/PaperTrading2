@@ -546,6 +546,23 @@ $("#settings-form").addEventListener("submit", async (e) => {
   toast("Réglages enregistrés.");
 });
 
+function renderAutostart(s) {
+  $("#autostart").checked = s.enabled;
+  $("#autostart-info").innerHTML = s.enabled
+    ? `À chaque ouverture de session, Windows lance <span class="mono">${esc(s.exe)}</span>, réduit dans la barre des tâches : les portefeuilles avancent sans que tu ouvres l'application. Fermer sa fenêtre arrête le mode direct jusqu'au prochain démarrage.`
+    : `Désactivé : les portefeuilles n'avancent que lorsque l'application est ouverte. Fermée, elle ne perd rien : à la réouverture, elle rejoue dans l'ordre les bougies clôturées entretemps.`;
+}
+$("#autostart").addEventListener("change", async (e) => {
+  const want = e.target.checked;
+  try {
+    const s = await call("set_autostart", { enabled: want });
+    renderAutostart(s);
+    toast(s.enabled ? "PaperTrading2 se lancera au démarrage de Windows." : "Lancement au démarrage désactivé.");
+  } catch {
+    e.target.checked = !want;
+  }
+});
+
 // ---------- démarrage ----------
 async function boot() {
   if (!TAURI) {
@@ -563,6 +580,7 @@ async function boot() {
   cmpPicker = symbolPicker($("#cmp-symbols"), DEFAULT_SYMBOLS);
   renderStrategies();
   renderSettings();
+  call("get_autostart").then(renderAutostart).catch(() => ($("#autostart").disabled = true));
   const info = await call("app_info");
   $("#app-info").innerHTML = `Version ${esc(info.version)} · données dans <span class="mono">${esc(info.data_dir)}</span> · bougies : <span class="mono">${esc(info.binance_url)}</span>`;
   renderEngine(await call("engine_status"));
