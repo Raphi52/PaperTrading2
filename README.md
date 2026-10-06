@@ -140,7 +140,9 @@ Variables d'environnement facultatives :
 - `PT_BINANCE_URL` : source des bougies. Par défaut, `https://data-api.binance.vision`, le point d'accès public en lecture seule de Binance.
 - `PT_BINANCE_FUTURES_URL` : source des taux de financement (`pt portage`). Par défaut, `https://fapi.binance.com`, en lecture seule et sans clé.
 
-Installateur Windows (non testé dans ce dépôt) : `cargo install tauri-cli --version "^2" --locked`, puis `cargo tauri build`.
+Installateur Windows : `cargo install tauri-cli --version "^2" --locked`, puis `cargo tauri build`. Il produit `target/release/bundle/nsis/PaperTrading2_0.1.0_x64-setup.exe` (3,4 Mo). L'installation se fait pour l'utilisateur courant, sans droits d'administrateur, dans `%LOCALAPPDATA%\PaperTrading2`, avec un raccourci dans le menu Démarrer et un désinstalleur. `/S` l'installe sans fenêtre ; depuis Git Bash, préfixe la commande de `MSYS_NO_PATHCONV=1`, sinon `/S` devient `S:/` et l'assistant s'ouvre. Testé le 6 octobre 2026 : la version installée reprend la base existante (`%APPDATA%\com.raphi52.papertrading2`) et ses portefeuilles.
+
+**L'application ne fait avancer les portefeuilles que lorsqu'elle est ouverte.** Fermée, elle ne perd rien : à la réouverture, elle rejoue dans l'ordre les bougies clôturées entretemps, avec le même moteur que le backtest.
 
 ## Architecture
 
