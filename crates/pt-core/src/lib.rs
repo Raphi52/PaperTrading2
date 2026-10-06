@@ -8,10 +8,12 @@ pub mod backtest;
 pub mod candle;
 pub mod catalog;
 pub mod engine;
+pub mod essais;
 pub mod indicators;
 pub mod portfolio;
 pub mod strategy;
 pub mod validation;
+pub mod walkforward;
 
 #[cfg(test)]
 pub(crate) mod testutil;

@@ -28,10 +28,13 @@ C'est la réécriture complète de [PaperTrading](https://github.com/Raphi52/Pap
 | Clés d'API en clair dans `data/settings.json`, dépôt public | Clés compromises | Aucune clé nécessaire : données publiques seulement | — |
 | Filtre horaire 23h-9h « basé sur l'analyse » de 16 jours | Surajustement | Supprimé | — |
 | Rien ne se passait pendant que le bot était arrêté | Trous dans l'historique | Au redémarrage, les bougies manquées sont rejouées dans l'ordre | `live.rs` (rattrapage) |
+| Correction pour essais multiples calculée sur le seul catalogue du moment (première version de ce dépôt) | Retirer les perdantes faisait passer la correction de ×29 à ×7 ; un réglage modifié n'était compté nulle part | Registre des essais versionné (`crates/pt-core/essais.tsv`), qui ne fait que grandir. La correction compte l'union du registre et de ce qui tourne. `--tested` ne peut pas descendre en dessous | `removing_a_strategy_never_lowers_the_correction`, `changing_a_setting_counts_as_a_new_trial`, `every_catalog_preset_is_registered`, `tested_below_registry_is_refused` |
+| Préchauffage pris dans la période affichée (première version de ce dépôt) | Chaque stratégie affichait une autre période : sur les « mêmes » 3 ans, « acheter et garder » allait de −8,6 % à +129,7 % selon la ligne | Préchauffage sur les bougies d'avant la période. L'historique chargé couvre le plus long préchauffage de l'unité de temps, avec ou sans validation | `every_strategy_shows_the_same_period`, `history_includes_warmup_without_validation` |
+| Garder « la meilleure » stratégie après coup | La meilleure sur l'historique n'est souvent que la plus chanceuse | Sélection glissante : chaque fenêtre est jouée par la stratégie choisie avec les seules fenêtres déjà terminées, et c'est ce procédé qui est jugé | `selection_never_sees_the_window_it_plays`, `selection_on_random_walks_is_not_solide` |
 
 ## Ce que disent les données (frais compris)
 
-Mesuré le 6 octobre 2026 sur BTC, ETH, SOL, BNB et XRP. Frais de 0,1 % par côté et glissement de 0,02 %. Résultats affichés sur 3 ans ; verdicts décidés par la validation sur fenêtres glissantes de fin 2017 à 2026. Tableau complet : [`docs/comparaison-2026-10-06.md`](docs/comparaison-2026-10-06.md).
+Mesuré le 6 octobre 2026 sur BTC, ETH, SOL, BNB et XRP. Frais de 0,1 % par côté et glissement de 0,02 %. Résultats affichés sur les mêmes 3 ans pour toutes les stratégies (« acheter et garder » : +230,9 % en 1j, +231,0 % en 4h, +228,4 % en 1h) ; verdicts décidés par la validation sur fenêtres glissantes de fin 2017 à 2026. Tableau complet : [`docs/comparaison-2026-10-06.md`](docs/comparaison-2026-10-06.md).
 
 | Verdict | Nombre | Stratégies |
 |---|---:|---|
@@ -42,8 +45,8 @@ Mesuré le 6 octobre 2026 sur BTC, ETH, SOL, BNB et XRP. Frais de 0,1 % par côt
 
 - **Aucune stratégie du catalogue ne prouve qu'elle fait mieux qu'un achat au hasard investi la même part du temps.** Ce qu'elles apportent, c'est une pire baisse bien plus faible, parce qu'elles sont peu investies.
 - **MACD 1j et Turtle 55/20**, classées « Solides » par la première version du comparateur, sont **indiscernables du hasard** (détail ci-dessous).
-- **Les frais tuent les stratégies rapides.** Le croisement EMA 9/21 en 1h ferait **+171 % sans frais**, mais il tombe à **−45 % avec frais** (2 750 trades). Les stratégies 1h sont toutes perdantes.
-- **Aucune stratégie ne bat « acheter et garder » en rendement brut** sur cette période haussière.
+- **Les frais tuent les stratégies rapides.** Le croisement EMA 9/21 en 1h ferait **+168 % sans frais**, mais il tombe à **−46 % avec frais** (2 757 trades). Les stratégies 1h sont toutes perdantes.
+- **Aucune stratégie ne bat « acheter et garder » en rendement brut** sur cette période haussière : la meilleure, Ichimoku 4h, fait +73,0 % contre +231,0 %.
 
 ## Coup de chance ou pas ? Validation sur fenêtres glissantes
 
@@ -61,11 +64,30 @@ Les deux stratégies que la première version du comparateur classait « Solides
 
 Pourquoi ne pas comparer simplement au Sharpe d'« acheter et garder » ? Parce qu'une stratégie qui achète **au hasard**, en restant souvent en liquide, « gagnerait » mécaniquement toutes les fenêtres baissières. La référence à exposition égale élimine ce biais. Le test ne retient que des fenêtres sans chevauchement, et garde le découpage le moins favorable.
 
+## Améliorer en boucle sans se mentir
+
+Chercher « la meilleure stratégie » sur l'historique puis la garder, c'est choisir après coup. C'est ce qui faisait croire à la première version qu'elle avait des gagnantes. Deux garde-fous rendent possible une boucle d'amélioration honnête.
+
+**Le registre des essais** (`crates/pt-core/essais.tsv`). Chaque stratégie (identifiant et réglages exacts) et chaque variante de sélection essayée sur les données réelles y est inscrite avant d'être lancée, et n'en sort jamais. La correction pour essais multiples compte l'union du registre et de ce qui tourne : retirer les perdantes ou retoucher un réglage ne peut plus rendre un verdict plus flatteur. `pt essais` affiche le total (aujourd'hui : 29 stratégies, 1 variante de sélection) et les lignes manquantes. Un test échoue si une stratégie du catalogue n'y est pas, et `pt walkforward` refuse une variante non inscrite.
+
+**La sélection glissante** (`pt walkforward`). Les 29 stratégies sont rejouées sur la même grille de fenêtres de 180 jours, décalées de 90 jours. Pour chaque fenêtre, on joue celle qui a le mieux battu un achat au hasard de même exposition, en moyenne, sur les 2 dernières fenêtres **terminées** avant son début. Puis on juge ce procédé comme une stratégie : test du signe sur fenêtres indépendantes, découpage le moins favorable, correction pour les variantes de sélection essayées. Rapport complet : [`docs/walkforward-2026-10-06.md`](docs/walkforward-2026-10-06.md).
+
+Résultat, de mai 2018 à octobre 2026 :
+
+> Verdict : Compatible avec la chance
+>
+> La stratégie choisie bat la référence à exposition égale dans 6 fenêtre(s) indépendante(s) sur 16. À pile ou face, on ferait au moins aussi bien avec une probabilité de 89.5 %, au-dessus du seuil de 5 %.
+
+- **Choisir la stratégie qui a le mieux marché récemment ne fait pas mieux que le hasard.** Sur les 33 fenêtres jouées, elle en gagne 17 et en perd 16.
+- **Mises bout à bout, les 16 fenêtres indépendantes de ce découpage donnent +49,2 %** à la sélection, contre +176,9 % pour un achat au hasard de même exposition et +4 519,3 % pour « acheter et garder ».
+- 13 stratégies différentes ont été choisies ; la plus fréquente, Cassure Donchian 20/10 (4h), ne l'a été que 6 fois sur 33.
+- Les prochaines idées (nouvelles familles de stratégies, autre taille de position) seront inscrites au registre avant d'être lancées, et jugées de la même façon.
+
 ## L'application
 
 - **Portefeuilles** : suivi en direct sur les prix réels. Chaque portefeuille a sa référence « acheter et garder » démarrée au même instant. Il démarre à la première bougie clôturée après sa création : aucun trade antidaté.
 - **Backtest** : courbe de valeur contre la référence, avec la frontière hors échantillon, les mesures (rendement, pire baisse, Sharpe, facteur de profit), le résultat « sans frais » et tous les trades. Le panneau **« Est-ce un coup de chance ? »** rejoue la stratégie sur des fenêtres glissantes et rend le verdict ci-dessus.
-- **Comparateur** : tout le catalogue d'un coup, validé sur fenêtres glissantes et classé par verdict : Solide, Prometteuse, Indiscernable du hasard, Perdante. Environ 1 minute une fois l'historique en cache.
+- **Comparateur** : tout le catalogue d'un coup, sur la même période pour toutes les stratégies, validé sur fenêtres glissantes et classé par verdict : Solide, Prometteuse, Indiscernable du hasard, Perdante. Environ 1 minute une fois l'historique en cache.
 - **Stratégies** : ce que chaque stratégie calcule, ses sorties et sa taille de position.
 - **Réglages** : frais, glissement, capital par défaut, part hors échantillon.
 
@@ -80,6 +102,8 @@ cargo run --release -p pt-cli -- presets
 cargo run --release -p pt-cli -- backtest --preset macd_1d --symbols BTCUSDT,ETHUSDT --days 1095
 cargo run --release -p pt-cli -- compare --days 1095 --validation-days 3650 --window 180 --step 90 --md rapport.md
 cargo run --release -p pt-cli -- validate --preset macd_1d --preset donchian_55_20_1d --days 3650 --window 180 --step 90 --md validation.md
+cargo run --release -p pt-cli -- walkforward --lookback 2 --md walkforward.md
+cargo run --release -p pt-cli -- essais
 ```
 
 Variables d'environnement facultatives :
@@ -92,10 +116,10 @@ Installateur Windows (non testé dans ce dépôt) : `cargo install tauri-cli --v
 ## Architecture
 
 ```
-crates/pt-core    indicateurs, comptabilité, stratégies, moteur, backtest — aucun accès réseau ni disque
+crates/pt-core    indicateurs, comptabilité, stratégies, moteur, backtest, validation, sélection glissante, registre des essais (lu à la compilation) — aucun accès réseau ni disque
 crates/pt-data    bougies Binance (clôturées seulement), Fear & Greed, cache disque
 crates/pt-store   SQLite : état, exécutions complètes, courbe de valeur
-crates/pt-cli     `pt` : backtest et comparaison en ligne de commande
+crates/pt-cli     `pt` : backtest, comparaison, validation, sélection glissante, registre des essais
 src-tauri         application de bureau : boucle du mode direct + commandes
 ui                interface HTML/CSS/JS sans dépendance externe
 ```

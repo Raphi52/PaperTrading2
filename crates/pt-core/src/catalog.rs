@@ -183,6 +183,16 @@ pub fn catalog() -> Vec<Preset> {
     v
 }
 
+/// Plus long préchauffage (en bougies) des stratégies du catalogue sur `tf`.
+pub fn longest_warmup(tf: Timeframe) -> usize {
+    let all = catalog();
+    all.iter()
+        .filter(|p| p.timeframe == tf)
+        .map(Preset::warmup)
+        .max()
+        .unwrap_or_else(|| all.iter().map(Preset::warmup).max().unwrap_or(0))
+}
+
 pub fn find(id: &str) -> Option<Preset> {
     catalog().into_iter().find(|p| p.id == id)
 }

@@ -5,15 +5,21 @@
 //!   pt backtest --preset supertrend_10_3_4h --symbols BTCUSDT,ETHUSDT --days 1095
 //!   pt compare --symbols BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT,XRPUSDT --days 1095 --md rapport.md
 //!   pt validate --preset macd_1d --preset donchian_55_20_1d --days 3650 --md validation.md
+//!   pt walkforward --lookback 2 --md docs/walkforward.md
+//!   pt essais
 
 use anyhow::{bail, Result};
 use clap::{Parser, Subcommand};
-use pt_core::backtest::{evaluate, BacktestReport, EvalSettings};
-use pt_core::validation::{rolling_validation, tested_strategies_in_catalog, Outcome, RollingConfig, RollingReport};
+use pt_core::backtest::{evaluate, history_start, BacktestReport, EvalSettings};
+use pt_core::essais;
+use pt_core::validation::{rolling_validation, tested_strategies, Outcome, RollingConfig, RollingReport};
+use pt_core::walkforward::{score_candidates, walk_forward, Candidate, WalkForwardReport};
 use pt_core::{catalog, CostModel, External, Preset, Timeframe};
 use pt_data::{fetch_fear_greed, BinanceClient, HistoryCache};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+
+const DAY_MS: i64 = 86_400_000;
 
 #[derive(Parser)]
 #[command(name = "pt", about = "PaperTrading2 — backtests honnêtes, frais compris, contre « acheter et garder »")]
@@ -62,7 +68,7 @@ fn rolling_cfg(c: &Common) -> Option<RollingConfig> {
     (!c.no_validation).then(|| RollingConfig {
         window_days: c.window,
         step_days: c.step,
-        tested_strategies: tested_strategies_in_catalog(),
+        tested_strategies: tested_strategies(),
         initial_cash: c.cash,
     })
 }
@@ -71,16 +77,24 @@ fn settings(c: &Common, period_start: i64) -> EvalSettings {
     EvalSettings { costs: costs(c), initial_cash: c.cash, oos_fraction: c.oos, period_start, rolling: rolling_cfg(c) }
 }
 
-/// Début de l'historique à charger : la période affichée, ou plus pour la validation.
-fn history_start(c: &Common, now: i64) -> i64 {
-    let days = if c.no_validation { c.days } else { c.days.max(c.validation_days) };
-    now - days * 86_400_000
+/// Début de l'historique à charger sur `tf` : la période affichée plus le plus long
+/// préchauffage du catalogue (pour que toutes les stratégies affichent la même
+/// période), ou plus encore pour la validation.
+fn load_from(c: &Common, now: i64, tf: Timeframe) -> i64 {
+    let from = history_start(now - c.days * DAY_MS, tf);
+    if c.no_validation {
+        from
+    } else {
+        from.min(now - c.validation_days * DAY_MS)
+    }
 }
 
 #[derive(Subcommand)]
 enum Cmd {
     /// Liste le catalogue des stratégies.
     Presets,
+    /// Registre des essais : combien de stratégies et de variantes ont été essayées.
+    Essais,
     /// Backtest d'une stratégie.
     Backtest {
         #[arg(long)]
@@ -96,6 +110,33 @@ enum Cmd {
         #[command(flatten)]
         common: Common,
         /// Écrit le tableau en Markdown.
+        #[arg(long)]
+        md: Option<PathBuf>,
+    },
+    /// Sélection glissante : pour chaque fenêtre, joue la stratégie qui a le mieux
+    /// battu le hasard sur les fenêtres déjà terminées, puis juge ce procédé.
+    Walkforward {
+        #[arg(long, default_value = "BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT,XRPUSDT")]
+        symbols: String,
+        /// Profondeur d'historique, en jours.
+        #[arg(long, default_value_t = 3650)]
+        days: i64,
+        /// Durée d'une fenêtre, en jours.
+        #[arg(long, default_value_t = 180)]
+        window: i64,
+        /// Décalage entre deux fenêtres, en jours.
+        #[arg(long, default_value_t = 90)]
+        step: i64,
+        /// Fenêtres terminées regardées pour choisir (plusieurs valeurs : 1,2,4 ; chacune est un essai).
+        #[arg(long, value_delimiter = ',', default_value = "2")]
+        lookback: Vec<usize>,
+        #[arg(long, default_value_t = 0.1)]
+        fee: f64,
+        #[arg(long, default_value_t = 2.0)]
+        slippage_bps: f64,
+        #[arg(long, default_value_t = 10_000.0)]
+        cash: f64,
+        /// Écrit le rapport en Markdown.
         #[arg(long)]
         md: Option<PathBuf>,
     },
@@ -115,7 +156,7 @@ enum Cmd {
         /// Décalage entre deux fenêtres, en jours.
         #[arg(long, default_value_t = 90)]
         step: i64,
-        /// Nombre de stratégies essayées avant de retenir celles-ci (par défaut : tout le catalogue).
+        /// Nombre de stratégies essayées avant de retenir celles-ci (par défaut, et au minimum : le registre des essais).
         #[arg(long)]
         tested: Option<usize>,
         #[arg(long, default_value_t = 0.1)]
@@ -198,27 +239,142 @@ struct Loader {
 }
 
 impl Loader {
-    async fn get(
-        &mut self,
-        preset: &Preset,
-        symbols: &[String],
-        start: i64,
-    ) -> Result<(BTreeMap<String, Vec<pt_core::Candle>>, External)> {
+    /// Charge (une fois par unité de temps) ce dont `preset` a besoin.
+    async fn ensure(&mut self, preset: &Preset, symbols: &[String], start: i64) -> Result<()> {
         let tf = preset.timeframe;
         if !self.series.contains_key(&tf) {
             eprintln!("… bougies {tf} pour {}", symbols.join(", "));
             let s = self.cache.series(symbols, tf, start).await?;
             self.series.insert(tf, s);
         }
+        if preset.needs_fear_greed() && self.fear_greed.is_none() {
+            eprintln!("… historique Fear & Greed");
+            self.fear_greed = Some(fetch_fear_greed().await?);
+        }
+        Ok(())
+    }
+
+    async fn get(
+        &mut self,
+        preset: &Preset,
+        symbols: &[String],
+        start: i64,
+    ) -> Result<(BTreeMap<String, Vec<pt_core::Candle>>, External)> {
+        self.ensure(preset, symbols, start).await?;
         let mut ext = External::default();
         if preset.needs_fear_greed() {
-            if self.fear_greed.is_none() {
-                eprintln!("… historique Fear & Greed");
-                self.fear_greed = Some(fetch_fear_greed().await?);
-            }
             ext.fear_greed = self.fear_greed.clone().unwrap_or_default();
         }
-        Ok((self.series[&tf].clone(), ext))
+        Ok((self.series[&preset.timeframe].clone(), ext))
+    }
+}
+
+/// Valeurs de `--lookback` : au moins 1, sans doublon.
+fn parse_lookbacks(asked: &[usize]) -> Result<Vec<usize>> {
+    let mut out: Vec<usize> = Vec::new();
+    for &l in asked {
+        if l == 0 {
+            bail!("--lookback 0 refusé : il faut au moins une fenêtre terminée pour choisir");
+        }
+        if !out.contains(&l) {
+            out.push(l);
+        }
+    }
+    if out.is_empty() {
+        bail!("--lookback attend au moins une valeur, par exemple 2");
+    }
+    Ok(out)
+}
+
+/// Une variante de sélection ne se lance sur les données réelles qu'une fois
+/// inscrite au registre : l'essayer puis l'oublier rendrait le verdict plus
+/// flatteur qu'il n'est. Rend le nombre de variantes à compter.
+fn registered_selections(fingerprints: &[String], today: &str) -> Result<usize> {
+    let reg = essais::registry();
+    let missing = essais::unregistered_selections(&reg, fingerprints);
+    if !missing.is_empty() {
+        let lines: Vec<String> = missing.iter().map(|f| format!("{today}\tselection\twalkforward\t{f}")).collect();
+        bail!(
+            "variante(s) de sélection absente(s) du registre des essais. Ajoute d'abord ces lignes à {} (séparateur : tabulation) ; elles compteront dans la correction :\n{}",
+            essais::REGISTRY_PATH,
+            lines.join("\n")
+        );
+    }
+    Ok(essais::selection_trials_in(&reg, fingerprints))
+}
+
+fn outcome_label(o: Outcome) -> &'static str {
+    match o {
+        Outcome::Win => "gagnée",
+        Outcome::Loss => "perdue",
+        Outcome::Tie => "nulle",
+    }
+}
+
+fn walkforward_markdown(r: &WalkForwardReport) -> String {
+    let t = &r.sign_test;
+    let mut s = format!(
+        "## Choix sur les {} dernière(s) fenêtre(s) terminée(s)\n\nVerdict : {}\n\n{}\n\n",
+        r.lookback,
+        r.verdict.label(),
+        r.verdict_reason
+    );
+    s.push_str(&format!(
+        "- {} fenêtre(s) jouée(s) sur {} ; {} stratégies candidates ; fenêtres de {} jours décalées de {} jours. Le choix d'une fenêtre ne regarde que les fenêtres terminées avant son début.\n",
+        r.played, r.windows.len(), r.candidates, r.window_days, r.step_days
+    ));
+    s.push_str(&format!(
+        "- Test du signe sur une fenêtre sur {} (découpage le moins favorable) : {} gagnée(s), {} perdue(s), {} nulle(s) ou non jouée(s). Probabilité à pile ou face : {:.4} ; corrigée pour {} variante(s) de sélection essayée(s) : {:.4}.\n",
+        r.stride, t.wins, t.losses, t.ties, t.p_value, r.tested_selections, r.p_adjusted
+    ));
+    s.push_str(&format!(
+        "- Écart médian avec un achat au hasard de même exposition : {:+.1} points par fenêtre jouée.\n",
+        r.median_excess_pct
+    ));
+    s.push_str(&format!(
+        "- Les {} fenêtres jouées de ce découpage, mises bout à bout (elles ne se chevauchent pas) : sélection {:+.1} %, achat au hasard de même exposition {:+.1} %, « acheter et garder » {:+.1} %.\n",
+        r.independent_played, r.compounded_return_pct, r.compounded_matched_pct, r.compounded_benchmark_pct
+    ));
+    let picks: Vec<String> = r.picks.iter().map(|(id, n)| format!("{id} ×{n}")).collect();
+    s.push_str(&format!("- Stratégies choisies : {}.\n\n", picks.join(", ")));
+    s.push_str("| Début | Fin | Stratégie choisie | Écart passé | Expo. | Rendement | Acheter-garder | Hasard à expo. égale | Écart | Résultat |\n");
+    s.push_str("|---|---|---|---:|---:|---:|---:|---:|---:|---|\n");
+    for w in &r.windows {
+        match (&w.result, &w.chosen_name, w.past_score) {
+            (Some(x), Some(name), Some(score)) => s.push_str(&format!(
+                "| {} | {} | {} | {:+.1} | {:.0} % | {:+.1} % | {:+.1} % | {:+.1} % | {:+.1} | {} |\n",
+                date(w.start),
+                date(w.end - 1),
+                name,
+                score,
+                x.exposure_pct,
+                x.return_pct,
+                x.benchmark_return_pct,
+                x.matched_return_pct,
+                x.excess_pct,
+                outcome_label(x.outcome)
+            )),
+            _ => s.push_str(&format!(
+                "| {} | {} | — (pas assez de fenêtres terminées) | | | | | | | non jouée |\n",
+                date(w.start),
+                date(w.end - 1)
+            )),
+        }
+    }
+    s.push('\n');
+    s
+}
+
+/// `--tested` : par défaut le registre ; jamais en dessous (ce serait oublier des essais).
+fn tested_count(asked: Option<usize>) -> Result<usize> {
+    let floor = tested_strategies();
+    match asked {
+        None => Ok(floor),
+        Some(n) if n < floor => bail!(
+            "--tested {n} refusé : le registre des essais ({}) compte déjà {floor} stratégies essayées. Une valeur plus petite rendrait le verdict plus flatteur qu'il n'est.",
+            essais::REGISTRY_PATH
+        ),
+        Some(n) => Ok(n),
     }
 }
 
@@ -226,8 +382,33 @@ fn costs(c: &Common) -> CostModel {
     CostModel { fee_rate: c.fee / 100.0, slippage_bps: c.slippage_bps }
 }
 
-fn symbols(c: &Common) -> Vec<String> {
-    c.symbols.split(',').map(|s| s.trim().to_uppercase()).filter(|s| !s.is_empty()).collect()
+/// Symboles : en majuscules, sans doublon, jamais vide.
+fn parse_symbols(raw: &str) -> Result<Vec<String>> {
+    let mut out: Vec<String> = Vec::new();
+    for s in raw.split(',').map(|s| s.trim().to_uppercase()).filter(|s| !s.is_empty()) {
+        if !out.contains(&s) {
+            out.push(s);
+        }
+    }
+    if out.is_empty() {
+        bail!("aucun symbole : --symbols attend une liste comme BTCUSDT,ETHUSDT");
+    }
+    Ok(out)
+}
+
+fn check_range(name: &str, value: i64, range: std::ops::RangeInclusive<i64>) -> Result<()> {
+    if !range.contains(&value) {
+        bail!("{name} {value} refusé : entre {} et {} jours", range.start(), range.end());
+    }
+    Ok(())
+}
+
+/// Mêmes bornes que l'application, vérifiées AVANT tout téléchargement ou calcul.
+fn check_common(c: &Common) -> Result<Vec<String>> {
+    check_range("--days", c.days, 30..=3650)?;
+    check_range("--validation-days", c.validation_days, 365..=3650)?;
+    RollingConfig { window_days: c.window, step_days: c.step, tested_strategies: 1, initial_cash: c.cash }.check()?;
+    parse_symbols(&c.symbols)
 }
 
 fn print_report(r: &BacktestReport) {
@@ -301,7 +482,7 @@ fn markdown(rows: &[BacktestReport], syms: &[String], c: &Common) -> String {
             c.validation_days,
             c.window,
             c.step,
-            tested_strategies_in_catalog()
+            tested_strategies()
         ));
     }
     s.push_str("« Hasard à expo. égale » = `(1 + R)^f − 1` : ce qu'un achat au hasard, investi la même part du temps `f`, obtient en moyenne quand « acheter et garder » fait `R`.\n\n");
@@ -345,6 +526,20 @@ async fn main() -> Result<()> {
     };
     let now = pt_data::now_ms();
     match cli.cmd {
+        Cmd::Essais => {
+            let reg = essais::registry();
+            let missing = essais::unregistered_strategies(&reg, &catalog(), &date(now));
+            println!("Stratégies à compter dans la correction : {} (registre ∪ catalogue).", tested_strategies());
+            println!("Variantes de sélection inscrites : {}.", essais::selection_trials_in(&reg, &[]));
+            if missing.is_empty() {
+                println!("Toutes les stratégies du catalogue sont inscrites dans {}.", essais::REGISTRY_PATH);
+            } else {
+                println!("Stratégies du catalogue absentes de {} : ajoute ces lignes.", essais::REGISTRY_PATH);
+                for t in &missing {
+                    println!("{}", t.line());
+                }
+            }
+        }
         Cmd::Presets => {
             for p in catalog() {
                 println!("{:<26} {:<4} {:<22} {}", p.id, p.timeframe.as_str(), p.family, p.name);
@@ -352,8 +547,8 @@ async fn main() -> Result<()> {
         }
         Cmd::Backtest { preset, common, json } => {
             let Some(p) = pt_core::find(&preset) else { bail!("stratégie inconnue : {preset} (voir `pt presets`)") };
-            let syms = symbols(&common);
-            let (history, ext) = loader.get(&p, &syms, history_start(&common, now)).await?;
+            let syms = check_common(&common)?;
+            let (history, ext) = loader.get(&p, &syms, load_from(&common, now, p.timeframe)).await?;
             let period_start = now - common.days * 86_400_000;
             let r = evaluate(&p, &history, &ext, settings(&common, period_start))?;
             print_report(&r);
@@ -363,12 +558,11 @@ async fn main() -> Result<()> {
             }
         }
         Cmd::Compare { common, md } => {
-            let syms = symbols(&common);
-            let start = history_start(&common, now);
+            let syms = check_common(&common)?;
             let period_start = now - common.days * 86_400_000;
             let mut rows = Vec::new();
             for p in catalog() {
-                let (history, ext) = loader.get(&p, &syms, start).await?;
+                let (history, ext) = loader.get(&p, &syms, load_from(&common, now, p.timeframe)).await?;
                 let res = evaluate(&p, &history, &ext, settings(&common, period_start));
                 match res {
                     Ok(r) => {
@@ -386,15 +580,54 @@ async fn main() -> Result<()> {
                 eprintln!("tableau écrit : {}", path.display());
             }
         }
+        Cmd::Walkforward { symbols: raw, days, window, step, lookback, fee, slippage_bps, cash, md } => {
+            let syms = parse_symbols(&raw)?;
+            check_range("--days", days, 365..=3650)?;
+            RollingConfig { window_days: window, step_days: step, tested_strategies: 1, initial_cash: cash }.check()?;
+            let lookbacks = parse_lookbacks(&lookback)?;
+            let fingerprints: Vec<String> =
+                lookbacks.iter().map(|l| essais::selection_fingerprint(*l, window, step)).collect();
+            let tested = registered_selections(&fingerprints, &date(now))?;
+            let start = now - days * DAY_MS;
+            let presets: Vec<Preset> = catalog().into_iter().filter(|p| !p.is_benchmark()).collect();
+            for p in &presets {
+                loader.ensure(p, &syms, start).await?;
+            }
+            let ext = External { fear_greed: loader.fear_greed.clone().unwrap_or_default() };
+            let candidates: Vec<Candidate> = presets
+                .iter()
+                .map(|p| Candidate { preset: p, series: &loader.series[&p.timeframe], ext: &ext })
+                .collect();
+            let cost = CostModel { fee_rate: fee / 100.0, slippage_bps };
+            eprintln!("… {} stratégies rejouées sur une grille commune de fenêtres", candidates.len());
+            let scores = score_candidates(&candidates, cost, window, step, cash)?;
+            let mut text = format!(
+                "# Sélection glissante — {}\n\nFrais {fee:.2} % par côté, glissement {slippage_bps} pb, historique demandé : {days} jours. Les {} stratégies du catalogue (la référence exclue) sont rejouées sur la même grille de fenêtres ; chaque fenêtre repart de zéro et se compare à un achat au hasard de même exposition, `(1 + R)^f − 1`. Pour chaque fenêtre, on joue la stratégie qui a le mieux battu ce hasard, en moyenne, sur les dernières fenêtres TERMINÉES avant son début. Variantes de sélection comptées dans la correction : {tested} (registre des essais ∪ variantes demandées).\n\n",
+                syms.join(", "),
+                candidates.len()
+            );
+            for l in &lookbacks {
+                let r = walk_forward(&scores, *l, tested);
+                eprintln!("  lookback {l} : {} — {}", r.verdict.label(), r.verdict_reason);
+                text.push_str(&walkforward_markdown(&r));
+            }
+            println!("{text}");
+            if let Some(path) = md {
+                std::fs::write(&path, &text)?;
+                eprintln!("rapport écrit : {}", path.display());
+            }
+        }
         Cmd::Validate { presets, symbols: raw, days, window, step, tested, fee, slippage_bps, cash, md } => {
-            let syms: Vec<String> = raw.split(',').map(|s| s.trim().to_uppercase()).filter(|s| !s.is_empty()).collect();
+            let syms = parse_symbols(&raw)?;
+            check_range("--days", days, 365..=3650)?;
             let start = now - days * 86_400_000;
             let cfg = RollingConfig {
                 window_days: window,
                 step_days: step,
-                tested_strategies: tested.unwrap_or_else(tested_strategies_in_catalog),
+                tested_strategies: tested_count(tested)?,
                 initial_cash: cash,
             };
+            cfg.check()?;
             let cost = CostModel { fee_rate: fee / 100.0, slippage_bps };
             let mut text = format!(
                 "# Validation sur fenêtres glissantes — {}\n\nFrais {fee:.2} % par côté, glissement {slippage_bps} pb, historique demandé : {days} jours. Chaque fenêtre repart de zéro et se compare à « acheter et garder » ramené à la même exposition : `(1 + R)^f − 1`, ce qu'un timing au hasard investi la fraction `f` du temps obtient en moyenne.\n\n",
@@ -419,6 +652,55 @@ async fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    #[test]
+    fn lookback_values_are_checked() {
+        assert!(parse_lookbacks(&[0]).is_err());
+        assert!(parse_lookbacks(&[2, 0]).is_err());
+        assert!(parse_lookbacks(&[]).is_err());
+        assert_eq!(parse_lookbacks(&[2, 2, 1]).unwrap(), vec![2, 1]);
+    }
+
+    #[test]
+    fn unregistered_selection_is_refused() {
+        let registered = essais::selection_fingerprint(2, 180, 90);
+        assert!(registered_selections(&[registered], "2026-10-06").unwrap() >= 1);
+        let err = registered_selections(&[essais::selection_fingerprint(97, 180, 90)], "2026-10-06").unwrap_err();
+        assert!(err.to_string().contains("lookback=97;window=180;step=90"), "{err}");
+    }
+
+    #[test]
+    fn empty_symbol_list_is_refused() {
+        assert!(parse_symbols("").is_err());
+        assert!(parse_symbols(" , ,,").is_err());
+        assert_eq!(parse_symbols("btcusdt").unwrap(), vec!["BTCUSDT"]);
+    }
+
+    #[test]
+    fn repeated_symbols_count_once() {
+        assert_eq!(parse_symbols("BTCUSDT, btcusdt,ETHUSDT,BTCUSDT").unwrap(), vec!["BTCUSDT", "ETHUSDT"]);
+    }
+
+    #[test]
+    fn days_are_bounded_like_the_app() {
+        assert!(check_range("--days", 0, 30..=3650).is_err());
+        assert!(check_range("--days", -5, 30..=3650).is_err());
+        assert!(check_range("--days", 3651, 30..=3650).is_err());
+        assert!(check_range("--days", 30, 30..=3650).is_ok());
+        assert!(check_range("--days", 3650, 30..=3650).is_ok());
+    }
+
+    #[test]
+    fn tested_below_registry_is_refused() {
+        let floor = tested_strategies();
+        assert_eq!(tested_count(None).unwrap(), floor);
+        assert!(tested_count(Some(0)).is_err());
+        assert!(tested_count(Some(floor - 1)).is_err());
+        assert_eq!(tested_count(Some(floor)).unwrap(), floor);
+        assert_eq!(tested_count(Some(floor + 10)).unwrap(), floor + 10);
+    }
+
     #[test]
     fn date_formatting() {
         assert_eq!(super::date(0), "1970-01-01");

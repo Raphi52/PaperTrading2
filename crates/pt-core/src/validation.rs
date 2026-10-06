@@ -53,20 +53,38 @@ pub struct RollingConfig {
     pub initial_cash: f64,
 }
 
+impl RollingConfig {
+    /// Refuse une configuration invalide, avant tout calcul.
+    pub fn check(&self) -> Result<(), ValidationError> {
+        if self.window_days < 30 || self.step_days < 1 || self.step_days > self.window_days {
+            return Err(ValidationError::InvalidConfig(
+                "la fenêtre doit durer au moins 30 jours, et le pas être compris entre 1 jour et la durée d'une fenêtre"
+                    .into(),
+            ));
+        }
+        if !(self.initial_cash.is_finite() && self.initial_cash > 0.0) {
+            return Err(ValidationError::InvalidConfig("capital initial invalide".into()));
+        }
+        Ok(())
+    }
+}
+
 impl Default for RollingConfig {
     fn default() -> Self {
         RollingConfig {
             window_days: 180,
             step_days: 90,
-            tested_strategies: tested_strategies_in_catalog(),
+            tested_strategies: tested_strategies(),
             initial_cash: 10_000.0,
         }
     }
 }
 
-/// Nombre de stratégies que le comparateur met en concurrence (la référence exclue).
-pub fn tested_strategies_in_catalog() -> usize {
-    catalog::catalog().iter().filter(|p| !p.is_benchmark()).count()
+/// Nombre de stratégies à compter dans la correction : le registre des essais
+/// ∪ le catalogue actuel (la référence exclue). Retirer une stratégie ou changer
+/// un réglage ne peut jamais faire baisser ce nombre (voir [`crate::essais`]).
+pub fn tested_strategies() -> usize {
+    crate::essais::strategy_trials()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -255,7 +273,7 @@ pub fn judge_rolling(test: &SignTest, tested_strategies: usize) -> (Robustness, 
     }
 }
 
-fn fmt_p(p: f64) -> String {
+pub(crate) fn fmt_p(p: f64) -> String {
     if p < 0.001 {
         format!("{:.2} ‰", p * 1000.0)
     } else {
@@ -263,7 +281,7 @@ fn fmt_p(p: f64) -> String {
     }
 }
 
-fn median(v: &mut [f64]) -> f64 {
+pub(crate) fn median(v: &mut [f64]) -> f64 {
     if v.is_empty() {
         return 0.0;
     }
@@ -360,15 +378,7 @@ pub fn rolling_validation(
     costs: CostModel,
     config: RollingConfig,
 ) -> Result<RollingReport, ValidationError> {
-    if config.window_days < 30 || config.step_days < 1 || config.step_days > config.window_days {
-        return Err(ValidationError::InvalidConfig(
-            "la fenêtre doit durer au moins 30 jours, et le pas être compris entre 1 jour et la durée d'une fenêtre"
-                .into(),
-        ));
-    }
-    if !(config.initial_cash.is_finite() && config.initial_cash > 0.0) {
-        return Err(ValidationError::InvalidConfig("capital initial invalide".into()));
-    }
+    config.check()?;
     let warmup = preset.warmup();
     // Première fenêtre : dès qu'un symbole a fini son préchauffage.
     let first = series.values().filter(|c| c.len() > warmup).map(|c| c[warmup].open_time).min();

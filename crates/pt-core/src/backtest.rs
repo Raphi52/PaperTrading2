@@ -371,6 +371,27 @@ pub fn since(series: &BTreeMap<String, Vec<Candle>>, start: i64) -> BTreeMap<Str
     series.iter().map(|(s, c)| (s.clone(), c[c.partition_point(|x| x.open_time < start)..].to_vec())).collect()
 }
 
+/// Bougies à partir de `start`, plus les `warmup` bougies qui le précèdent : la
+/// stratégie se préchauffe AVANT la période, qui commence donc bien à `start`
+/// (comme chaque fenêtre de la validation).
+pub fn with_warmup(series: &BTreeMap<String, Vec<Candle>>, start: i64, warmup: usize) -> BTreeMap<String, Vec<Candle>> {
+    series
+        .iter()
+        .map(|(s, c)| {
+            let first = c.partition_point(|x| x.open_time < start).saturating_sub(warmup);
+            (s.clone(), c[first..].to_vec())
+        })
+        .collect()
+}
+
+/// Début de l'historique à charger pour afficher une période commençant à
+/// `period_start` sur l'unité de temps `tf` : la période, plus le plus long
+/// préchauffage du catalogue sur cette unité de temps. Le même historique sert
+/// ainsi à toutes les stratégies, qui affichent toutes la même période.
+pub fn history_start(period_start: i64, tf: Timeframe) -> i64 {
+    period_start - catalog::longest_warmup(tf) as i64 * tf.millis()
+}
+
 /// Réglages d'une évaluation complète.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct EvalSettings {
@@ -394,7 +415,7 @@ pub fn evaluate(
     s: EvalSettings,
 ) -> Result<BacktestReport, BacktestError> {
     let costs = s.costs;
-    let period = since(history, s.period_start);
+    let period = with_warmup(history, s.period_start, preset.warmup());
     let mut report = backtest(preset, &period, ext, costs, s.initial_cash, s.oos_fraction)?;
     if preset.is_benchmark() {
         return Ok(report);
@@ -610,6 +631,83 @@ mod tests {
             assert_eq!(full.verdict == Verdict::Solide, v.verdict == Robustness::PasDeLaChance, "{}", p.id);
             // Le backtest affiché ne dépend pas de la validation.
             assert_eq!(full.metrics, alone.metrics, "{}", p.id);
+        }
+    }
+
+    fn on_timeframe(n: usize, seeds: &[u64], tf: Timeframe) -> BTreeMap<String, Vec<Candle>> {
+        let step = tf.millis();
+        seeds
+            .iter()
+            .map(|s| {
+                let c = synthetic(n, *s)
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, mut c)| {
+                        c.open_time = i as i64 * step;
+                        c.close_time = c.open_time + step - 1;
+                        c
+                    })
+                    .collect();
+                (format!("S{s}USDT"), c)
+            })
+            .collect()
+    }
+
+    /// Toutes les stratégies d'une même unité de temps affichent la MÊME période,
+    /// qui commence à la date demandée : le préchauffage se fait sur les bougies
+    /// d'avant. (Avant : il était pris dans la période, d'une durée différente pour
+    /// chaque stratégie ; « acheter et garder » allait de −8,6 % à +129,7 % sur la
+    /// même période demandée.)
+    #[test]
+    fn every_strategy_shows_the_same_period() {
+        let costs = CostModel::default();
+        let ext = External::default();
+        for tf in [Timeframe::H1, Timeframe::H4, Timeframe::D1] {
+            let history = on_timeframe(1800, &[11, 12], tf);
+            let period_start = 900 * tf.millis();
+            let settings =
+                EvalSettings { costs, initial_cash: 10_000.0, oos_fraction: 0.3, period_start, rolling: None };
+            let reports: Vec<BacktestReport> = catalog::catalog()
+                .into_iter()
+                .filter(|p| p.timeframe == tf)
+                .map(|p| evaluate(&p, &history, &ext, settings).unwrap())
+                .collect();
+            assert!(reports.len() > 2, "{tf} : trop peu de stratégies pour le test");
+            for r in &reports {
+                assert_eq!(
+                    r.start_time,
+                    period_start + tf.millis() - 1,
+                    "{} ({tf}) commence à la clôture de la première bougie de la période",
+                    r.preset_id
+                );
+                assert_eq!(r.benchmark, reports[0].benchmark, "{} ({tf}) : autre « acheter et garder »", r.preset_id);
+            }
+        }
+    }
+
+    /// L'historique chargé couvre le préchauffage de toutes les stratégies de
+    /// l'unité de temps, même sans validation : la période commence bien à la
+    /// date demandée.
+    #[test]
+    fn history_includes_warmup_without_validation() {
+        let costs = CostModel::default();
+        let ext = External::default();
+        for tf in [Timeframe::H1, Timeframe::H4, Timeframe::D1] {
+            let full = on_timeframe(2000, &[13, 14], tf);
+            let period_start = 1500 * tf.millis();
+            let from = history_start(period_start, tf);
+            let loaded = since(&full, from);
+            let settings =
+                EvalSettings { costs, initial_cash: 10_000.0, oos_fraction: 0.3, period_start, rolling: None };
+            for p in catalog::catalog().into_iter().filter(|p| p.timeframe == tf) {
+                assert!(
+                    from <= period_start - p.warmup() as i64 * tf.millis(),
+                    "{} : l'historique chargé ne couvre pas son préchauffage",
+                    p.id
+                );
+                let r = evaluate(&p, &loaded, &ext, settings).unwrap();
+                assert_eq!(r.start_time, period_start + tf.millis() - 1, "{} ({tf})", p.id);
+            }
         }
     }
 

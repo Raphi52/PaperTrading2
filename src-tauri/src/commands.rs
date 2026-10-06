@@ -1,9 +1,9 @@
 //! Commandes appelées par l'interface.
 
 use crate::state::{AppState, EngineStatus, Settings};
-use pt_core::backtest::{evaluate, BacktestReport, CurvePoint, EvalSettings, Metrics, Verdict};
+use pt_core::backtest::{evaluate, history_start, BacktestReport, CurvePoint, EvalSettings, Metrics, Verdict};
 use pt_core::portfolio::{ClosedTrade, Fill};
-use pt_core::validation::{tested_strategies_in_catalog, RollingConfig, RollingReport};
+use pt_core::validation::{tested_strategies, RollingConfig, RollingReport};
 use pt_core::{catalog as all_presets, find, Engine, External, Preset, Timeframe};
 use pt_data::HistoryCache;
 use pt_store::{EquityRow, LivePortfolio};
@@ -308,7 +308,7 @@ impl ValidationParams {
         Ok(RollingConfig {
             window_days: self.window_days,
             step_days: self.step_days,
-            tested_strategies: tested_strategies_in_catalog(),
+            tested_strategies: tested_strategies(),
             initial_cash: cash,
         })
     }
@@ -327,13 +327,9 @@ async fn load(
     state: &AppState,
     preset: &Preset,
     symbols: &[String],
-    days: i64,
+    start: i64,
 ) -> Res<(std::collections::BTreeMap<String, Vec<pt_core::Candle>>, External)> {
-    if !(30..=3650).contains(&days) {
-        return Err("la période doit être entre 30 jours et 10 ans".into());
-    }
     let cache = HistoryCache::new(&state.cache_dir, state.client.clone());
-    let start = pt_data::now_ms() - days * 86_400_000;
     let series = cache.series(symbols, preset.timeframe, start).await.map_err(|e| format!("{e:#}"))?;
     let mut ext = External::default();
     if preset.needs_fear_greed() {
@@ -354,9 +350,17 @@ async fn evaluate_one(
 ) -> Res<BacktestReport> {
     let settings = state.settings();
     let rolling = validation.map(|v| v.config(cash)).transpose()?;
-    let history_days = validation.map_or(days, |v| days.max(v.days));
-    let (history, ext) = load(state, &preset, symbols, history_days).await?;
-    let period_start = pt_data::now_ms() - days * 86_400_000;
+    if !(30..=3650).contains(&days) {
+        return Err("la période doit être entre 30 jours et 10 ans".into());
+    }
+    let now = pt_data::now_ms();
+    let period_start = now - days * 86_400_000;
+    // Préchauffage AVANT la période : toutes les stratégies affichent la même période.
+    let mut start = history_start(period_start, preset.timeframe);
+    if let Some(v) = validation {
+        start = start.min(now - v.days * 86_400_000);
+    }
+    let (history, ext) = load(state, &preset, symbols, start).await?;
     tauri::async_runtime::spawn_blocking(move || {
         evaluate(
             &preset,
