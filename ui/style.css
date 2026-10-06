@@ -112,7 +112,7 @@ tr.click { cursor: pointer; }
 tr.click:hover td { background: var(--panel-2); }
 .table-wrap { max-height: 460px; overflow: auto; border-radius: 8px; }
 
-.verdict { display: inline-block; padding: 2px 9px; border-radius: 999px; font-size: 11.5px; font-weight: 600; border: 1px solid; }
+.verdict { display: inline-block; padding: 2px 9px; border-radius: 999px; font-size: 11.5px; font-weight: 600; border: 1px solid; white-space: nowrap; }
 .v-Solide { color: var(--green); border-color: rgba(76,195,138,.5); }
 .v-Fragile { color: var(--gold-2); border-color: rgba(212,169,79,.5); }
 .v-Perdante { color: var(--red); border-color: rgba(229,103,95,.5); }

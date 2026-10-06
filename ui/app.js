@@ -349,6 +349,86 @@ function openBacktest(presetId, symbols) {
   runBacktest(presetId, btPicker.get(), Number(f.days.value), Number(f.cash.value));
 }
 
+// ---------- validation sur fenêtres glissantes ----------
+const ROBUSTNESS = {
+  PasDeLaChance: { label: "Pas un coup de chance", cls: "Solide" },
+  Prometteuse: { label: "Prometteuse, pas prouvée", cls: "Fragile" },
+  CompatibleAvecLaChance: { label: "Compatible avec la chance", cls: "Perdante" },
+  TropPeuDeFenetres: { label: "Trop peu de fenêtres", cls: "Insuffisant" },
+};
+const OUTCOME = { Win: "gagnée", Loss: "perdue", Tie: "nulle" };
+function windowsChart(windows) {
+  const W = 1000, H = 220, L = 54, R = 10, T = 12, B = 24;
+  if (!windows.length) return "";
+  const vals = windows.map((w) => w.excess_pct);
+  const hi = Math.max(1, ...vals), lo = Math.min(-1, ...vals);
+  const Y = (v) => T + ((hi - v) / (hi - lo)) * (H - T - B);
+  const slot = (W - L - R) / windows.length;
+  const bw = Math.max(2, slot * 0.72);
+  let s = `<line x1="${L}" x2="${W - R}" y1="${Y(0)}" y2="${Y(0)}" stroke="#5b667d"/>`;
+  for (const v of [hi, lo]) s += `<text x="${L - 6}" y="${Y(v) + 4}" text-anchor="end">${esc(pct(v, 0).replace(" %", " pts"))}</text>`;
+  windows.forEach((w, i) => {
+    const x = L + i * slot + (slot - bw) / 2;
+    const y0 = Y(0), y1 = Y(w.excess_pct);
+    const color = w.outcome === "Win" ? "#4cc38a" : w.outcome === "Loss" ? "#e5675f" : "#8b93a6";
+    s += `<rect x="${x.toFixed(1)}" y="${Math.min(y0, y1).toFixed(1)}" width="${bw.toFixed(1)}" height="${Math.max(1, Math.abs(y1 - y0)).toFixed(1)}" fill="${color}"><title>${esc(date(w.start))} → ${esc(date(w.end - 1))} : ${esc(pct(w.excess_pct, 1).replace(" %", " points"))}</title></rect>`;
+  });
+  const ticks = Math.min(6, windows.length);
+  for (let k = 0; k < ticks; k++) {
+    const i = Math.round((k * (windows.length - 1)) / Math.max(1, ticks - 1));
+    // Première et dernière étiquettes ancrées vers l'intérieur : sinon elles débordent du cadre.
+    const anchor = k === 0 ? "start" : k === ticks - 1 ? "end" : "middle";
+    const x = k === 0 ? L + i * slot : k === ticks - 1 ? L + (i + 1) * slot : L + i * slot + slot / 2;
+    s += `<text x="${x.toFixed(1)}" y="${H - 6}" text-anchor="${anchor}">${esc(date(windows[i].start))}</text>`;
+  }
+  return `<div class="legend"><span><i style="background:#4cc38a"></i>bat la référence à exposition égale</span><span><i style="background:#e5675f"></i>fait moins bien</span><span>hauteur = écart en points de rendement</span></div>
+    <svg class="chart" style="height:220px" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none">${s}</svg>`;
+}
+function renderValidation(r) {
+  const v = ROBUSTNESS[r.verdict] || { label: r.verdict, cls: "Insuffisant" };
+  const t = r.sign_test;
+  const n = r.windows.length;
+  $("#val-result").innerHTML = `
+    <div class="verdict-banner" style="margin-top:12px"><span class="verdict v-${v.cls} big">${esc(v.label)}</span>
+      <div><div>${esc(r.verdict_reason)}</div>
+      <div class="muted small">${esc(r.preset_name)} · ${n} fenêtres de ${r.config.window_days} jours décalées de ${r.config.step_days} jours, du ${date(r.windows[0].start)} au ${date(r.windows[n - 1].end - 1)} · test sur une fenêtre sur ${r.stride} (${t.wins} gagnée(s), ${t.losses} perdue(s), ${t.ties} nulle(s), découpage le moins favorable)</div></div></div>
+    <div class="grid-4" style="margin-bottom:10px">
+      <div class="kpi"><div class="v">${num(t.p_value * 100, 1)} %</div><div class="l">probabilité à pile ou face</div></div>
+      <div class="kpi"><div class="v">${num(r.p_adjusted * 100, 1)} %</div><div class="l">corrigée pour ${r.config.tested_strategies} stratégies essayées (seuil 5 %)</div></div>
+      <div class="kpi"><div class="v">${r.positive_windows}/${n}</div><div class="l">fenêtres en gain</div></div>
+      <div class="kpi"><div class="v ${cls(r.median_excess_pct)}">${pct(r.median_excess_pct, 1).replace(" %", " pts")}</div><div class="l">écart médian avec la référence à exposition égale</div></div>
+    </div>
+    ${windowsChart(r.windows)}
+    <details><summary class="muted small">Détail des ${n} fenêtres</summary><div class="table-wrap"><table>
+      <tr><th>Début</th><th>Fin</th><th class="num">Symboles</th><th class="num">Trades</th><th class="num">Exposition</th><th class="num">Stratégie</th><th class="num">Acheter-garder</th><th class="num">Réf. à expo. égale</th><th class="num">Écart</th><th class="num">Pire baisse</th><th class="num">Réf.</th><th>Résultat</th></tr>
+      ${r.windows.map((w) => `<tr><td>${date(w.start)}</td><td>${date(w.end - 1)}</td><td class="num">${w.symbols.length}</td><td class="num">${w.trades}</td><td class="num">${num(w.exposure_pct, 0)} %</td>
+        <td class="num">${signed(w.return_pct)}</td><td class="num muted">${pct(w.benchmark_return_pct)}</td><td class="num">${pct(w.matched_return_pct)}</td>
+        <td class="num">${signed(w.excess_pct, (x) => pct(x, 1).replace(" %", " pts"))}</td><td class="num">${pct(w.max_drawdown_pct).replace("+", "")}</td><td class="num muted">${pct(w.benchmark_max_drawdown_pct).replace("+", "")}</td>
+        <td><span class="verdict v-${w.outcome === "Win" ? "Solide" : w.outcome === "Loss" ? "Perdante" : "Insuffisant"}">${OUTCOME[w.outcome]}</span></td></tr>`).join("")}
+    </table></div></details>`;
+}
+$("#val-form").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const f = e.target;
+  const btn = $("#val-run");
+  btn.disabled = true;
+  btn.textContent = "Calcul…";
+  $("#val-result").innerHTML = `<div class="empty" style="margin-top:12px">Téléchargement de l'historique long (une seule fois, ensuite en cache) puis une exécution par fenêtre…</div>`;
+  try {
+    const r = await call("run_validation", { req: {
+      preset_id: $("#bt-preset").value, symbols: btPicker.get(), days: Number(f.days.value),
+      window_days: Number(f.window.value), step_days: Number(f.step.value), cash: Number($("#bt-form").cash.value),
+    } });
+    renderValidation(r);
+  } catch (err) {
+    $("#val-result").innerHTML = `<div class="notice err" style="margin-top:12px">${esc(err)}</div>`;
+  } finally {
+    btn.disabled = false;
+    btn.textContent = "Valider";
+  }
+});
+$("#bt-preset").addEventListener("change", () => ($("#val-result").innerHTML = ""));
+
 // ---------- comparateur ----------
 let cmpPicker;
 const RANK = { Solide: 0, Fragile: 1, Reference: 2, Perdante: 3, Insuffisant: 4 };

@@ -3,6 +3,7 @@
 use crate::state::{AppState, EngineStatus, Settings};
 use pt_core::backtest::{backtest, BacktestReport, CurvePoint, Metrics, Verdict};
 use pt_core::portfolio::{ClosedTrade, Fill};
+use pt_core::validation::{rolling_validation, tested_strategies_in_catalog, RollingConfig, RollingReport};
 use pt_core::{catalog as all_presets, find, Engine, External, Preset, Timeframe};
 use pt_data::HistoryCache;
 use pt_store::{EquityRow, LivePortfolio};
@@ -312,6 +313,38 @@ async fn load(
         ext.fear_greed = state.fear_greed().await.map_err(|e| format!("{e:#}"))?;
     }
     Ok((series, ext))
+}
+
+#[tauri::command]
+pub async fn run_validation(state: St<'_>, req: ValidationRequest) -> Res<RollingReport> {
+    let preset = find(&req.preset_id).ok_or_else(|| format!("stratégie inconnue : {}", req.preset_id))?;
+    let symbols = clean_symbols(&req.symbols)?;
+    if !(30..=730).contains(&req.window_days) || !(1..=req.window_days).contains(&req.step_days) {
+        return Err("la fenêtre doit durer de 30 à 730 jours, et le pas ne pas dépasser la fenêtre".into());
+    }
+    let costs = state.settings().costs;
+    let (series, ext) = load(&state, &preset, &symbols, req.days).await?;
+    let cfg = RollingConfig {
+        window_days: req.window_days,
+        step_days: req.step_days,
+        tested_strategies: tested_strategies_in_catalog(),
+        initial_cash: req.cash,
+    };
+    // Calcul long (une exécution par fenêtre) : hors du fil qui sert l'interface et le mode direct.
+    tauri::async_runtime::spawn_blocking(move || rolling_validation(&preset, &series, &ext, costs, cfg))
+        .await
+        .map_err(err)?
+        .map_err(err)
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ValidationRequest {
+    pub preset_id: String,
+    pub symbols: Vec<String>,
+    pub days: i64,
+    pub window_days: i64,
+    pub step_days: i64,
+    pub cash: f64,
 }
 
 #[tauri::command]

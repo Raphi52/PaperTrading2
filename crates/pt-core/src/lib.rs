@@ -11,6 +11,7 @@ pub mod engine;
 pub mod indicators;
 pub mod portfolio;
 pub mod strategy;
+pub mod validation;
 
 #[cfg(test)]
 pub(crate) mod testutil;
@@ -21,3 +22,4 @@ pub use catalog::{catalog, find};
 pub use engine::Engine;
 pub use portfolio::{ClosedTrade, CostModel, Fill, Portfolio, Position, Side};
 pub use strategy::{compute_signals, External, Preset, Signal};
+pub use validation::{rolling_validation, Robustness, RollingConfig, RollingReport};

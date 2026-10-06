@@ -32,15 +32,30 @@ C'est la réécriture complète de [PaperTrading](https://github.com/Raphi52/Pap
 
 Mesuré le 6 octobre 2026 sur BTC, ETH, SOL, BNB et XRP. Frais de 0,1 % par côté et glissement de 0,02 %. Les 30 % finaux de la période sont gardés hors échantillon. Tableau complet : [`docs/comparaison-2026-10-06.md`](docs/comparaison-2026-10-06.md).
 
-- **2 stratégies « Solides »** sur 30 : le croisement **MACD journalier** et la cassure **Donchian 55/20 journalière** (« Turtle »). Elles gagnent moins que la référence (+35 % contre +94 %), mais avec une pire baisse de **14 % au lieu de 61 %**. Leur rendement ajusté du risque est donc meilleur, aussi sur la période hors échantillon.
+- **2 stratégies « Solides » sur cette période** : le croisement **MACD journalier** et la cassure **Donchian 55/20 journalière** (« Turtle »). Elles gagnent moins que la référence (+35 % contre +94 %), mais avec une pire baisse de **14 % au lieu de 61 %**. **La validation sur 9 ans ci-dessous montre que ce n'est pas prouvé.**
 - **Les frais tuent les stratégies rapides.** Le croisement EMA 9/21 en 1h ferait **+171 % sans frais**, mais il tombe à **−45 % avec frais** (2 750 trades). Les stratégies 1h sont toutes perdantes.
 - **Aucune stratégie ne bat « acheter et garder » en rendement brut** sur cette période haussière.
-- Avec 30 stratégies testées, une ou deux peuvent passer par chance. Une stratégie « Solide » mérite un suivi en direct, pas une confiance aveugle.
+
+## Coup de chance ou pas ? Validation sur fenêtres glissantes
+
+Les deux « Solides » ont été rejouées de fin 2017 à juillet 2026, sur des fenêtres de 180 jours décalées de 90 jours (34 fenêtres). Chaque fenêtre repart de zéro. Chaque fenêtre se compare à « acheter et garder » **ramené à la même exposition** : `(1 + R)^f − 1`. C'est ce qu'obtient en moyenne un timing au hasard investi la fraction `f` du temps. Rapport complet : [`docs/validation-2026-10-06.md`](docs/validation-2026-10-06.md).
+
+| Stratégie | Fenêtres indépendantes gagnées | Probabilité à pile ou face | Corrigée pour 29 essais | Verdict |
+|---|---:|---:|---:|---|
+| Croisement MACD (1j) | 12 / 17 | 7,2 % | 100 % | **Compatible avec la chance** |
+| Cassure Donchian 55/20 (1j) | 9 / 17 | 50 % | 100 % | **Compatible avec la chance** |
+
+- **Aucune des deux n'est prouvée.** Le résultat ne dépend pas du découpage. Avec des fenêtres de 90 jours ou d'un an, avec ou sans chevauchement, aucune ne passe le seuil de 5 % une fois comptées les 29 stratégies essayées.
+- **MACD est la seule piste sérieuse.** Prise isolément, elle passe le seuil dans 2 des 5 découpages essayés (25 fenêtres sur 35 en 90 jours : 0,8 %). Elle gagne presque toutes les fenêtres jusqu'en 2022, mais **perd 6 des 12 dernières**, surtout les fenêtres haussières.
+- **Turtle 55/20 se comporte comme un pile ou face** dès que les fenêtres raccourcissent (10 gagnées sur 30 en 90 jours).
+- **Ce qui est réel : la protection.** Leur pire fenêtre de 6 mois est de −6,8 % et −4,3 %, contre −62 % pour « acheter et garder ». Cette protection vient surtout du fait de n'être investi qu'entre 0 et 21 % du capital, pas d'un talent de timing démontré.
+
+Pourquoi ne pas comparer simplement au Sharpe d'« acheter et garder » ? Parce qu'une stratégie qui achète **au hasard**, en restant souvent en liquide, « gagnerait » mécaniquement toutes les fenêtres baissières. La référence à exposition égale élimine ce biais. Le test ne retient que des fenêtres sans chevauchement, et garde le découpage le moins favorable.
 
 ## L'application
 
 - **Portefeuilles** : suivi en direct sur les prix réels. Chaque portefeuille a sa référence « acheter et garder » démarrée au même instant. Il démarre à la première bougie clôturée après sa création : aucun trade antidaté.
-- **Backtest** : courbe de valeur contre la référence, avec la frontière hors échantillon, les mesures (rendement, pire baisse, Sharpe, facteur de profit), le résultat « sans frais » et tous les trades.
+- **Backtest** : courbe de valeur contre la référence, avec la frontière hors échantillon, les mesures (rendement, pire baisse, Sharpe, facteur de profit), le résultat « sans frais » et tous les trades. Le panneau **« Est-ce un coup de chance ? »** rejoue la stratégie sur des fenêtres glissantes et rend le verdict ci-dessus.
 - **Comparateur** : tout le catalogue d'un coup, classé par verdict.
 - **Stratégies** : ce que chaque stratégie calcule, ses sorties et sa taille de position.
 - **Réglages** : frais, glissement, capital par défaut, part hors échantillon.
@@ -55,6 +70,7 @@ cargo test --workspace                # les tests
 cargo run --release -p pt-cli -- presets
 cargo run --release -p pt-cli -- backtest --preset macd_1d --symbols BTCUSDT,ETHUSDT --days 1095
 cargo run --release -p pt-cli -- compare --days 1095 --md rapport.md
+cargo run --release -p pt-cli -- validate --preset macd_1d --preset donchian_55_20_1d --days 3650 --window 180 --step 90 --md validation.md
 ```
 
 Variables d'environnement facultatives :

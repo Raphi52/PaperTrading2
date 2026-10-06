@@ -78,6 +78,17 @@
         <div class="symbol-picker" id="bt-symbols"></div>
       </form>
       <div id="bt-result"></div>
+      <div class="panel" id="val-panel">
+        <h2>Est-ce un coup de chance ?</h2>
+        <p class="muted small">Rejoue la stratégie choisie ci-dessus, sur les mêmes symboles, dans des fenêtres successives. Chaque fenêtre repart de zéro et se compare à « acheter et garder » <b>ramené à la même exposition</b> : une stratégie investie 20 % du temps doit battre ce qu'un achat au hasard, investi 20 % du temps, obtiendrait en moyenne. Le test ne garde que des fenêtres qui ne se chevauchent pas, et tient compte de toutes les stratégies du catalogue essayées avant de retenir celle-ci.</p>
+        <form id="val-form" class="grid-4">
+          <label>Historique (jours)<input name="days" type="number" min="365" max="3650" value="3650"></label>
+          <label>Durée d'une fenêtre (jours)<input name="window" type="number" min="30" max="730" value="180"></label>
+          <label>Décalage entre fenêtres (jours)<input name="step" type="number" min="1" max="730" value="90"></label>
+          <div class="form-actions"><button type="submit" id="val-run">Valider</button></div>
+        </form>
+        <div id="val-result"></div>
+      </div>
     </section>
 
     <!-- COMPARATEUR -->

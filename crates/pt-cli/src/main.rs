@@ -4,10 +4,12 @@
 //!   pt presets
 //!   pt backtest --preset supertrend_10_3_4h --symbols BTCUSDT,ETHUSDT --days 1095
 //!   pt compare --symbols BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT,XRPUSDT --days 1095 --md rapport.md
+//!   pt validate --preset macd_1d --preset donchian_55_20_1d --days 3650 --md validation.md
 
 use anyhow::{bail, Result};
 use clap::{Parser, Subcommand};
 use pt_core::backtest::{backtest, BacktestReport, Verdict};
+use pt_core::validation::{rolling_validation, tested_strategies_in_catalog, Outcome, RollingConfig, RollingReport};
 use pt_core::{catalog, CostModel, External, Preset, Timeframe};
 use pt_data::{fetch_fear_greed, BinanceClient, HistoryCache};
 use std::collections::BTreeMap;
@@ -66,6 +68,82 @@ enum Cmd {
         #[arg(long)]
         md: Option<PathBuf>,
     },
+    /// Est-ce un coup de chance ? Rejoue des stratégies sur des fenêtres glissantes.
+    Validate {
+        /// Stratégie à valider (option répétable).
+        #[arg(long = "preset", required = true)]
+        presets: Vec<String>,
+        #[arg(long, default_value = "BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT,XRPUSDT")]
+        symbols: String,
+        /// Profondeur d'historique, en jours (les symboles cotés plus tard entrent dès qu'ils sont prêts).
+        #[arg(long, default_value_t = 3650)]
+        days: i64,
+        /// Durée d'une fenêtre, en jours.
+        #[arg(long, default_value_t = 180)]
+        window: i64,
+        /// Décalage entre deux fenêtres, en jours.
+        #[arg(long, default_value_t = 90)]
+        step: i64,
+        /// Nombre de stratégies essayées avant de retenir celles-ci (par défaut : tout le catalogue).
+        #[arg(long)]
+        tested: Option<usize>,
+        #[arg(long, default_value_t = 0.1)]
+        fee: f64,
+        #[arg(long, default_value_t = 2.0)]
+        slippage_bps: f64,
+        #[arg(long, default_value_t = 10_000.0)]
+        cash: f64,
+        /// Écrit le rapport en Markdown.
+        #[arg(long)]
+        md: Option<PathBuf>,
+    },
+}
+
+fn validation_markdown(r: &RollingReport) -> String {
+    let t = &r.sign_test;
+    let mut s =
+        format!("## {} — {}\n\n**{}** — {}\n\n", r.preset_name, r.timeframe, r.verdict.label(), r.verdict_reason);
+    s.push_str(&format!(
+        "- {} fenêtres de {} jours, décalées de {} jours ; le test garde une fenêtre sur {} pour qu'elles ne se chevauchent pas (découpage le moins favorable retenu) : {} gagnée(s), {} perdue(s), {} nulle(s).\n",
+        r.windows.len(), r.config.window_days, r.config.step_days, r.stride, t.wins, t.losses, t.ties
+    ));
+    s.push_str(&format!(
+        "- Probabilité à pile ou face : {:.4} ; corrigée pour {} stratégies essayées : {:.4}.\n",
+        t.p_value, r.config.tested_strategies, r.p_adjusted
+    ));
+    s.push_str(&format!(
+        "- Fenêtres en gain : {}/{} · battant le Sharpe d'« acheter et garder » : {}/{} · écart médian avec la référence à exposition égale : {:+.1} points.\n",
+        r.positive_windows, r.windows.len(), r.beats_benchmark_sharpe, r.windows.len(), r.median_excess_pct
+    ));
+    s.push_str(&format!(
+        "- Pire fenêtre : {:+.1} % (« acheter et garder » : pire fenêtre {:+.1} %).\n\n",
+        r.worst_return_pct, r.worst_benchmark_return_pct
+    ));
+    s.push_str("| Début | Fin | Symboles | Trades | Exposition | Stratégie | Acheter-garder | Réf. à expo. égale | Écart | Pire baisse | Réf. | Résultat |\n");
+    s.push_str("|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|\n");
+    for w in &r.windows {
+        s.push_str(&format!(
+            "| {} | {} | {} | {} | {:.0} % | {:+.1} % | {:+.1} % | {:+.1} % | {:+.1} | {:.1} % | {:.1} % | {} |\n",
+            date(w.start),
+            date(w.end - 1),
+            w.symbols.len(),
+            w.trades,
+            w.exposure_pct,
+            w.return_pct,
+            w.benchmark_return_pct,
+            w.matched_return_pct,
+            w.excess_pct,
+            w.max_drawdown_pct,
+            w.benchmark_max_drawdown_pct,
+            match w.outcome {
+                Outcome::Win => "gagnée",
+                Outcome::Loss => "perdue",
+                Outcome::Tie => "nulle",
+            }
+        ));
+    }
+    s.push('\n');
+    s
 }
 
 fn date(ms: i64) -> String {
@@ -245,6 +323,33 @@ async fn main() -> Result<()> {
             if let Some(path) = md {
                 std::fs::write(&path, &text)?;
                 eprintln!("tableau écrit : {}", path.display());
+            }
+        }
+        Cmd::Validate { presets, symbols: raw, days, window, step, tested, fee, slippage_bps, cash, md } => {
+            let syms: Vec<String> = raw.split(',').map(|s| s.trim().to_uppercase()).filter(|s| !s.is_empty()).collect();
+            let start = now - days * 86_400_000;
+            let cfg = RollingConfig {
+                window_days: window,
+                step_days: step,
+                tested_strategies: tested.unwrap_or_else(tested_strategies_in_catalog),
+                initial_cash: cash,
+            };
+            let cost = CostModel { fee_rate: fee / 100.0, slippage_bps };
+            let mut text = format!(
+                "# Validation sur fenêtres glissantes — {}\n\nFrais {fee:.2} % par côté, glissement {slippage_bps} pb, historique demandé : {days} jours. Chaque fenêtre repart de zéro et se compare à « acheter et garder » ramené à la même exposition : `(1 + R)^f − 1`, ce qu'un timing au hasard investi la fraction `f` du temps obtient en moyenne.\n\n",
+                syms.join(", ")
+            );
+            for id in &presets {
+                let Some(p) = pt_core::find(id) else { bail!("stratégie inconnue : {id} (voir `pt presets`)") };
+                let (series, ext) = loader.get(&p, &syms, start).await?;
+                let r = rolling_validation(&p, &series, &ext, cost, cfg)?;
+                eprintln!("  {:<22} {} — {}", p.id, r.verdict.label(), r.verdict_reason);
+                text.push_str(&validation_markdown(&r));
+            }
+            println!("{text}");
+            if let Some(path) = md {
+                std::fs::write(&path, &text)?;
+                eprintln!("rapport écrit : {}", path.display());
             }
         }
     }
