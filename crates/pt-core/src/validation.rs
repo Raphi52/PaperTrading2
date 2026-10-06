@@ -460,6 +460,28 @@ mod tests {
         assert!((t.p_value - 0.5).abs() < 1e-12); // P(X ≥ 2 | n = 3) = 4/8
     }
 
+    /// Sur une marche aléatoire PURE, une stratégie sans talent qui entre et sort avec
+    /// des positions partielles (momentum 28 jours, un tiers du capital par symbole)
+    /// ne doit pas battre la référence à exposition égale plus de 6 fois sur 10.
+    /// Mesuré : 13 fenêtres sur 40 avec frais, 17 sur 40 sans frais.
+    #[test]
+    fn no_talent_does_not_beat_the_bar_on_a_pure_random_walk() {
+        let p = catalog::find("tsmom_28_1d").unwrap();
+        for costs in [CostModel::default(), CostModel::zero()] {
+            let (mut wins, mut n) = (0, 0);
+            for seed in 0..40u64 {
+                let series: BTreeMap<String, Vec<Candle>> =
+                    (0..3).map(|k| (format!("S{k}"), crate::testutil::random_walk(700, 100 + 3 * seed + k))).collect();
+                let c = &series["S0"];
+                let (start, end) = (c[150].open_time, c[650].open_time);
+                let w = run_window(&p, &series, &External::default(), costs, 10_000.0, start, end).unwrap();
+                wins += usize::from(w.outcome == Outcome::Win);
+                n += 1;
+            }
+            assert!(wins * 10 <= n * 6, "{wins}/{n} fenêtres battues sans aucun talent ({costs:?})");
+        }
+    }
+
     #[test]
     fn the_least_favourable_split_is_kept() {
         use Outcome::*;

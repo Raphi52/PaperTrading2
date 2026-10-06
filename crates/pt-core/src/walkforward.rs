@@ -320,11 +320,20 @@ mod tests {
     use crate::testutil::synthetic;
 
     fn on_timeframe(n: usize, seeds: &[u64], tf: Timeframe) -> BTreeMap<String, Vec<Candle>> {
+        generated(synthetic, n, seeds, tf)
+    }
+
+    fn generated(
+        make: fn(usize, u64) -> Vec<Candle>,
+        n: usize,
+        seeds: &[u64],
+        tf: Timeframe,
+    ) -> BTreeMap<String, Vec<Candle>> {
         let step = tf.millis();
         seeds
             .iter()
             .map(|s| {
-                let c = synthetic(n, *s)
+                let c = make(n, *s)
                     .into_iter()
                     .enumerate()
                     .map(|(i, mut c)| {
@@ -454,14 +463,16 @@ mod tests {
 
     /// Sur des prix tirés au hasard, aucun talent n'existe : le procédé ne doit
     /// jamais être déclaré « Pas un coup de chance ». S'il voyait le futur, il
-    /// gagnerait presque toutes les fenêtres.
+    /// gagnerait presque toutes les fenêtres. Marche aléatoire PURE : le générateur
+    /// à régimes alterne des tendances de 150 bougies, qu'un suivi de tendance
+    /// exploite réellement (le momentum 28 jours y gagnait 14 fenêtres sur 18).
     #[test]
     fn selection_on_random_walks_is_not_solide() {
         let all = catalog::catalog();
         let presets = daily_candidates(&all);
         let ext = External::default();
         for seeds in [[21u64, 22], [23, 24], [25, 26], [27, 28], [29, 30]] {
-            let d1 = on_timeframe(2500, &seeds, Timeframe::D1);
+            let d1 = generated(crate::testutil::random_walk, 2500, &seeds, Timeframe::D1);
             let candidates: Vec<Candidate> =
                 presets.iter().map(|p| Candidate { preset: p, series: &d1, ext: &ext }).collect();
             let s = score_candidates(&candidates, CostModel::default(), 120, 60, 10_000.0).unwrap();

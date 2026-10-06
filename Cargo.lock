@@ -2722,6 +2722,7 @@ dependencies = [
  "clap",
  "pt-core",
  "pt-data",
+ "pt-store",
  "serde_json",
  "tokio",
 ]

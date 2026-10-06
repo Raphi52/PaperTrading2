@@ -117,6 +117,16 @@ pub enum Rule {
         buy_below: f64,
         sell_above: f64,
     },
+    /// Momentum en série temporelle : investi tant que la clôture dépasse celle
+    /// d'il y a `lookback` bougies (Liu & Tsyvinski, 2021, momentum de 1 à 4 semaines).
+    Momentum {
+        lookback: usize,
+    },
+    /// Investi tant que la clôture est au-dessus de sa SMA (Detzel et al., 2021,
+    /// règles de moyenne mobile sur le bitcoin).
+    SmaTrend {
+        period: usize,
+    },
     /// Score 0..5 : tendance EMA50/200, MACD, RSI sain, Supertrend, ADX.
     Confluence {
         min_score: u8,
@@ -145,6 +155,8 @@ impl Rule {
             Rule::VwapReversion { period, .. } => *period,
             Rule::DipBuy { lookback, .. } => *lookback,
             Rule::FearGreed { .. } => 1,
+            Rule::Momentum { lookback } => *lookback,
+            Rule::SmaTrend { period } => *period,
             Rule::Confluence { .. } => 200,
         };
         (3 * longest).max(30)
@@ -280,6 +292,19 @@ pub fn compute_signals(rule: &Rule, c: &[Candle], ext: &External, trend_sma: Opt
                     enter: ind::crossed_down_level(&fg, *buy_below, i),
                     exit: !fg[i].is_nan() && fg[i] > *sell_above,
                 };
+            }
+        }
+        Rule::Momentum { lookback } => {
+            for i in *lookback..n {
+                let past = close[i - lookback];
+                out[i] = Signal { enter: close[i] > past, exit: close[i] < past };
+            }
+        }
+        Rule::SmaTrend { period } => {
+            let s = ind::sma(&close, *period);
+            for i in 0..n {
+                // NaN pendant le préchauffage : ni entrée ni sortie.
+                out[i] = Signal { enter: close[i] > s[i], exit: close[i] < s[i] };
             }
         }
         Rule::Confluence { min_score, exit_score } => {

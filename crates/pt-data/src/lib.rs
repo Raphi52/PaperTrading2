@@ -6,10 +6,12 @@
 pub mod binance;
 pub mod cache;
 pub mod fear_greed;
+pub mod funding;
 
 pub use binance::{BinanceClient, Recent};
 pub use cache::HistoryCache;
 pub use fear_greed::fetch_fear_greed;
+pub use funding::{FundingCache, FundingClient};
 
 pub fn now_ms() -> i64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0)

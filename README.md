@@ -31,22 +31,25 @@ C'est la réécriture complète de [PaperTrading](https://github.com/Raphi52/Pap
 | Correction pour essais multiples calculée sur le seul catalogue du moment (première version de ce dépôt) | Retirer les perdantes faisait passer la correction de ×29 à ×7 ; un réglage modifié n'était compté nulle part | Registre des essais versionné (`crates/pt-core/essais.tsv`), qui ne fait que grandir. La correction compte l'union du registre et de ce qui tourne. `--tested` ne peut pas descendre en dessous | `removing_a_strategy_never_lowers_the_correction`, `changing_a_setting_counts_as_a_new_trial`, `every_catalog_preset_is_registered`, `tested_below_registry_is_refused` |
 | Préchauffage pris dans la période affichée (première version de ce dépôt) | Chaque stratégie affichait une autre période : sur les « mêmes » 3 ans, « acheter et garder » allait de −8,6 % à +129,7 % selon la ligne | Préchauffage sur les bougies d'avant la période. L'historique chargé couvre le plus long préchauffage de l'unité de temps, avec ou sans validation | `every_strategy_shows_the_same_period`, `history_includes_warmup_without_validation` |
 | Garder « la meilleure » stratégie après coup | La meilleure sur l'historique n'est souvent que la plus chanceuse | Sélection glissante : chaque fenêtre est jouée par la stratégie choisie avec les seules fenêtres déjà terminées, et c'est ce procédé qui est jugé | `selection_never_sees_the_window_it_plays`, `selection_on_random_walks_is_not_solide` |
+| Contrôle « aucun talent sur des prix aléatoires » fait sur un générateur à tendances (première version de ce dépôt) | Un suivi de tendance y a un vrai talent : le momentum 28 jours y gagnait 14 fenêtres sur 18, et le test aurait fini par interdire toute stratégie de tendance | Le contrôle tourne sur une marche aléatoire PURE (rendements indépendants, sans dérive) ; un second contrôle vérifie qu'une stratégie sans talent n'y bat pas la barre plus de 6 fois sur 10 (mesuré : 13 sur 40 avec frais) | `selection_on_random_walks_is_not_solide`, `no_talent_does_not_beat_the_bar_on_a_pure_random_walk` |
+| Deux fenêtres de l'application ouvertes = deux boucles du mode direct (première version de ce dépôt) | Chaque bougie pouvait être traitée deux fois, et la base renvoyer « verrouillée » | Un verrou de fichier : une seule instance fait avancer les portefeuilles ; les autres affichent la même base (« affichage seul ») et prennent le relais si elle se ferme. La base attend 5 s une écriture en cours au lieu d'échouer | `only_one_instance_runs_the_live_loop` |
 
 ## Ce que disent les données (frais compris)
 
-Mesuré le 6 octobre 2026 sur BTC, ETH, SOL, BNB et XRP. Frais de 0,1 % par côté et glissement de 0,02 %. Résultats affichés sur les mêmes 3 ans pour toutes les stratégies (« acheter et garder » : +230,9 % en 1j, +231,0 % en 4h, +228,4 % en 1h) ; verdicts décidés par la validation sur fenêtres glissantes de fin 2017 à 2026. Tableau complet : [`docs/comparaison-2026-10-06.md`](docs/comparaison-2026-10-06.md).
+Mesuré le 6 octobre 2026 sur BTC, ETH, SOL, BNB et XRP, pour les 31 stratégies du catalogue (33 essais au registre, portage compris). Frais de 0,1 % par côté et glissement de 0,02 %. Résultats affichés sur les mêmes 3 ans pour toutes les stratégies (« acheter et garder » : +230,9 % en 1j, +231,0 % en 4h, +228,4 % en 1h) ; verdicts décidés par la validation sur fenêtres glissantes de fin 2017 à 2026. Tableau complet : [`docs/comparaison-2026-10-06.md`](docs/comparaison-2026-10-06.md).
 
 | Verdict | Nombre | Stratégies |
 |---|---:|---|
 | **Solide** | **0** | — |
-| Prometteuse | 1 | Cassure Keltner 4h : 13 fenêtres indépendantes gagnées sur 17 (2,5 % seule, 71 % une fois comptées les 29 stratégies) |
-| Indiscernable du hasard | 6 | MACD 1j, Ichimoku 4h, Donchian 20/10 4h, Supertrend 1j, EMA 20/50 4h, Turtle 55/20 1j |
+| Prometteuse | 1 | Cassure Keltner 4h : 13 fenêtres indépendantes gagnées sur 17 (2,5 % seule, 81 % une fois comptés les 33 essais) |
+| Indiscernable du hasard | 8 | MACD 1j, Ichimoku 4h, Donchian 20/10 4h, Supertrend 1j, **Momentum 28 jours 1j**, EMA 20/50 4h, **Au-dessus de la SMA 50 1j**, Turtle 55/20 1j |
 | Perdante | 22 | dont **toutes** les stratégies 1h |
 
 - **Aucune stratégie du catalogue ne prouve qu'elle fait mieux qu'un achat au hasard investi la même part du temps.** Ce qu'elles apportent, c'est une pire baisse bien plus faible, parce qu'elles sont peu investies.
 - **MACD 1j et Turtle 55/20**, classées « Solides » par la première version du comparateur, sont **indiscernables du hasard** (détail ci-dessous).
 - **Les frais tuent les stratégies rapides.** Le croisement EMA 9/21 en 1h ferait **+168 % sans frais**, mais il tombe à **−46 % avec frais** (2 757 trades). Les stratégies 1h sont toutes perdantes.
-- **Aucune stratégie ne bat « acheter et garder » en rendement brut** sur cette période haussière : la meilleure, Ichimoku 4h, fait +73,0 % contre +231,0 %.
+- **Une seule stratégie bat « acheter et garder » en rendement brut** sur ces 3 ans : **Au-dessus de la SMA 50 (1j)**, qui fait **+352,5 %** contre +230,9 %, avec une pire baisse de **33 %** contre 63 %. Elle est investie à parts égales sur chaque symbole tant que son prix est au-dessus de sa moyenne 50 jours, en liquide sinon (Detzel et al., 2021). Mais sur 2017-2026, elle ne bat un timing au hasard de même exposition que dans 9 fenêtres sur 17 : ce gain peut venir de la période. Elle est suivie en direct pour le vérifier sur des prix qu'elle n'a jamais vus.
+- **Le momentum 28 jours** (Liu & Tsyvinski, 2021), même principe, fait +193,1 % avec une pire baisse de 36 %, et reste lui aussi indiscernable du hasard (10 fenêtres sur 18).
 
 ## Coup de chance ou pas ? Validation sur fenêtres glissantes
 
@@ -64,28 +67,49 @@ Les deux stratégies que la première version du comparateur classait « Solides
 
 Pourquoi ne pas comparer simplement au Sharpe d'« acheter et garder » ? Parce qu'une stratégie qui achète **au hasard**, en restant souvent en liquide, « gagnerait » mécaniquement toutes les fenêtres baissières. La référence à exposition égale élimine ce biais. Le test ne retient que des fenêtres sans chevauchement, et garde le découpage le moins favorable.
 
+## Portage du financement des perpétuels (`pt portage`)
+
+Une stratégie qui ne parie pas sur la direction du prix : acheter un symbole au comptant et vendre en même quantité son contrat perpétuel. Le prix s'annule entre les deux jambes ; il reste le **financement**, versé toutes les 8 h par les acheteurs de perpétuels aux vendeurs quand le taux est positif. C'est une prime documentée (Schmeling, Schrimpf & Todorov, « Crypto carry », BIS Working Paper 1087, 2023), pas un timing.
+
+Le modèle (`crates/pt-core/src/carry.rs`) est volontairement prudent :
+- la moitié de chaque poche est au comptant, l'autre sert de marge au perpétuel (levier 1×) ;
+- frais du perpétuel à **0,05 %** par côté, tarif preneur d'un utilisateur standard ([Binance](https://www.binance.com/fr/support/articles/360033544231)), en plus de 0,1 % au comptant et du glissement sur chaque jambe ;
+- rééquilibrage quand la hausse ronge la marge, et liquidation si une bougie l'épuise ;
+- non modélisés : l'écart de prix entre perpétuel et comptant, et les intérêts de la trésorerie.
+
+Le même code sert au backtest et au mode direct (`carry_live_increments_equal_one_shot`). Une fenêtre est gagnée si elle finit en gain, puisque le portage n'est pas exposé au prix. Historique des taux : septembre 2019 à aujourd'hui. Rapport complet : [`docs/portage-2026-10-06.md`](docs/portage-2026-10-06.md).
+
+| Variante | Fenêtres indépendantes gagnées | Corrigée pour 33 essais | Par an (fenêtres bout à bout) | Pire fenêtre de 6 mois | Verdict |
+|---|---:|---:|---:|---:|---|
+| Permanent | **11 / 14** | 95 % | **+4,7 %** | −2,1 % | **Prometteuse, pas prouvée** |
+| Filtré sur 7 jours de taux | 10 / 14 | 100 % | +4,8 % | −1,0 % | Compatible avec la chance |
+
+- **La prime a existé, mais elle s'est presque éteinte.** +3 à +14 % par semestre en 2020-2021 ; pertes pendant le marché baissier de 2022-2023, quand le financement est devenu négatif ; puis **de −0,1 % à +0,9 % par semestre pour les fenêtres commencées depuis 2025**.
+- Aucune liquidation sur 27 fenêtres. Pire baisse en cours de fenêtre : 2,5 %, contre 22 à 69 % pour « acheter et garder ».
+- Le portage n'est pas encore suivi en direct dans l'application : son rendement actuel ne le justifie pas.
+
 ## Améliorer en boucle sans se mentir
 
 Chercher « la meilleure stratégie » sur l'historique puis la garder, c'est choisir après coup. C'est ce qui faisait croire à la première version qu'elle avait des gagnantes. Deux garde-fous rendent possible une boucle d'amélioration honnête.
 
-**Le registre des essais** (`crates/pt-core/essais.tsv`). Chaque stratégie (identifiant et réglages exacts) et chaque variante de sélection essayée sur les données réelles y est inscrite avant d'être lancée, et n'en sort jamais. La correction pour essais multiples compte l'union du registre et de ce qui tourne : retirer les perdantes ou retoucher un réglage ne peut plus rendre un verdict plus flatteur. `pt essais` affiche le total (aujourd'hui : 29 stratégies, 1 variante de sélection) et les lignes manquantes. Un test échoue si une stratégie du catalogue n'y est pas, et `pt walkforward` refuse une variante non inscrite.
+**Le registre des essais** (`crates/pt-core/essais.tsv`). Chaque stratégie (identifiant et réglages exacts) et chaque variante de sélection essayée sur les données réelles y est inscrite avant d'être lancée, et n'en sort jamais. La correction pour essais multiples compte l'union du registre et de ce qui tourne : retirer les perdantes ou retoucher un réglage ne peut plus rendre un verdict plus flatteur. `pt essais` affiche le total (aujourd'hui : 33 stratégies, dont les 2 variantes de portage, et 1 variante de sélection) et les lignes manquantes. Un test échoue si une stratégie du catalogue n'y est pas, et `pt walkforward` refuse une variante non inscrite.
 
-**La sélection glissante** (`pt walkforward`). Les 29 stratégies sont rejouées sur la même grille de fenêtres de 180 jours, décalées de 90 jours. Pour chaque fenêtre, on joue celle qui a le mieux battu un achat au hasard de même exposition, en moyenne, sur les 2 dernières fenêtres **terminées** avant son début. Puis on juge ce procédé comme une stratégie : test du signe sur fenêtres indépendantes, découpage le moins favorable, correction pour les variantes de sélection essayées. Rapport complet : [`docs/walkforward-2026-10-06.md`](docs/walkforward-2026-10-06.md).
+**La sélection glissante** (`pt walkforward`). Les 31 stratégies du catalogue sont rejouées sur la même grille de fenêtres de 180 jours, décalées de 90 jours. Pour chaque fenêtre, on joue celle qui a le mieux battu un achat au hasard de même exposition, en moyenne, sur les 2 dernières fenêtres **terminées** avant son début. Puis on juge ce procédé comme une stratégie : test du signe sur fenêtres indépendantes, découpage le moins favorable, correction pour les variantes de sélection essayées. Rapport complet : [`docs/walkforward-2026-10-06.md`](docs/walkforward-2026-10-06.md).
 
-Résultat, de mai 2018 à octobre 2026 :
+Résultat, de novembre 2018 à octobre 2026 :
 
 > Verdict : Compatible avec la chance
 >
-> La stratégie choisie bat la référence à exposition égale dans 6 fenêtre(s) indépendante(s) sur 16. À pile ou face, on ferait au moins aussi bien avec une probabilité de 89.5 %, au-dessus du seuil de 5 %.
+> La stratégie choisie bat la référence à exposition égale dans 6 fenêtre(s) indépendante(s) sur 17. À pile ou face, on ferait au moins aussi bien avec une probabilité de 92.8 %, au-dessus du seuil de 5 %.
 
-- **Choisir la stratégie qui a le mieux marché récemment ne fait pas mieux que le hasard.** Sur les 33 fenêtres jouées, elle en gagne 17 et en perd 16.
-- **Mises bout à bout, les 16 fenêtres indépendantes de ce découpage donnent +49,2 %** à la sélection, contre +176,9 % pour un achat au hasard de même exposition et +4 519,3 % pour « acheter et garder ».
-- 13 stratégies différentes ont été choisies ; la plus fréquente, Cassure Donchian 20/10 (4h), ne l'a été que 6 fois sur 33.
+- **Choisir la stratégie qui a le mieux marché récemment ne fait pas mieux que le hasard.**
+- **Mises bout à bout, les 17 fenêtres de ce découpage donnent +6,1 %** à la sélection, contre +159,7 % pour un achat au hasard de même exposition et +4 784,4 % pour « acheter et garder ».
+- 12 stratégies différentes ont été choisies ; les plus fréquentes sont le momentum 28 jours (11 fois) et la SMA 50 (8 fois).
 - Les prochaines idées (nouvelles familles de stratégies, autre taille de position) seront inscrites au registre avant d'être lancées, et jugées de la même façon.
 
 ## L'application
 
-- **Portefeuilles** : suivi en direct sur les prix réels. Chaque portefeuille a sa référence « acheter et garder » démarrée au même instant. Il démarre à la première bougie clôturée après sa création : aucun trade antidaté.
+- **Portefeuilles** : suivi en direct sur les prix réels. Une seule fenêtre de l'application fait avancer les portefeuilles ; une seconde fenêtre ouverte affiche la même base (« affichage seul ») et prend le relais si la première se ferme. Chaque portefeuille a sa référence « acheter et garder » démarrée au même instant. Il démarre à la première bougie clôturée après sa création : aucun trade antidaté.
 - **Backtest** : courbe de valeur contre la référence, avec la frontière hors échantillon, les mesures (rendement, pire baisse, Sharpe, facteur de profit), le résultat « sans frais » et tous les trades. Le panneau **« Est-ce un coup de chance ? »** rejoue la stratégie sur des fenêtres glissantes et rend le verdict ci-dessus.
 - **Comparateur** : tout le catalogue d'un coup, sur la même période pour toutes les stratégies, validé sur fenêtres glissantes et classé par verdict : Solide, Prometteuse, Indiscernable du hasard, Perdante. Environ 1 minute une fois l'historique en cache.
 - **Stratégies** : ce que chaque stratégie calcule, ses sorties et sa taille de position.
@@ -104,22 +128,27 @@ cargo run --release -p pt-cli -- compare --days 1095 --validation-days 3650 --wi
 cargo run --release -p pt-cli -- validate --preset macd_1d --preset donchian_55_20_1d --days 3650 --window 180 --step 90 --md validation.md
 cargo run --release -p pt-cli -- walkforward --lookback 2 --md walkforward.md
 cargo run --release -p pt-cli -- essais
+cargo run --release -p pt-cli -- portage --md portage.md
+cargo run --release -p pt-cli -- suivre --preset sma_trend_50_1d --nom "Tendance SMA 50"
 ```
+
+`pt suivre` crée un portefeuille dans la base de l'application (même dossier qu'elle, ou `--donnees`), avec sa référence « acheter et garder » démarrée au même instant. L'application le fait avancer à son passage suivant, même si elle est déjà ouverte.
 
 Variables d'environnement facultatives :
 
 - `PT_DATA_DIR` : dossier des données de l'application. Par défaut, c'est le dossier de données de l'utilisateur.
 - `PT_BINANCE_URL` : source des bougies. Par défaut, `https://data-api.binance.vision`, le point d'accès public en lecture seule de Binance.
+- `PT_BINANCE_FUTURES_URL` : source des taux de financement (`pt portage`). Par défaut, `https://fapi.binance.com`, en lecture seule et sans clé.
 
 Installateur Windows (non testé dans ce dépôt) : `cargo install tauri-cli --version "^2" --locked`, puis `cargo tauri build`.
 
 ## Architecture
 
 ```
-crates/pt-core    indicateurs, comptabilité, stratégies, moteur, backtest, validation, sélection glissante, registre des essais (lu à la compilation) — aucun accès réseau ni disque
-crates/pt-data    bougies Binance (clôturées seulement), Fear & Greed, cache disque
+crates/pt-core    indicateurs, comptabilité, stratégies, moteur, backtest, validation, sélection glissante, portage du financement, registre des essais (lu à la compilation) — aucun accès réseau ni disque
+crates/pt-data    bougies Binance (clôturées seulement), taux de financement des perpétuels, Fear & Greed, cache disque
 crates/pt-store   SQLite : état, exécutions complètes, courbe de valeur
-crates/pt-cli     `pt` : backtest, comparaison, validation, sélection glissante, registre des essais
+crates/pt-cli     `pt` : backtest, comparaison, validation, sélection glissante, portage, registre des essais, création de portefeuilles
 src-tauri         application de bureau : boucle du mode direct + commandes
 ui                interface HTML/CSS/JS sans dépendance externe
 ```
@@ -132,7 +161,7 @@ Tout ce qui décide d'un trade vit dans `pt-core`, sous forme de fonctions pures
 - **Sniper de tokens DEX** : ses résultats reposaient sur des exécutions et des « rug pulls » simulés au hasard, donc invérifiables.
 - **Copie de « whales », du Congrès et d'investisseurs légendaires** : les signaux étaient générés aléatoirement (`_simulate_legendary_trader`).
 - **Martingale et renforcement sans stop** : risque de ruine.
-- **Ventes à découvert** : impossibles sur Binance spot. Les simuler sans coût d'emprunt surestime les résultats.
+- **Ventes à découvert** : impossibles sur Binance spot. Les simuler sans coût d'emprunt surestime les résultats. Le portage vend bien un perpétuel, mais toujours couvert par le comptant, et son coût (le financement) est exactement ce qu'il mesure.
 - **Alertes Telegram, tableaux de bord Streamlit et Next.js** : remplacés par l'application Tauri.
 
 ## Licence

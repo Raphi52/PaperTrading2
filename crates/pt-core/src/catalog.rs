@@ -53,6 +53,12 @@ fn reversion_exits(max_bars: u32) -> ExitPolicy {
     }
 }
 
+/// Sortie d'un filtre de régime : on sort sur le signal ; le stop à 25 % n'est
+/// qu'un garde-fou contre un krach entre deux clôtures.
+fn regime_exits() -> ExitPolicy {
+    ExitPolicy { stop: Some(Distance::Percent(25.0)), take_profit: None, trailing: None, max_bars: None }
+}
+
 fn risk() -> Sizing {
     Sizing::Risk { risk_pct: 1.0, max_position_pct: 25.0 }
 }
@@ -156,6 +162,12 @@ pub fn catalog() -> Vec<Preset> {
           D1, Rule::FearGreed { buy_below: 25.0, sell_above: 75.0 },
           ExitPolicy { stop: Some(Distance::Percent(20.0)), take_profit: None, trailing: None, max_bars: None },
           Sizing::Fixed { position_pct: 20.0 }),
+        p("tsmom_28_1d", "Momentum 28 jours (1j)", "Régime",
+          "Investi à parts égales sur chaque symbole tant que sa clôture dépasse celle d'il y a 28 jours, en liquide sinon. Momentum en série temporelle de 1 à 4 semaines (Liu & Tsyvinski, 2021).",
+          D1, Rule::Momentum { lookback: 28 }, regime_exits(), Sizing::EqualWeight),
+        p("sma_trend_50_1d", "Au-dessus de la SMA 50 (1j)", "Régime",
+          "Investi à parts égales sur chaque symbole tant que sa clôture est au-dessus de sa moyenne 50 jours, en liquide sinon (Detzel et al., 2021).",
+          D1, Rule::SmaTrend { period: 50 }, regime_exits(), Sizing::EqualWeight),
     ];
     // Les retours à la moyenne n'achètent que dans une tendance de fond haussière.
     for preset in v.iter_mut() {
