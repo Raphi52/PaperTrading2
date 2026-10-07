@@ -15,7 +15,7 @@
 use crate::candle::Candle;
 use crate::indicators::atr;
 use crate::portfolio::{CostModel, Portfolio};
-use crate::strategy::{compute_signals, External, Preset, Signal, Sizing, TakeProfit};
+use crate::strategy::{compute_signals, entry_strength, External, Preset, Signal, Sizing, TakeProfit};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -58,6 +58,16 @@ pub struct SymbolState {
     /// Ouverture de la dernière bougie clôturée traitée.
     pub last_bar_open_time: Option<i64>,
     pub trailing_active: bool,
+    /// Force d'entrée à la dernière clôture (voir `entry_strength`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub strength: Option<f64>,
+}
+
+/// Une crypto qui a donné un signal d'entrée à la clôture, en attente de place.
+struct Candidate {
+    symbol: String,
+    strength: f64,
+    atr: f64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -104,6 +114,7 @@ impl Engine {
         struct Prepared<'a> {
             feed: &'a Feed<'a>,
             signals: Vec<Signal>,
+            strength: Vec<f64>,
             atr: Vec<f64>,
             by_time: BTreeMap<i64, usize>,
         }
@@ -123,25 +134,38 @@ impl Engine {
                 Prepared {
                     feed,
                     signals: compute_signals(&self.preset.rule, feed.closed, ext, self.preset.trend_sma),
+                    strength: entry_strength(feed.closed),
                     atr: atr(feed.closed, 14),
                     by_time,
                 },
             );
         }
         let mut processed = 0;
+        let warmup = self.preset.warmup();
         for t in times {
             let mut close_time = t;
             let mut done = Vec::new();
+            let mut candidates = Vec::new();
             for (sym, p) in &prepared {
                 if let Some(&i) = p.by_time.get(&t) {
                     let bar = &p.feed.closed[i];
-                    self.on_bar_close(sym, bar, p.signals[i], p.atr[i]);
+                    let mut sig = p.signals[i];
+                    // Préchauffage propre à chaque crypto : cotée tard, elle entre tard.
+                    sig.enter &= i >= warmup;
+                    if let Some(c) = self.close_bar(sym, bar, sig, p.atr[i], p.strength[i], true) {
+                        candidates.push(c);
+                    }
                     close_time = close_time.max(bar.close_time);
                     done.push((*sym, i));
                     processed += 1;
                 }
             }
+            let closed_now: BTreeSet<String> = done.iter().map(|(s, _)| (*s).clone()).collect();
+            self.allocate(candidates, &closed_now);
             on_tick(Tick { open_time: t, close_time }, self);
+            // Les sorties d'abord : la vente d'un changement libère la trésorerie de l'achat.
+            let is_exit = |e: &Engine, s: &String| matches!(e.states.get(s).and_then(|st| st.pending.as_ref()), Some(p) if p.kind == PendingKind::Exit);
+            done.sort_by_key(|(s, _)| !is_exit(self, s));
             for (sym, i) in done {
                 let feed = prepared[sym].feed;
                 let next = feed.closed.get(i + 1).or(feed.forming);
@@ -169,12 +193,70 @@ impl Engine {
     /// Étape 1 : la bougie `bar` de `symbol` vient de se clôturer.
     /// Applique les stops/objectifs touchés pendant la bougie, puis décide.
     pub fn on_bar_close(&mut self, symbol: &str, bar: &Candle, sig: Signal, atr: f64) {
+        self.close_bar(symbol, bar, sig, atr, f64::NAN, false);
+    }
+
+    /// Répartit les places entre les cryptos qui ont donné un signal d'entrée au
+    /// même instant : les plus fortes d'abord. Places pleines et `switch_margin`
+    /// réglée : une candidate remplace la position la plus faible (clôturée au
+    /// même instant) si sa force la dépasse d'au moins la marge.
+    fn allocate(&mut self, mut candidates: Vec<Candidate>, closed_now: &BTreeSet<String>) {
+        let key = |x: f64| if x.is_nan() { f64::NEG_INFINITY } else { x };
+        candidates.sort_by(|a, b| key(b.strength).total_cmp(&key(a.strength)).then_with(|| a.symbol.cmp(&b.symbol)));
+        let mut free = self.max_positions().saturating_sub(self.portfolio.positions.len() + self.pending_entries());
+        for c in candidates {
+            if free > 0 {
+                free -= 1;
+                self.states.get_mut(&c.symbol).expect("état").pending =
+                    Some(Pending { kind: PendingKind::Enter, reason: "SIGNAL D'ENTRÉE".into(), atr: c.atr });
+                continue;
+            }
+            let Some(margin) = self.preset.switch_margin else { break };
+            if c.strength.is_nan() {
+                break;
+            }
+            let weakest = self
+                .portfolio
+                .positions
+                .keys()
+                .filter(|s| closed_now.contains(*s))
+                .filter_map(|s| {
+                    let st = self.states.get(s)?;
+                    if st.pending.as_ref().is_some_and(|p| p.kind == PendingKind::Exit) {
+                        return None;
+                    }
+                    st.strength.map(|v| (s.clone(), v))
+                })
+                .min_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+            let Some((weak, weak_strength)) = weakest else { break };
+            if c.strength < weak_strength + margin {
+                break; // candidates triées : les suivantes ne feront pas mieux
+            }
+            self.states.get_mut(&weak).expect("état").pending =
+                Some(Pending { kind: PendingKind::Exit, reason: format!("CHANGEMENT → {}", c.symbol), atr: c.atr });
+            self.states.get_mut(&c.symbol).expect("état").pending =
+                Some(Pending { kind: PendingKind::Enter, reason: format!("CHANGEMENT (remplace {weak})"), atr: c.atr });
+        }
+    }
+
+    /// `defer_entry` : l'entrée n'est pas décidée ici mais rendue comme candidate,
+    /// pour être classée avec celles des autres cryptos (voir `allocate`).
+    fn close_bar(
+        &mut self,
+        symbol: &str,
+        bar: &Candle,
+        sig: Signal,
+        atr: f64,
+        strength: f64,
+        defer_entry: bool,
+    ) -> Option<Candidate> {
         let state = self.states.entry(symbol.to_string()).or_default();
         if let Some(last) = state.last_bar_open_time {
             if bar.open_time <= last {
-                return; // déjà traitée : rejouer une bougie ne doit rien changer
+                return None; // déjà traitée : rejouer une bougie ne doit rien changer
             }
         }
+        state.strength = strength.is_finite().then_some(strength);
 
         // 1. Sorties touchées pendant la bougie.
         if let Some(pos) = self.portfolio.positions.get(symbol) {
@@ -245,6 +327,12 @@ impl Engine {
             };
             let state = self.states.get_mut(symbol).expect("état");
             state.pending = pending;
+        } else if defer_entry {
+            let state = self.states.get_mut(symbol).expect("état");
+            state.pending = None;
+            if sig.enter && bar.open_time >= self.trade_from {
+                return Some(Candidate { symbol: symbol.to_string(), strength, atr });
+            }
         } else {
             let can_enter = sig.enter
                 && bar.open_time >= self.trade_from
@@ -253,6 +341,7 @@ impl Engine {
             state.pending =
                 can_enter.then(|| Pending { kind: PendingKind::Enter, reason: "SIGNAL D'ENTRÉE".into(), atr });
         }
+        None
     }
 
     /// Étape 2 : la bougie suivante s'ouvre à `price` (instant `time`).
@@ -311,7 +400,7 @@ impl Engine {
                 }
             }
             Sizing::Fixed { position_pct } => equity * position_pct / 100.0,
-            Sizing::EqualWeight => equity / self.symbols.len().max(1) as f64,
+            Sizing::EqualWeight => equity / self.symbols.len().min(self.max_positions()).max(1) as f64,
         }
     }
 
@@ -523,5 +612,65 @@ mod tests {
         let before = e.clone();
         e.on_bar_close("A", &b0, Signal { enter: false, exit: true }, 1.0);
         assert_eq!(before, e);
+    }
+
+    fn multi(max: usize, margin: Option<f64>) -> Engine {
+        let mut p = find("buy_hold").unwrap();
+        p.max_positions = Some(max);
+        p.switch_margin = margin;
+        Engine::new(p, vec!["A".into(), "B".into(), "C".into()], 1_000.0, CostModel::default(), 0)
+    }
+
+    fn close_all(e: &mut Engine, i: i64, sigs: &[(&str, bool, f64)]) {
+        let b = candle(i, 100.0, 101.0, 99.0, 100.0);
+        let mut cands = Vec::new();
+        for (s, enter, st) in sigs {
+            if let Some(c) = e.close_bar(s, &b, Signal { enter: *enter, exit: false }, 1.0, *st, true) {
+                cands.push(c);
+            }
+        }
+        let now: BTreeSet<String> = sigs.iter().map(|x| x.0.to_string()).collect();
+        e.allocate(cands, &now);
+        let mut order: Vec<&str> = sigs.iter().map(|x| x.0).collect();
+        order.sort_by_key(|s| !matches!(e.states[*s].pending.as_ref(), Some(p) if p.kind == PendingKind::Exit));
+        for s in order {
+            e.on_next_open(s, b.close_time + 1, 100.0);
+        }
+    }
+
+    #[test]
+    fn simultaneous_signals_take_the_strongest() {
+        let mut e = multi(2, None);
+        close_all(&mut e, 0, &[("A", true, 1.0), ("B", true, 3.0), ("C", true, 2.0)]);
+        let held: Vec<&String> = e.portfolio.positions.keys().collect();
+        assert_eq!(held, ["B", "C"], "les 2 plus fortes, pas les 2 premières");
+    }
+
+    #[test]
+    fn stronger_signal_switches_the_weakest_position() {
+        let mut e = multi(1, Some(1.0));
+        close_all(&mut e, 0, &[("A", true, 1.0), ("B", false, 0.0), ("C", false, 0.0)]);
+        assert!(e.portfolio.positions.contains_key("A"));
+        close_all(&mut e, 1, &[("A", false, 1.0), ("B", true, 2.5), ("C", false, 0.0)]);
+        let held: Vec<&String> = e.portfolio.positions.keys().collect();
+        assert_eq!(held, ["B"], "A vendue, B achetée à la même ouverture");
+    }
+
+    #[test]
+    fn signal_below_margin_does_not_switch() {
+        let mut e = multi(1, Some(1.0));
+        close_all(&mut e, 0, &[("A", true, 1.0), ("B", false, 0.0), ("C", false, 0.0)]);
+        close_all(&mut e, 1, &[("A", false, 1.0), ("B", true, 1.9), ("C", false, 0.0)]);
+        let held: Vec<&String> = e.portfolio.positions.keys().collect();
+        assert_eq!(held, ["A"], "écart 0,9 sous la marge 1 : rien ne bouge");
+    }
+
+    #[test]
+    fn without_switch_margin_a_full_book_never_switches() {
+        let mut e = multi(1, None);
+        close_all(&mut e, 0, &[("A", true, 1.0), ("B", false, 0.0), ("C", false, 0.0)]);
+        close_all(&mut e, 1, &[("A", false, 1.0), ("B", true, 50.0), ("C", false, 0.0)]);
+        let held: Vec<&String> = e.portfolio.positions.keys().collect();
+        assert_eq!(held, ["A"]);
     }
 }

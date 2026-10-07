@@ -1,0 +1,110 @@
+# Univers figé de PaperTrading2 — 2026-10-07
+# Les 100 paires USDT spot les plus échangées sur Binance (volume 24 h, data-api.binance.vision),
+# hors stablecoins (USDC, FDUSD, U…), or (XAUT), actions tokenisées (MSTRB, NVDAB, QQQB…),
+# jetons à effet de levier et jetons aux noms non latins. Liste RELUE à la main : Binance ne
+# distingue pas une action tokenisée d'une crypto. Figée pour que backtests et validations
+# soient reproductibles.
+# BIAIS DU SURVIVANT : ce sont les 100 premières AUJOURD'HUI. Rejouer le passé sur cette liste
+# favorise les cryptos qui ont survécu et monté ; un résultat de backtest est donc plus flatteur
+# qu'il ne l'aurait été en temps réel. Chaque symbole n'entre dans une fenêtre qu'une fois coté
+# et préchauffé, et la référence « acheter et garder » utilise le même univers.
+BTCUSDT
+ETHUSDT
+SOLUSDT
+XRPUSDT
+ZECUSDT
+DOGEUSDT
+NEARUSDT
+BNBUSDT
+SUIUSDT
+ADAUSDT
+UNIUSDT
+AVAXUSDT
+ORCAUSDT
+NMRUSDT
+QNTUSDT
+ENAUSDT
+HYPEUSDT
+WLDUSDT
+TAOUSDT
+RLCUSDT
+PUMPUSDT
+TRXUSDT
+ONDOUSDT
+PEPEUSDT
+INJUSDT
+FETUSDT
+TRUMPUSDT
+ACEUSDT
+SANDUSDT
+ZROUSDT
+AAVEUSDT
+LTCUSDT
+LINKUSDT
+PENGUUSDT
+MARSCOINUSDT
+XLMUSDT
+HBARUSDT
+ARBUSDT
+ASTERUSDT
+MINAUSDT
+API3USDT
+TRBUSDT
+PROMUSDT
+DOTUSDT
+APTUSDT
+RENDERUSDT
+FILUSDT
+BCHUSDT
+DASHUSDT
+RAYUSDT
+GTCUSDT
+MUBARAKUSDT
+ICPUSDT
+MOVRUSDT
+VIRTUALUSDT
+ETHFIUSDT
+XPLUSDT
+GRAMUSDT
+TIAUSDT
+TONUSDT
+OPUSDT
+METUSDT
+POLUSDT
+CAKEUSDT
+SEIUSDT
+EDUUSDT
+RADUSDT
+PYTHUSDT
+AEROUSDT
+CHIPUSDT
+SHIBUSDT
+ARUSDT
+MAGICUSDT
+WLFIUSDT
+UMAUSDT
+JTOUSDT
+ZAMAUSDT
+PARTIUSDT
+C98USDT
+SAGAUSDT
+ETCUSDT
+AXSUSDT
+LDOUSDT
+RESOLVUSDT
+JSTUSDT
+ORDIUSDT
+SYNUSDT
+NIGHTUSDT
+PENDLEUSDT
+LPTUSDT
+MIRAUSDT
+NILUSDT
+STRKUSDT
+OGNUSDT
+ZENUSDT
+HEMIUSDT
+SKYUSDT
+NFPUSDT
+STXUSDT
+ALGOUSDT
