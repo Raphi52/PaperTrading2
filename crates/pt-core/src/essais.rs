@@ -113,6 +113,8 @@ pub fn fingerprint(p: &Preset) -> String {
         pyramid: Option<Pyramid>,
         trend_sma: Option<usize>,
         max_positions: Option<usize>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        switch_margin: Option<f64>,
     }
     serde_json::to_string(&Settings {
         timeframe: p.timeframe,
@@ -122,6 +124,7 @@ pub fn fingerprint(p: &Preset) -> String {
         pyramid: p.pyramid,
         trend_sma: p.trend_sma,
         max_positions: p.max_positions,
+        switch_margin: p.switch_margin,
     })
     .expect("réglages sérialisables")
 }
@@ -222,7 +225,7 @@ mod tests {
         let before = strategy_trials_in(&reg, &full);
         let mut tuned = full.clone();
         for p in tuned.iter_mut() {
-            if let Rule::KeltnerBreakout { mult, .. } = &mut p.rule {
+            if let (true, Rule::KeltnerBreakout { mult, .. }) = (p.id == "keltner_breakout_4h", &mut p.rule) {
                 *mult = 1.5;
             }
         }

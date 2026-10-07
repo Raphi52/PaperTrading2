@@ -155,3 +155,21 @@ progress { width: 320px; height: 8px; accent-color: var(--gold); margin-right: 1
   .brand-sub { display: none; }
   .brand { min-width: 0; }
 }
+
+/* liste triable, filtres, marqueurs de trades */
+.toolbar { display: flex; flex-wrap: wrap; align-items: end; gap: 10px; margin: 10px 0; }
+.toolbar input, .toolbar select { width: auto; min-width: 150px; }
+.toolbar #pf-q { min-width: 260px; }
+.toolbar label { display: flex; flex-direction: column; }
+.seg { display: flex; gap: 4px; }
+.seg button.on { border-color: var(--gold); color: var(--gold-2); }
+th.sortable { cursor: pointer; user-select: none; white-space: nowrap; }
+th.sortable:hover, th.sorted { color: var(--gold-2); }
+td.actions { white-space: nowrap; }
+td.actions button { margin-left: 4px; }
+#pf-table a { color: var(--text); text-decoration: none; font-weight: 600; }
+#pf-table a:hover { color: var(--gold-2); }
+.marks .buy { fill: var(--green); stroke: #0d1118; stroke-width: .8; }
+.marks .sell { fill: var(--red); stroke: #0d1118; stroke-width: .8; }
+tr.trade-row { cursor: pointer; }
+tr.trade-row:hover td { background: rgba(227,186,85,.07); }

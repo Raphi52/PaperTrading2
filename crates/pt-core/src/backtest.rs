@@ -197,20 +197,24 @@ pub struct Run {
     pub curve: Vec<CurvePoint>,
 }
 
-/// Instant à partir duquel tous les symboles ont fini leur préchauffage.
+/// Instant à partir duquel le PREMIER symbole a fini son préchauffage. Chaque
+/// crypto n'entre ensuite qu'après son propre préchauffage (voir `Engine::advance`) :
+/// une crypto cotée tard n'ampute plus l'historique des autres, et aucune crypto
+/// n'est utilisée avant sa date de cotation.
 pub fn common_start(preset: &Preset, series: &BTreeMap<String, Vec<Candle>>) -> Result<i64, BacktestError> {
     let w = preset.warmup();
-    let mut start = i64::MIN;
+    let mut start: Option<i64> = None;
+    let mut longest = 0;
     for (s, c) in series {
         if c.is_empty() {
             return Err(BacktestError::NoData(s.clone()));
         }
-        if c.len() <= w + 2 {
-            return Err(BacktestError::TooShort { needed: w + 3, got: c.len() });
+        longest = longest.max(c.len());
+        if c.len() > w + 2 {
+            start = Some(start.map_or(c[w].open_time, |x| x.min(c[w].open_time)));
         }
-        start = start.max(c[w].open_time);
     }
-    Ok(start)
+    start.ok_or(BacktestError::TooShort { needed: w + 3, got: longest })
 }
 
 /// Rejoue le moteur sur des séries de bougies CLÔTURÉES.

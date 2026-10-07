@@ -2550,7 +2550,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "papertrading2"
+name = "papertrading"
 version = "0.1.0"
 dependencies = [
  "anyhow",

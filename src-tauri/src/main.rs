@@ -30,7 +30,7 @@ fn main() {
                 Err(_) => app.path().app_data_dir()?,
             };
             std::fs::create_dir_all(&dir)?;
-            let store = pt_store::Store::open(dir.join("papertrading2.sqlite"))?;
+            let store = pt_store::open_app_store(&dir)?;
             let state = Arc::new(AppState::new(store, dir));
             app.manage(state.clone());
             tauri::async_runtime::spawn(live::run_loop(state, app.handle().clone()));
@@ -58,9 +58,11 @@ fn main() {
             commands::app_info,
             commands::get_autostart,
             commands::set_autostart,
+            commands::trade_candles,
+            commands::portfolio_decisions,
         ])
         .run(tauri::generate_context!())
-        .expect("impossible de démarrer PaperTrading2");
+        .expect("impossible de démarrer PaperTrading");
 }
 
 #[cfg(test)]
@@ -70,8 +72,8 @@ mod tests {
     #[test]
     fn only_the_login_entry_opens_minimized() {
         let args = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
-        assert!(launched_at_login(args(&["papertrading2.exe", "--demarrage"])));
-        assert!(!launched_at_login(args(&["papertrading2.exe"])));
+        assert!(launched_at_login(args(&["papertrading.exe", "--demarrage"])));
+        assert!(!launched_at_login(args(&["papertrading.exe"])));
         // Le chemin de l'exécutable n'est jamais pris pour l'argument.
         assert!(!launched_at_login(args(&["--demarrage"])));
     }

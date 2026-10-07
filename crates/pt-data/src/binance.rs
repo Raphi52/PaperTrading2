@@ -42,7 +42,7 @@ impl BinanceClient {
     pub fn with_base(base: &str) -> Self {
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(20))
-            .user_agent("PaperTrading2")
+            .user_agent("PaperTrading")
             .build()
             .expect("client HTTP");
         BinanceClient { http, base: base.trim_end_matches('/').to_string() }
@@ -86,6 +86,19 @@ impl BinanceClient {
         Ok(out)
     }
 
+    /// Les `n` paires USDT les plus échangées sur 24 h (volume en USDT),
+    /// sans stablecoins ni jetons à effet de levier.
+    pub async fn top_usdt_symbols(&self, n: usize) -> Result<Vec<String>> {
+        let url = format!("{}/api/v3/ticker/24hr", self.base);
+        let resp = self.http.get(&url).send().await.context("requête Binance ticker 24h")?;
+        let status = resp.status();
+        let body: Value = resp.json().await.context("réponse Binance ticker 24h illisible")?;
+        if !status.is_success() {
+            bail!("Binance ticker 24h : {status} {body}");
+        }
+        Ok(rank_usdt_symbols(&body, n))
+    }
+
     /// Les `limit` dernières bougies clôturées, plus la bougie en cours.
     pub async fn recent(&self, symbol: &str, tf: Timeframe, limit: usize) -> Result<Recent> {
         let now = crate::now_ms();
@@ -96,6 +109,46 @@ impl BinanceClient {
         };
         Ok(Recent { closed: all, forming })
     }
+}
+
+const STABLES: &[&str] = &[
+    "USDC", "FDUSD", "TUSD", "BUSD", "DAI", "USDP", "USDD", "PYUSD", "USDE", "EUR", "EURI", "AEUR", "GBP", "TRY",
+    "BRL", "XUSD", "USD1", "RLUSD", "PAXG", "WBTC", "WBETH", "BFUSD", "U", "XAUT",
+];
+
+/// Actions tokenisées cotées en USDT sur Binance (relevé du 2026-10-07). Binance ne
+/// les distingue d'une crypto par aucun champ de son API : la liste est tenue à la main.
+const TOKENIZED_STOCKS: &[&str] =
+    &["SPCXB", "SNDKB", "CRCLB", "MSTRB", "QQQB", "NVDAB", "MUB", "MRVLB", "SNXXB", "GOOGLB", "INTCB", "MRNAB", "BNCB"];
+
+/// Univers figé et relu (`crates/pt-data/univers.txt`) : `TOP100` le désigne partout.
+pub const UNIVERSE: &str = include_str!("../univers.txt");
+
+/// Les `n` premiers symboles de l'univers figé.
+pub fn frozen_universe(n: usize) -> Vec<String> {
+    UNIVERSE.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with('#')).take(n).map(String::from).collect()
+}
+
+/// Classe les paires USDT du ticker 24 h par volume en USDT décroissant.
+pub fn rank_usdt_symbols(body: &Value, n: usize) -> Vec<String> {
+    let mut rows: Vec<(String, f64)> = body
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|r| {
+            let sym = r.get("symbol")?.as_str()?;
+            let base = sym.strip_suffix("USDT")?;
+            let levered = ["UP", "DOWN", "BULL", "BEAR"].iter().any(|x| base.len() > x.len() && base.ends_with(x));
+            let not_crypto = STABLES.contains(&base) || TOKENIZED_STOCKS.contains(&base) || !base.is_ascii();
+            if base.is_empty() || not_crypto || levered {
+                return None;
+            }
+            let vol: f64 = r.get("quoteVolume")?.as_str()?.parse().ok()?;
+            (vol > 0.0).then(|| (sym.to_string(), vol))
+        })
+        .collect();
+    rows.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    rows.into_iter().take(n).map(|(s, _)| s).collect()
 }
 
 pub fn parse_klines(body: &Value) -> Result<Vec<Candle>> {
@@ -129,6 +182,36 @@ pub fn parse_klines(body: &Value) -> Result<Vec<Candle>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn frozen_universe_has_100_distinct_cryptos() {
+        let u = frozen_universe(1000);
+        assert_eq!(u.len(), 100);
+        assert_eq!(u.iter().collect::<std::collections::BTreeSet<_>>().len(), 100);
+        for s in &u {
+            let base = s.strip_suffix("USDT").expect("paire USDT");
+            assert!(base.is_ascii() && !STABLES.contains(&base) && !TOKENIZED_STOCKS.contains(&base), "{s}");
+        }
+        assert_eq!(&frozen_universe(3)[..], ["BTCUSDT", "ETHUSDT", "SOLUSDT"]);
+    }
+
+    #[test]
+    fn top_symbols_rank_by_volume_without_stables() {
+        let body = serde_json::json!([
+            {"symbol": "ETHUSDT", "quoteVolume": "500"},
+            {"symbol": "USDCUSDT", "quoteVolume": "9000"},
+            {"symbol": "BTCUSDT", "quoteVolume": "1000"},
+            {"symbol": "ETHBTC", "quoteVolume": "99999"},
+            {"symbol": "BTCUPUSDT", "quoteVolume": "800"},
+            {"symbol": "DEADUSDT", "quoteVolume": "0"},
+            {"symbol": "SOLUSDT", "quoteVolume": "700"},
+            {"symbol": "MSTRBUSDT", "quoteVolume": "650"},
+            {"symbol": "XAUTUSDT", "quoteVolume": "640"},
+            {"symbol": "牛来USDT", "quoteVolume": "630"}
+        ]);
+        assert_eq!(rank_usdt_symbols(&body, 2), ["BTCUSDT", "SOLUSDT"]);
+        assert_eq!(rank_usdt_symbols(&body, 10), ["BTCUSDT", "SOLUSDT", "ETHUSDT"]);
+    }
 
     #[test]
     fn parses_binance_rows() {

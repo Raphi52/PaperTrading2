@@ -1,6 +1,6 @@
 //! # pt-core
 //!
-//! Le cœur de PaperTrading2 : indicateurs, comptabilité, stratégies, moteur et
+//! Le cœur de PaperTrading : indicateurs, comptabilité, stratégies, moteur et
 //! backtest. Ce crate ne fait AUCUN accès réseau ni disque : tout ce qui décide
 //! d'un trade est une fonction pure, donc testable et rejouable.
 

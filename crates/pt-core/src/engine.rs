@@ -13,7 +13,7 @@
 //!   pas de la trésorerie restante.
 
 use crate::candle::Candle;
-use crate::indicators::atr;
+use crate::indicators::{atr, closes, rsi, sma};
 use crate::portfolio::{CostModel, Portfolio};
 use crate::strategy::{compute_signals, entry_strength, External, Preset, Signal, Sizing, TakeProfit};
 use serde::{Deserialize, Serialize};
@@ -68,6 +68,69 @@ struct Candidate {
     symbol: String,
     strength: f64,
     atr: f64,
+    time: i64,
+    price: f64,
+    indicators: BTreeMap<String, f64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DecisionKind {
+    /// Entrée décidée (exécutée à l'ouverture suivante).
+    Entry,
+    /// Renforcement décidé.
+    Add,
+    /// Sortie décidée, ou stop/objectif touché dans la bougie.
+    Exit,
+    /// Signal (ou décision) écarté, avec sa raison.
+    Skipped,
+}
+
+impl DecisionKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DecisionKind::Entry => "ENTRY",
+            DecisionKind::Add => "ADD",
+            DecisionKind::Exit => "EXIT",
+            DecisionKind::Skipped => "SKIPPED",
+        }
+    }
+}
+
+/// Instantané d'une décision : quand, quoi, pourquoi, et l'état des indicateurs.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Decision {
+    pub time: i64,
+    pub symbol: String,
+    pub kind: DecisionKind,
+    pub reason: String,
+    pub price: f64,
+    pub indicators: BTreeMap<String, f64>,
+}
+
+/// Indicateurs communs à toutes les stratégies, à la dernière bougie de `c`.
+/// Les valeurs non définies (historique trop court) sont omises.
+pub fn indicator_snapshot(c: &[Candle], atr14: f64, strength: f64) -> BTreeMap<String, f64> {
+    let mut m = BTreeMap::new();
+    let Some(last) = c.last() else { return m };
+    let cl = closes(c);
+    let i = c.len() - 1;
+    let mut put = |k: &str, v: f64| {
+        if v.is_finite() {
+            m.insert(k.to_string(), v);
+        }
+    };
+    put("close", last.close);
+    put("volume", last.volume);
+    put("atr14", atr14);
+    put("strength", strength);
+    put("rsi14", rsi(&cl, 14)[i]);
+    put("sma20", sma(&cl, 20)[i]);
+    put("sma50", sma(&cl, 50)[i]);
+    put("sma200", sma(&cl, 200)[i]);
+    if i >= 1 {
+        put("change_pct", (last.close / c[i - 1].close - 1.0) * 100.0);
+    }
+    m
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -80,6 +143,18 @@ pub struct Engine {
     pub marks: BTreeMap<String, f64>,
     /// Aucune entrée sur une bougie ouverte avant cet instant (préchauffage).
     pub trade_from: i64,
+    /// Active le journal des décisions (mode direct). Jamais sérialisé.
+    #[serde(skip)]
+    pub record: bool,
+    /// Décisions pas encore enregistrées. Jamais sérialisé : la base les garde
+    /// dans sa propre table, l'état du moteur ne grossit donc pas.
+    #[serde(skip)]
+    pub decisions: Vec<Decision>,
+    /// Dernier instantané d'indicateurs par crypto (clôture la plus récente),
+    /// pour les décisions prises hors de la clôture (exécution à l'ouverture,
+    /// sortie par remplacement). Jamais sérialisé.
+    #[serde(skip)]
+    pub last_indicators: BTreeMap<String, BTreeMap<String, f64>>,
 }
 
 impl Engine {
@@ -93,7 +168,27 @@ impl Engine {
             states,
             marks: BTreeMap::new(),
             trade_from,
+            record: false,
+            decisions: Vec::new(),
+            last_indicators: BTreeMap::new(),
         }
+    }
+
+    fn log(&mut self, time: i64, symbol: &str, kind: DecisionKind, reason: &str, price: f64, indicators: BTreeMap<String, f64>) {
+        if self.record {
+            self.decisions.push(Decision {
+                time,
+                symbol: symbol.to_string(),
+                kind,
+                reason: reason.to_string(),
+                price,
+                indicators,
+            });
+        }
+    }
+
+    fn last_snap(&self, symbol: &str) -> BTreeMap<String, f64> {
+        if self.record { self.last_indicators.get(symbol).cloned().unwrap_or_default() } else { BTreeMap::new() }
     }
 
     pub fn equity(&self) -> f64 {
@@ -152,7 +247,7 @@ impl Engine {
                     let mut sig = p.signals[i];
                     // Préchauffage propre à chaque crypto : cotée tard, elle entre tard.
                     sig.enter &= i >= warmup;
-                    if let Some(c) = self.close_bar(sym, bar, sig, p.atr[i], p.strength[i], true) {
+                    if let Some(c) = self.close_bar(sym, &p.feed.closed[..=i], sig, p.atr[i], p.strength[i], true) {
                         candidates.push(c);
                     }
                     close_time = close_time.max(bar.close_time);
@@ -193,7 +288,7 @@ impl Engine {
     /// Étape 1 : la bougie `bar` de `symbol` vient de se clôturer.
     /// Applique les stops/objectifs touchés pendant la bougie, puis décide.
     pub fn on_bar_close(&mut self, symbol: &str, bar: &Candle, sig: Signal, atr: f64) {
-        self.close_bar(symbol, bar, sig, atr, f64::NAN, false);
+        self.close_bar(symbol, std::slice::from_ref(bar), sig, atr, f64::NAN, false);
     }
 
     /// Répartit les places entre les cryptos qui ont donné un signal d'entrée au
@@ -204,15 +299,26 @@ impl Engine {
         let key = |x: f64| if x.is_nan() { f64::NEG_INFINITY } else { x };
         candidates.sort_by(|a, b| key(b.strength).total_cmp(&key(a.strength)).then_with(|| a.symbol.cmp(&b.symbol)));
         let mut free = self.max_positions().saturating_sub(self.portfolio.positions.len() + self.pending_entries());
-        for c in candidates {
+        let skip = |e: &mut Engine, c: Candidate, why: &str| {
+            e.log(c.time, &c.symbol, DecisionKind::Skipped, why, c.price, c.indicators);
+        };
+        let mut rest = candidates.into_iter();
+        while let Some(c) = rest.next() {
             if free > 0 {
                 free -= 1;
                 self.states.get_mut(&c.symbol).expect("état").pending =
                     Some(Pending { kind: PendingKind::Enter, reason: "SIGNAL D'ENTRÉE".into(), atr: c.atr });
+                self.log(c.time, &c.symbol, DecisionKind::Entry, "SIGNAL D'ENTRÉE", c.price, c.indicators);
                 continue;
             }
-            let Some(margin) = self.preset.switch_margin else { break };
+            let Some(margin) = self.preset.switch_margin else {
+                skip(self, c, "PLUS DE PLACE");
+                rest.for_each(|c| skip(self, c, "PLUS DE PLACE"));
+                break;
+            };
             if c.strength.is_nan() {
+                skip(self, c, "PLUS DE PLACE (force inconnue)");
+                rest.for_each(|c| skip(self, c, "PLUS DE PLACE (force inconnue)"));
                 break;
             }
             let weakest = self
@@ -228,14 +334,35 @@ impl Engine {
                     st.strength.map(|v| (s.clone(), v))
                 })
                 .min_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
-            let Some((weak, weak_strength)) = weakest else { break };
+            let Some((weak, weak_strength)) = weakest else {
+                skip(self, c, "PLUS DE PLACE (aucune position remplaçable)");
+                rest.for_each(|c| skip(self, c, "PLUS DE PLACE (aucune position remplaçable)"));
+                break;
+            };
             if c.strength < weak_strength + margin {
-                break; // candidates triées : les suivantes ne feront pas mieux
+                // candidates triées : les suivantes ne feront pas mieux
+                let why = |c: &Candidate| {
+                    format!("PLUS DE PLACE (force {:.2} < {weak} {:.2} + marge {margin})", c.strength, weak_strength)
+                };
+                let w = why(&c);
+                skip(self, c, &w);
+                rest.for_each(|c| {
+                    let w = why(&c);
+                    skip(self, c, &w)
+                });
+                break;
             }
+            let out_reason = format!("CHANGEMENT → {}", c.symbol);
+            let in_reason = format!("CHANGEMENT (remplace {weak})");
             self.states.get_mut(&weak).expect("état").pending =
-                Some(Pending { kind: PendingKind::Exit, reason: format!("CHANGEMENT → {}", c.symbol), atr: c.atr });
+                Some(Pending { kind: PendingKind::Exit, reason: out_reason.clone(), atr: c.atr });
             self.states.get_mut(&c.symbol).expect("état").pending =
-                Some(Pending { kind: PendingKind::Enter, reason: format!("CHANGEMENT (remplace {weak})"), atr: c.atr });
+                Some(Pending { kind: PendingKind::Enter, reason: in_reason.clone(), atr: c.atr });
+            let weak_price = self.marks.get(&weak).copied().unwrap_or(f64::NAN);
+            let mut weak_ind = self.last_snap(&weak);
+            weak_ind.insert("strength".to_string(), weak_strength);
+            self.log(c.time, &weak, DecisionKind::Exit, &out_reason, weak_price, weak_ind);
+            self.log(c.time, &c.symbol, DecisionKind::Entry, &in_reason, c.price, c.indicators);
         }
     }
 
@@ -244,12 +371,19 @@ impl Engine {
     fn close_bar(
         &mut self,
         symbol: &str,
-        bar: &Candle,
+        hist: &[Candle],
         sig: Signal,
         atr: f64,
         strength: f64,
         defer_entry: bool,
     ) -> Option<Candidate> {
+        let bar = hist.last().expect("au moins la bougie clôturée");
+        let record = self.record;
+        let snap_now = if record { indicator_snapshot(hist, atr, strength) } else { BTreeMap::new() };
+        if record {
+            self.last_indicators.insert(symbol.to_string(), snap_now.clone());
+        }
+        let snap = || snap_now.clone();
         let state = self.states.entry(symbol.to_string()).or_default();
         if let Some(last) = state.last_bar_open_time {
             if bar.open_time <= last {
@@ -259,6 +393,7 @@ impl Engine {
         state.strength = strength.is_finite().then_some(strength);
 
         // 1. Sorties touchées pendant la bougie.
+        let mut in_bar_exit: Option<(f64, String)> = None;
         if let Some(pos) = self.portfolio.positions.get(symbol) {
             if pos.entry_time <= bar.open_time {
                 let stop_label = if state.trailing_active { "STOP SUIVEUR" } else { "STOP" };
@@ -285,12 +420,24 @@ impl Engine {
                         .expect("position présente");
                     state.pending = None;
                     state.trailing_active = false;
+                    in_bar_exit = Some((price, reason));
                 }
             }
         }
 
         self.marks.insert(symbol.to_string(), bar.close);
         state.last_bar_open_time = Some(bar.open_time);
+        if let (true, Some((price, reason))) = (record, in_bar_exit) {
+            // Champ distinct de `states` : `state` reste emprunté plus bas.
+            self.decisions.push(Decision {
+                time: bar.close_time,
+                symbol: symbol.to_string(),
+                kind: DecisionKind::Exit,
+                reason,
+                price,
+                indicators: snap(),
+            });
+        }
 
         // 2. Décision à la clôture.
         let exits = self.preset.exits.clone();
@@ -325,21 +472,38 @@ impl Engine {
             } else {
                 None
             };
+            if let Some(p) = &pending {
+                let kind = if p.kind == PendingKind::Add { DecisionKind::Add } else { DecisionKind::Exit };
+                let reason = p.reason.clone();
+                self.log(bar.close_time, symbol, kind, &reason, bar.close, snap());
+            }
             let state = self.states.get_mut(symbol).expect("état");
             state.pending = pending;
         } else if defer_entry {
             let state = self.states.get_mut(symbol).expect("état");
             state.pending = None;
             if sig.enter && bar.open_time >= self.trade_from {
-                return Some(Candidate { symbol: symbol.to_string(), strength, atr });
+                return Some(Candidate {
+                    symbol: symbol.to_string(),
+                    strength,
+                    atr,
+                    time: bar.close_time,
+                    price: bar.close,
+                    indicators: snap(),
+                });
             }
         } else {
-            let can_enter = sig.enter
-                && bar.open_time >= self.trade_from
-                && self.portfolio.positions.len() + self.pending_entries() < self.max_positions();
+            let in_window = sig.enter && bar.open_time >= self.trade_from;
+            let can_enter =
+                in_window && self.portfolio.positions.len() + self.pending_entries() < self.max_positions();
             let state = self.states.get_mut(symbol).expect("état");
             state.pending =
                 can_enter.then(|| Pending { kind: PendingKind::Enter, reason: "SIGNAL D'ENTRÉE".into(), atr });
+            if can_enter {
+                self.log(bar.close_time, symbol, DecisionKind::Entry, "SIGNAL D'ENTRÉE", bar.close, snap());
+            } else if in_window {
+                self.log(bar.close_time, symbol, DecisionKind::Skipped, "PLUS DE PLACE", bar.close, snap());
+            }
         }
         None
     }
@@ -362,12 +526,18 @@ impl Engine {
             }
             PendingKind::Enter => {
                 if self.portfolio.positions.contains_key(symbol) {
+                    let why = "ENTRÉE ANNULÉE (position déjà ouverte)";
+                    let ind = self.last_snap(symbol);
+                    self.log(time, symbol, DecisionKind::Skipped, why, price, ind);
                     return;
                 }
                 let fill = self.costs.buy_price(price);
                 let stop = self.preset.exits.stop.and_then(|d| d.below(fill, pending.atr));
                 let notional = self.entry_notional(fill, stop).min(self.portfolio.cash);
                 if notional < MIN_NOTIONAL {
+                    let why = format!("ENTRÉE ANNULÉE (montant {notional:.2} < minimum {MIN_NOTIONAL})");
+                    let ind = self.last_snap(symbol);
+                    self.log(time, symbol, DecisionKind::Skipped, &why, price, ind);
                     return;
                 }
                 self.portfolio
@@ -379,6 +549,9 @@ impl Engine {
                 let Some(pos) = self.portfolio.positions.get(symbol) else { return };
                 let notional = pos.layer_notional.min(self.portfolio.cash);
                 if notional < MIN_NOTIONAL {
+                    let why = format!("RENFORCEMENT ANNULÉ (montant {notional:.2} < minimum {MIN_NOTIONAL})");
+                    let ind = self.last_snap(symbol);
+                    self.log(time, symbol, DecisionKind::Skipped, &why, price, ind);
                     return;
                 }
                 self.portfolio
@@ -447,6 +620,50 @@ mod tests {
         e.on_next_open("A", b0.close_time + 1, 105.0);
         let pos = &e.portfolio.positions["A"];
         assert!((pos.avg_price - e.costs.buy_price(105.0)).abs() < 1e-9, "exécuté à l'ouverture suivante");
+    }
+
+    #[test]
+    fn decisions_record_entry_exit_and_skipped_with_indicators() {
+        let mut e = stop_engine(5.0, None);
+        e.preset.max_positions = Some(1);
+        e.symbols = vec!["A".into(), "B".into()];
+        e.record = true;
+        let hist: Vec<Candle> = (0..30).map(|i| candle(i, 100.0, 101.0, 99.0, 100.0 + i as f64 * 0.1)).collect();
+        let last = hist.last().unwrap();
+        e.close_bar("A", &hist, Signal { enter: true, exit: false }, 1.0, f64::NAN, false);
+        e.close_bar("B", &hist, Signal { enter: true, exit: false }, 1.0, f64::NAN, false);
+        e.on_next_open("A", last.close_time + 1, 103.0);
+        let next = candle(30, 103.0, 104.0, 102.0, 103.5);
+        e.on_bar_close("A", &next, Signal { enter: false, exit: true }, 1.0);
+        let kinds: Vec<_> = e.decisions.iter().map(|d| (d.symbol.as_str(), d.kind, d.reason.as_str())).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                ("A", DecisionKind::Entry, "SIGNAL D'ENTRÉE"),
+                ("B", DecisionKind::Skipped, "PLUS DE PLACE"),
+                ("A", DecisionKind::Exit, "SIGNAL DE SORTIE"),
+            ]
+        );
+        assert!(e.decisions[0].indicators.contains_key("rsi14"), "{:?}", e.decisions[0].indicators);
+        assert!(e.decisions[0].indicators.contains_key("sma20"));
+        assert!(e.decisions.iter().all(|d| d.indicators.contains_key("close")));
+        // Une entrée annulée à l'ouverture garde l'instantané de la dernière clôture.
+        let mut e2 = stop_engine(5.0, None);
+        e2.record = true;
+        e2.close_bar("A", &hist, Signal { enter: true, exit: false }, 1.0, f64::NAN, false);
+        e2.portfolio.cash = 1.0;
+        e2.on_next_open("A", last.close_time + 1, 103.0);
+        let skip = e2.decisions.last().unwrap();
+        assert_eq!(skip.kind, DecisionKind::Skipped, "{:?}", skip.reason);
+        assert!(skip.reason.starts_with("ENTRÉE ANNULÉE"), "{}", skip.reason);
+        assert!(skip.indicators.contains_key("rsi14"), "{:?}", skip.indicators);
+        // Jumeau : sans `record`, rien n'est journalisé (backtests inchangés).
+        let mut quiet = stop_engine(5.0, None);
+        quiet.on_bar_close("A", &next, Signal { enter: true, exit: false }, 1.0);
+        assert!(quiet.decisions.is_empty());
+        // Et le journal n'entre jamais dans l'état sérialisé.
+        let json = serde_json::to_string(&e).unwrap();
+        assert!(!json.contains("decisions") && !json.contains("rsi14"), "{json}");
     }
 
     #[test]
@@ -625,7 +842,7 @@ mod tests {
         let b = candle(i, 100.0, 101.0, 99.0, 100.0);
         let mut cands = Vec::new();
         for (s, enter, st) in sigs {
-            if let Some(c) = e.close_bar(s, &b, Signal { enter: *enter, exit: false }, 1.0, *st, true) {
+            if let Some(c) = e.close_bar(s, std::slice::from_ref(&b), Signal { enter: *enter, exit: false }, 1.0, *st, true) {
                 cands.push(c);
             }
         }

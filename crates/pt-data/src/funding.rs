@@ -31,7 +31,7 @@ impl FundingClient {
         let base = std::env::var("PT_BINANCE_FUTURES_URL").unwrap_or_else(|_| DEFAULT_FUTURES_URL.to_string());
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(20))
-            .user_agent("PaperTrading2")
+            .user_agent("PaperTrading")
             .build()
             .expect("client HTTP");
         FundingClient { http, base: base.trim_end_matches('/').to_string() }

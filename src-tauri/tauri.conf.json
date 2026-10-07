@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "PaperTrading2",
+  "productName": "PaperTrading",
   "version": "0.1.0",
-  "identifier": "com.raphi52.papertrading2",
+  "identifier": "com.raphi52.papertrading",
   "build": {
     "frontendDist": "../ui"
   },
@@ -11,7 +11,7 @@
     "windows": [
       {
         "label": "main",
-        "title": "PaperTrading2",
+        "title": "PaperTrading",
         "width": 1320,
         "height": 860,
         "minWidth": 980,

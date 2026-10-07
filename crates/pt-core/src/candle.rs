@@ -33,6 +33,8 @@ impl Candle {
 pub enum Timeframe {
     #[serde(rename = "15m")]
     M15,
+    #[serde(rename = "30m")]
+    M30,
     #[serde(rename = "1h")]
     H1,
     #[serde(rename = "4h")]
@@ -42,12 +44,13 @@ pub enum Timeframe {
 }
 
 impl Timeframe {
-    pub const ALL: [Timeframe; 4] = [Timeframe::M15, Timeframe::H1, Timeframe::H4, Timeframe::D1];
+    pub const ALL: [Timeframe; 5] = [Timeframe::M15, Timeframe::M30, Timeframe::H1, Timeframe::H4, Timeframe::D1];
 
     /// Code d'intervalle Binance.
     pub fn as_str(&self) -> &'static str {
         match self {
             Timeframe::M15 => "15m",
+            Timeframe::M30 => "30m",
             Timeframe::H1 => "1h",
             Timeframe::H4 => "4h",
             Timeframe::D1 => "1d",
@@ -57,6 +60,7 @@ impl Timeframe {
     pub fn millis(&self) -> i64 {
         match self {
             Timeframe::M15 => 15 * 60_000,
+            Timeframe::M30 => 30 * 60_000,
             Timeframe::H1 => 3_600_000,
             Timeframe::H4 => 4 * 3_600_000,
             Timeframe::D1 => 24 * 3_600_000,
@@ -71,6 +75,7 @@ impl Timeframe {
     pub fn parse(s: &str) -> Option<Timeframe> {
         match s {
             "15m" => Some(Timeframe::M15),
+            "30m" => Some(Timeframe::M30),
             "1h" => Some(Timeframe::H1),
             "4h" => Some(Timeframe::H4),
             "1d" => Some(Timeframe::D1),

@@ -1,4 +1,4 @@
-# PaperTrading2
+# PaperTrading
 
 Paper trading crypto en **Rust + Tauri** : des stratégies suivies sur les prix réels de Binance avec de l'argent fictif, **frais compris**, et **toujours comparées à « acheter et garder »**.
 
@@ -52,6 +52,20 @@ Mesuré le 7 octobre 2026 sur BTC, ETH, SOL, BNB et XRP, pour les **101 stratég
 - **Les frais tuent les stratégies rapides.** Le croisement EMA 9/21 en 1h ferait **+168 % sans frais**, mais il tombe à **−46 % avec frais** (2 757 trades). Les stratégies 1h sont toutes perdantes.
 - **Une seule stratégie bat « acheter et garder » en rendement brut** sur ces 3 ans : **Au-dessus de la SMA 50 (1j)**, qui fait **+362,2 %** contre +240,2 %, avec une pire baisse de **33 %** contre 63 %. Elle est investie à parts égales sur chaque symbole tant que son prix est au-dessus de sa moyenne 50 jours, en liquide sinon (Detzel et al., 2021). Mais sur 2017-2026, elle ne bat un timing au hasard de même exposition que dans 9 fenêtres sur 17 : ce gain peut venir de la période. Elle est suivie en direct pour le vérifier sur des prix qu'elle n'a jamais vus.
 - **Le momentum 28 jours** (Liu & Tsyvinski, 2021), même principe, fait +201,1 % avec une pire baisse de 36 %, et reste lui aussi indiscernable du hasard (10 fenêtres sur 18).
+
+## Sur 100 cryptos (`--symbols top100`)
+
+Chaque stratégie peut scanner un **univers de 100 cryptos** (`crates/pt-data/univers.txt`) : les 100 paires USDT spot les plus échangées sur Binance le 7 octobre 2026, relues à la main pour retirer les stablecoins, l'or (XAUT) et les actions tokenisées (MSTRB, NVDAB, QQQB…), que Binance ne distingue d'une crypto par aucun champ. Une stratégie tient **10 positions au plus** : quand plus de cryptos signalent une entrée que de places libres, les signaux les plus forts passent (rendement des 20 dernières bougies rapporté à la volatilité), et une crypto nettement plus forte **remplace** la plus faible tenue (`switch_margin`). Tableau complet : [`docs/comparaison-univers-2026-10-07.md`](docs/comparaison-univers-2026-10-07.md), calculé en 4 minutes sur 16 cœurs.
+
+| Verdict | Nombre |
+|---|---:|
+| **Solide** | **0** |
+| Prometteuse | 1 (MACD 1j : 13 fenêtres indépendantes gagnées sur 17) |
+| Indiscernable du hasard | 16 |
+| Perdante | 84, dont les 25 stratégies 1h |
+
+- « Acheter et garder » les 100 cryptos ne fait que **+66,6 %** sur 3 ans (pire baisse 78 %). Plusieurs stratégies 1j font mieux en rendement brut (Cassure Keltner 2 ATR +212 %, Turtle 55/20 +196 %), mais **aucune ne prouve que ce n'est pas la chance**.
+- ⚠️ **Biais du survivant** : ce sont les 100 premières *aujourd'hui*. Rejouer le passé sur cette liste favorise les cryptos qui ont survécu et monté ; un backtest y est plus flatteur qu'il ne l'aurait été en temps réel. Seuls les portefeuilles en direct, sur des prix futurs, en sont exempts.
 
 ## Coup de chance ou pas ? Validation sur fenêtres glissantes
 
@@ -122,7 +136,7 @@ Résultat, de novembre 2018 à octobre 2026 :
 Prérequis : [Rust](https://rustup.rs) stable. Sous Windows, il faut aussi les Build Tools C++ de Visual Studio et WebView2 (présent sur Windows 10/11).
 
 ```bash
-cargo run -p papertrading2            # l'application de bureau
+cargo run -p papertrading            # l'application de bureau
 cargo test --workspace                # les tests
 cargo run --release -p pt-cli -- presets
 cargo run --release -p pt-cli -- backtest --preset macd_1d --symbols BTCUSDT,ETHUSDT --days 1095
@@ -142,7 +156,7 @@ Variables d'environnement facultatives :
 - `PT_BINANCE_URL` : source des bougies. Par défaut, `https://data-api.binance.vision`, le point d'accès public en lecture seule de Binance.
 - `PT_BINANCE_FUTURES_URL` : source des taux de financement (`pt portage`). Par défaut, `https://fapi.binance.com`, en lecture seule et sans clé.
 
-Installateur Windows : `cargo install tauri-cli --version "^2" --locked`, puis `cargo tauri build`. Il produit `target/release/bundle/nsis/PaperTrading2_0.1.0_x64-setup.exe` (3,4 Mo). L'installation se fait pour l'utilisateur courant, sans droits d'administrateur, dans `%LOCALAPPDATA%\PaperTrading2`, avec un raccourci dans le menu Démarrer et un désinstalleur. `/S` l'installe sans fenêtre ; depuis Git Bash, préfixe la commande de `MSYS_NO_PATHCONV=1`, sinon `/S` devient `S:/` et l'assistant s'ouvre. Testé le 6 octobre 2026 : la version installée reprend la base existante (`%APPDATA%\com.raphi52.papertrading2`) et ses portefeuilles.
+Installateur Windows : `cargo install tauri-cli --version "^2" --locked`, puis `cargo tauri build`. Il produit `target/release/bundle/nsis/PaperTrading_0.1.0_x64-setup.exe` (3,4 Mo). L'installation se fait pour l'utilisateur courant, sans droits d'administrateur, dans `%LOCALAPPDATA%\PaperTrading2`, avec un raccourci dans le menu Démarrer et un désinstalleur. `/S` l'installe sans fenêtre ; depuis Git Bash, préfixe la commande de `MSYS_NO_PATHCONV=1`, sinon `/S` devient `S:/` et l'assistant s'ouvre. Testé le 6 octobre 2026 : la version installée reprend la base existante (`%APPDATA%\com.raphi52.papertrading2`) et ses portefeuilles. Depuis le renommage en PaperTrading, la base vit dans `%APPDATA%\com.raphi52.papertrading\papertrading.sqlite` ; au premier lancement, l'ancienne base est copiée, jamais effacée.
 
 **L'application ne fait avancer les portefeuilles que lorsqu'elle est ouverte.** Fermée, elle ne perd rien : à la réouverture, elle rejoue dans l'ordre les bougies clôturées entretemps, avec le même moteur que le backtest.
 

@@ -174,6 +174,9 @@ pub async fn tick(state: &AppState) -> Result<(u64, Vec<String>)> {
                     (s.clone(), Feed { closed: &r.closed, forming: r.forming.as_ref() })
                 })
                 .collect();
+            // Journal des décisions : instantané des indicateurs à chaque entrée,
+            // sortie et signal écarté, enregistré par `save_progress`.
+            p.engine.record = true;
             let n = p.engine.advance(&feeds, &ext, |_, _| {});
             p.benchmark.advance(&feeds, &ext, |_, _| {});
             total += n as u64;
@@ -187,7 +190,7 @@ pub async fn tick(state: &AppState) -> Result<(u64, Vec<String>)> {
             let saved = (|| -> Result<()> {
                 let mut store = state.store.lock().expect("base");
                 // L'état est enregistré AVANT le point de courbe : c'est lui qui fait foi.
-                store.save_progress(&p)?;
+                store.save_progress_and_flush(&mut p)?;
                 let last = store.last_equity_time(p.id)?.unwrap_or(0);
                 if n > 0 || now - last >= EQUITY_EVERY_MS {
                     store.push_equity(p.id, row)?;
@@ -199,7 +202,7 @@ pub async fn tick(state: &AppState) -> Result<(u64, Vec<String>)> {
             }
             continue;
         }
-        if let Err(e) = state.store.lock().expect("base").save_progress(&p) {
+        if let Err(e) = state.store.lock().expect("base").save_progress_and_flush(&mut p) {
             errors.push(format!("{} : {e:#}", p.name));
         }
     }
@@ -216,7 +219,7 @@ mod tests {
     /// reprend dès que la première se ferme.
     #[test]
     fn only_one_instance_runs_the_live_loop() {
-        let dir = std::env::temp_dir().join(format!("pt2-lock-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("pt-lock-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("mode-direct.lock");
         let first = acquire_live_lock(&path).expect("première instance");
@@ -226,12 +229,12 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Passage complet sur le VRAI marché (réseau) : `cargo test -p papertrading2 -- --ignored`.
+    /// Passage complet sur le VRAI marché (réseau) : `cargo test -p papertrading -- --ignored`.
     /// Le départ est volontairement antidaté de 10 jours pour que le moteur ait des bougies à traiter.
     #[tokio::test]
     #[ignore]
     async fn live_tick_on_real_market_keeps_books_consistent() {
-        let dir = std::env::temp_dir().join("pt2-live-test");
+        let dir = std::env::temp_dir().join("pt-live-test");
         let state = AppState::new(Store::in_memory().unwrap(), dir);
         let now = pt_data::now_ms();
         let from = now - 10 * 86_400_000;

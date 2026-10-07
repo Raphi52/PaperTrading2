@@ -164,6 +164,23 @@ impl Rule {
 }
 
 /// Calcule les signaux à la clôture de chaque bougie.
+/// Force d'entrée, comparable d'une crypto à l'autre : rendement des 20 dernières
+/// bougies divisé par la volatilité (ATR 14 rapporté au prix). NaN pendant le
+/// préchauffage. Sert à classer les signaux simultanés et à décider un changement.
+pub fn entry_strength(c: &[Candle]) -> Vec<f64> {
+    const LOOKBACK: usize = 20;
+    let a = ind::atr(c, 14);
+    (0..c.len())
+        .map(|i| {
+            if i < LOOKBACK || a[i].is_nan() || a[i] <= 0.0 {
+                return f64::NAN;
+            }
+            let ret = c[i].close / c[i - LOOKBACK].close - 1.0;
+            ret / (a[i] / c[i].close)
+        })
+        .collect()
+}
+
 pub fn compute_signals(rule: &Rule, c: &[Candle], ext: &External, trend_sma: Option<usize>) -> Vec<Signal> {
     let n = c.len();
     let close = ind::closes(c);
@@ -425,6 +442,11 @@ pub struct Preset {
     /// N'entre que si la clôture est au-dessus de la SMA de cette période.
     pub trend_sma: Option<usize>,
     pub max_positions: Option<usize>,
+    /// Changement de crypto : quand toutes les places sont prises, une crypto qui
+    /// donne un signal d'entrée remplace la position la plus faible si sa force
+    /// la dépasse d'au moins cette marge. `None` = pas de changement.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub switch_margin: Option<f64>,
 }
 
 impl Preset {

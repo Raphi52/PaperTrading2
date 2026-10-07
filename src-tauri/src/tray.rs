@@ -37,11 +37,11 @@ fn quit_app(app: &AppHandle) {
 /// fil principal. Sans zone de notification (session sans barre des tâches), la
 /// création réussit mais l'icône n'apparaît pas : voir [`icon_shown`].
 pub fn install(app: &AppHandle) -> tauri::Result<()> {
-    let open = MenuItem::with_id(app, "ouvrir", "Ouvrir PaperTrading2", true, None::<&str>)?;
+    let open = MenuItem::with_id(app, "ouvrir", "Ouvrir PaperTrading", true, None::<&str>)?;
     let quit = MenuItem::with_id(app, "quitter", "Quitter (arrête le mode direct)", true, None::<&str>)?;
     let menu = Menu::with_items(app, &[&open, &quit])?;
     let mut builder = TrayIconBuilder::with_id(TRAY_ID)
-        .tooltip("PaperTrading2 · mode direct actif")
+        .tooltip("PaperTrading · mode direct actif")
         .menu(&menu)
         .show_menu_on_left_click(false)
         .on_menu_event(|app, event| match event.id.as_ref() {

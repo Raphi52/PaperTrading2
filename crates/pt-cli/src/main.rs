@@ -23,7 +23,7 @@ use std::path::PathBuf;
 const DAY_MS: i64 = 86_400_000;
 
 #[derive(Parser)]
-#[command(name = "pt", about = "PaperTrading2 — backtests honnêtes, frais compris, contre « acheter et garder »")]
+#[command(name = "pt", about = "PaperTrading — backtests honnêtes, frais compris, contre « acheter et garder »")]
 struct Cli {
     /// Dossier du cache de bougies.
     #[arg(long, default_value = "data/cache", global = true)]
@@ -94,6 +94,22 @@ fn load_from(c: &Common, now: i64, tf: Timeframe) -> i64 {
 enum Cmd {
     /// Liste le catalogue des stratégies.
     Presets,
+    /// Crée en direct un portefeuille par stratégie du catalogue sur les unités de temps
+    /// données, avec le panier d'un portefeuille existant. Même construction que la
+    /// commande `create_portfolio` de l'application ; saute les stratégies déjà présentes.
+    LiveCreate {
+        /// Dossier de données de l'application (contient papertrading.sqlite).
+        #[arg(long)]
+        data_dir: PathBuf,
+        /// Unités de temps, ex. 15m,30m,1h.
+        #[arg(long, value_delimiter = ',')]
+        timeframes: Vec<String>,
+        /// Portefeuille dont on recopie le panier de symboles.
+        #[arg(long)]
+        symbols_from: i64,
+        #[arg(long, default_value_t = 10_000.0)]
+        cash: f64,
+    },
     /// Registre des essais : combien de stratégies et de variantes ont été essayées.
     Essais,
     /// Backtest d'une stratégie.
@@ -154,7 +170,7 @@ enum Cmd {
         #[arg(long)]
         nom: String,
         /// Dossier des données de l'application. Par défaut : `PT_DATA_DIR`, sinon le
-        /// dossier de l'application (Windows : `%APPDATA%\com.raphi52.papertrading2`).
+        /// dossier de l'application (Windows : `%APPDATA%\com.raphi52.papertrading`).
         #[arg(long)]
         donnees: Option<PathBuf>,
     },
@@ -311,6 +327,49 @@ impl Loader {
     }
 }
 
+/// Juge toutes les stratégies, réparties sur tous les cœurs : chaque évaluation est
+/// indépendante et déterministe, donc le résultat ne dépend pas de l'ordre de calcul.
+/// Rend les rapports classés par conviction.
+fn evaluate_all(
+    presets: &[Preset],
+    series: &BTreeMap<Timeframe, BTreeMap<String, Vec<pt_core::Candle>>>,
+    fear_greed: &[(i64, f64)],
+    cfg: pt_core::backtest::EvalSettings,
+) -> Vec<BacktestReport> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let next = AtomicUsize::new(0);
+    let done = std::sync::Mutex::new(Vec::new());
+    let threads = std::thread::available_parallelism().map_or(4, |n| n.get()).min(presets.len().max(1));
+    std::thread::scope(|scope| {
+        for _ in 0..threads {
+            scope.spawn(|| loop {
+                let i = next.fetch_add(1, Ordering::Relaxed);
+                let Some(p) = presets.get(i) else { break };
+                let ext = if p.needs_fear_greed() {
+                    External { fear_greed: fear_greed.to_vec() }
+                } else {
+                    External::default()
+                };
+                let Some(history) = series.get(&p.timeframe) else { continue };
+                match evaluate(p, history, &ext, cfg) {
+                    Ok(r) => {
+                        eprintln!("  {:<26} {:>8.1} %  {}", p.id, r.metrics.total_return_pct, r.verdict.label());
+                        done.lock().expect("résultats").push((i, r));
+                    }
+                    Err(e) => eprintln!("  {:<26} ignorée : {e}", p.id),
+                }
+            });
+        }
+    });
+    // Ordre du catalogue d'abord : les égalités de conviction gardent le même ordre
+    // qu'un calcul séquentiel, quel que soit le cœur qui a fini le premier.
+    let mut done = done.into_inner().expect("résultats");
+    done.sort_by_key(|(i, _)| *i);
+    let mut rows: Vec<BacktestReport> = done.into_iter().map(|(_, r)| r).collect();
+    rows.sort_by(by_conviction);
+    rows
+}
+
 /// Valeurs de `--lookback` : au moins 1, sans doublon.
 fn parse_lookbacks(asked: &[usize]) -> Result<Vec<usize>> {
     let mut out: Vec<usize> = Vec::new();
@@ -357,7 +416,7 @@ fn app_data_dir(asked: Option<PathBuf>) -> Result<PathBuf> {
         .or_else(|_| std::env::var("XDG_DATA_HOME"))
         .or_else(|_| std::env::var("HOME").map(|h| format!("{h}/.local/share")))
         .map_err(|_| anyhow::anyhow!("dossier de données introuvable : précise --donnees"))?;
-    Ok(PathBuf::from(base).join("com.raphi52.papertrading2"))
+    Ok(PathBuf::from(base).join("com.raphi52.papertrading"))
 }
 
 fn carry_markdown(r: &CarryReport) -> String {
@@ -492,6 +551,31 @@ fn parse_symbols(raw: &str) -> Result<Vec<String>> {
     Ok(out)
 }
 
+/// `--symbols top100` : les 100 paires USDT les plus échangées sur Binance (24 h).
+/// Toute autre valeur est une liste explicite.
+async fn resolve_symbols(raw: &str) -> Result<Vec<String>> {
+    let syms = parse_symbols(raw)?;
+    let n = match syms.as_slice() {
+        [one] => one.strip_prefix("TOP").and_then(|x| x.parse::<usize>().ok()),
+        _ => None,
+    };
+    let Some(n) = n else { return Ok(syms) };
+    if !(1..=400).contains(&n) {
+        bail!("--symbols top{n} refusé : entre top1 et top400");
+    }
+    let out = pt_data::binance::frozen_universe(n);
+    if out.len() < n {
+        bail!("--symbols top{n} refusé : l'univers figé compte {} cryptos", out.len());
+    }
+    eprintln!(
+        "… univers top{n} : {} paires ({} … {})",
+        out.len(),
+        out.first().map_or("", |s| s),
+        out.last().map_or("", |s| s)
+    );
+    Ok(out)
+}
+
 fn check_range(name: &str, value: i64, range: std::ops::RangeInclusive<i64>) -> Result<()> {
     if !range.contains(&value) {
         bail!("{name} {value} refusé : entre {} et {} jours", range.start(), range.end());
@@ -501,10 +585,11 @@ fn check_range(name: &str, value: i64, range: std::ops::RangeInclusive<i64>) -> 
 
 /// Mêmes bornes que l'application, vérifiées AVANT tout téléchargement ou calcul.
 fn check_common(c: &Common) -> Result<Vec<String>> {
+    parse_symbols(&c.symbols)?;
     check_range("--days", c.days, 30..=3650)?;
     check_range("--validation-days", c.validation_days, 365..=3650)?;
     RollingConfig { window_days: c.window, step_days: c.step, tested_strategies: 1, initial_cash: c.cash }.check()?;
-    parse_symbols(&c.symbols)
+    Ok(Vec::new())
 }
 
 fn print_report(r: &BacktestReport) {
@@ -647,6 +732,34 @@ async fn main() -> Result<()> {
                 }
             }
         }
+        Cmd::LiveCreate { data_dir, timeframes, symbols_from, cash } => {
+            let mut store = pt_store::open_app_store(&data_dir)?;
+            let symbols = store.load(symbols_from)?.engine.symbols.clone();
+            let mut existing = std::collections::BTreeSet::new();
+            for id in store.ids()? {
+                let p = store.load(id)?;
+                if p.active {
+                    existing.insert((p.engine.preset.id.clone(), p.engine.symbols.len()));
+                }
+            }
+            let mut created = 0;
+            for p in catalog() {
+                if p.id == "buy_hold" || !timeframes.iter().any(|t| t == p.timeframe.as_str()) {
+                    continue;
+                }
+                if existing.contains(&(p.id.clone(), symbols.len())) {
+                    continue;
+                }
+                let now = pt_data::now_ms();
+                let name = format!("{} — {} cryptos", p.name, symbols.len());
+                let bench = pt_core::find("buy_hold").expect("référence");
+                let engine = pt_core::Engine::new(p, symbols.clone(), cash, CostModel::default(), now);
+                let benchmark = pt_core::Engine::new(bench, symbols.clone(), cash, CostModel::default(), now);
+                store.create(&name, now, &engine, &benchmark)?;
+                created += 1;
+            }
+            println!("portefeuilles créés : {created} ({} symboles chacun)", symbols.len());
+        }
         Cmd::Presets => {
             for p in catalog() {
                 println!("{:<26} {:<4} {:<22} {}", p.id, p.timeframe.as_str(), p.family, p.name);
@@ -654,7 +767,8 @@ async fn main() -> Result<()> {
         }
         Cmd::Backtest { preset, common, json } => {
             let Some(p) = pt_core::find(&preset) else { bail!("stratégie inconnue : {preset} (voir `pt presets`)") };
-            let syms = check_common(&common)?;
+            check_common(&common)?;
+            let syms = resolve_symbols(&common.symbols).await?;
             let (history, ext) = loader.get(&p, &syms, load_from(&common, now, p.timeframe)).await?;
             let period_start = now - common.days * 86_400_000;
             let r = evaluate(&p, &history, &ext, settings(&common, period_start))?;
@@ -665,21 +779,18 @@ async fn main() -> Result<()> {
             }
         }
         Cmd::Compare { common, md } => {
-            let syms = check_common(&common)?;
+            check_common(&common)?;
+            let syms = resolve_symbols(&common.symbols).await?;
             let period_start = now - common.days * 86_400_000;
-            let mut rows = Vec::new();
-            for p in catalog() {
-                let (history, ext) = loader.get(&p, &syms, load_from(&common, now, p.timeframe)).await?;
-                let res = evaluate(&p, &history, &ext, settings(&common, period_start));
-                match res {
-                    Ok(r) => {
-                        eprintln!("  {:<26} {:>8.1} %  {}", p.id, r.metrics.total_return_pct, r.verdict.label());
-                        rows.push(r);
-                    }
-                    Err(e) => eprintln!("  {:<26} ignorée : {e}", p.id),
-                }
+            let presets = catalog();
+            // L'historique est chargé UNE fois par unité de temps, puis partagé (pas de
+            // copie : 100 cryptos en 1h sur 10 ans pèsent des centaines de Mo).
+            for p in &presets {
+                loader.ensure(p, &syms, load_from(&common, now, p.timeframe)).await?;
             }
-            rows.sort_by(by_conviction);
+            let fear_greed = loader.fear_greed.clone().unwrap_or_default();
+            let cfg = settings(&common, period_start);
+            let rows = evaluate_all(&presets, &loader.series, &fear_greed, cfg);
             let text = markdown(&rows, &syms, &common);
             println!("{text}");
             if let Some(path) = md {
@@ -688,7 +799,7 @@ async fn main() -> Result<()> {
             }
         }
         Cmd::Walkforward { symbols: raw, days, window, step, lookback, fee, slippage_bps, cash, md } => {
-            let syms = parse_symbols(&raw)?;
+            let syms = resolve_symbols(&raw).await?;
             check_range("--days", days, 365..=3650)?;
             RollingConfig { window_days: window, step_days: step, tested_strategies: 1, initial_cash: cash }.check()?;
             let lookbacks = parse_lookbacks(&lookback)?;
@@ -736,7 +847,7 @@ async fn main() -> Result<()> {
             if !(100.0..=1e9).contains(&cash) {
                 bail!("le capital doit être entre 100 et 1 milliard");
             }
-            let mut syms = parse_symbols(&raw)?;
+            let mut syms = resolve_symbols(&raw).await?;
             syms.sort();
             let client = BinanceClient::new();
             for s in &syms {
@@ -747,7 +858,7 @@ async fn main() -> Result<()> {
             }
             let dir = app_data_dir(donnees)?;
             std::fs::create_dir_all(&dir)?;
-            let mut store = pt_store::Store::open(dir.join("papertrading2.sqlite"))?;
+            let mut store = pt_store::open_app_store(&dir)?;
             // Les frais réglés dans l'application, sinon ceux par défaut.
             let costs = store
                 .get_setting::<serde_json::Value>("settings")?
@@ -766,7 +877,7 @@ async fn main() -> Result<()> {
             );
         }
         Cmd::Portage { presets, symbols: raw, days, window, step, fee, slippage_bps, cash, md } => {
-            let syms = parse_symbols(&raw)?;
+            let syms = resolve_symbols(&raw).await?;
             check_range("--days", days, 365..=3650)?;
             let start = now - days * DAY_MS;
             let cost = CostModel { fee_rate: fee / 100.0, slippage_bps };
@@ -804,7 +915,7 @@ async fn main() -> Result<()> {
             }
         }
         Cmd::Validate { presets, symbols: raw, days, window, step, tested, fee, slippage_bps, cash, md } => {
-            let syms = parse_symbols(&raw)?;
+            let syms = resolve_symbols(&raw).await?;
             check_range("--days", days, 365..=3650)?;
             let start = now - days * 86_400_000;
             let cfg = RollingConfig {

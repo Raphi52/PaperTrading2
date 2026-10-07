@@ -1,6 +1,6 @@
 [package]
-name = "papertrading2"
-description = "Application de bureau PaperTrading2 (Tauri)"
+name = "papertrading"
+description = "Application de bureau PaperTrading (Tauri)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

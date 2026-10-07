@@ -227,6 +227,31 @@ pub struct CreateRequest {
     pub cash: f64,
 }
 
+/// `TOP100` (seul) : les 100 paires USDT les plus échangées sur Binance (24 h),
+/// sans stablecoins. Toute autre liste est rendue telle quelle.
+async fn resolve_universe(state: &St<'_>, symbols: Vec<String>) -> Res<Vec<String>> {
+    let n = match symbols.as_slice() {
+        [one] => one.strip_prefix("TOP").and_then(|x| x.parse::<usize>().ok()),
+        _ => None,
+    };
+    let Some(n) = n else {
+        if symbols.iter().any(|s| s.starts_with("TOP") && s[3..].parse::<usize>().is_ok()) {
+            return Err("TOP100 se choisit seul : décoche les autres cryptos".into());
+        }
+        return Ok(symbols);
+    };
+    if !(1..=400).contains(&n) {
+        return Err(format!("TOP{n} refusé : entre TOP1 et TOP400"));
+    }
+    let _ = &state.client;
+    let mut out = pt_data::binance::frozen_universe(n);
+    if out.len() < n {
+        return Err(format!("TOP{n} refusé : l'univers figé compte {} cryptos", out.len()));
+    }
+    out.sort();
+    Ok(out)
+}
+
 fn clean_symbols(raw: &[String]) -> Res<Vec<String>> {
     let mut out: Vec<String> = Vec::new();
     for s in raw {
@@ -255,11 +280,11 @@ pub async fn create_portfolio(state: St<'_>, req: CreateRequest) -> Res<i64> {
         return Err("donne un nom au portefeuille (80 caractères au plus)".into());
     }
     let preset = find(&req.preset_id).ok_or_else(|| format!("stratégie inconnue : {}", req.preset_id))?;
-    let symbols = clean_symbols(&req.symbols)?;
+    let symbols = resolve_universe(&state, clean_symbols(&req.symbols)?).await?;
     if !(100.0..=1e9).contains(&req.cash) {
         return Err("le capital doit être entre 100 et 1 milliard".into());
     }
-    for s in &symbols {
+    for s in symbols.iter().take(20) {
         state
             .client
             .recent(s, preset.timeframe, 5)
@@ -384,7 +409,7 @@ async fn evaluate_one(
 #[tauri::command]
 pub async fn run_backtest(state: St<'_>, req: BacktestRequest) -> Res<BacktestReport> {
     let preset = find(&req.preset_id).ok_or_else(|| format!("stratégie inconnue : {}", req.preset_id))?;
-    let symbols = clean_symbols(&req.symbols)?;
+    let symbols = resolve_universe(&state, clean_symbols(&req.symbols)?).await?;
     let mut r = evaluate_one(&state, preset, &symbols, req.days, req.cash, req.validation.as_ref()).await?;
     r.curve = downsample::<CurvePoint>(&r.curve, 1500);
     r.benchmark_curve = downsample::<CurvePoint>(&r.benchmark_curve, 1500);
@@ -428,7 +453,7 @@ struct Progress {
 
 #[tauri::command]
 pub async fn run_comparison(app: AppHandle, state: St<'_>, req: CompareRequest) -> Res<Vec<CompareRow>> {
-    let symbols = clean_symbols(&req.symbols)?;
+    let symbols = resolve_universe(&state, clean_symbols(&req.symbols)?).await?;
     if let Some(v) = &req.validation {
         v.config(req.cash)?; // refuse les paramètres invalides avant 30 calculs
     }
@@ -491,7 +516,7 @@ pub struct AppInfo {
     pub binance_url: String,
 }
 
-/// Lancement au démarrage de Windows : entrée `PaperTrading2` de
+/// Lancement au démarrage de Windows : entrée `PaperTrading` de
 /// `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`, pour l'utilisateur courant.
 #[derive(Debug, Clone, Serialize)]
 pub struct AutostartStatus {
@@ -534,4 +559,26 @@ pub fn app_info(state: St) -> AppInfo {
         data_dir: state.data_dir.display().to_string(),
         binance_url: std::env::var("PT_BINANCE_URL").unwrap_or_else(|_| pt_data::binance::DEFAULT_BASE_URL.to_string()),
     }
+}
+
+/// Prix d'une crypto autour d'un trade : bougies clôturées de `from` à `to` (marge
+/// comprise), pour tracer l'évolution du prix entre l'achat et la vente.
+#[tauri::command]
+pub async fn trade_candles(state: St<'_>, symbol: String, timeframe: String, from: i64, to: i64) -> Res<Vec<[f64; 2]>> {
+    let tf = Timeframe::parse(&timeframe).ok_or_else(|| format!("unité inconnue : {timeframe}"))?;
+    if to < from || !symbol.chars().all(|c| c.is_ascii_alphanumeric()) {
+        return Err("période ou symbole invalide".into());
+    }
+    let margin = ((to - from) / 4).max(tf.millis() * 8);
+    let start = from - margin;
+    let end = to + margin;
+    let candles = state.client.closed_since(&symbol, tf, start).await.map_err(|e| format!("{e:#}"))?;
+    Ok(candles.iter().filter(|c| c.open_time <= end).map(|c| [c.close_time as f64, c.close]).collect())
+}
+
+/// Journal des décisions d'un portefeuille (stratégie seulement) : entrées, sorties,
+/// renforts et signaux écartés, avec leur motif et l'instantané des indicateurs.
+#[tauri::command]
+pub fn portfolio_decisions(state: St, id: i64) -> Res<Vec<pt_core::engine::Decision>> {
+    state.store.lock().expect("base").decisions(id).map_err(|e| format!("{e:#}"))
 }
