@@ -97,6 +97,7 @@ main { padding: 18px 22px 60px; max-width: 1500px; margin: 0 auto; }
 .badge { font-size: 11px; padding: 2px 8px; border-radius: 999px; background: var(--panel-2); color: var(--muted); border: 1px solid var(--line); }
 .badge.gold { color: var(--gold-2); border-color: rgba(212,169,79,.45); }
 .badge.paused { color: var(--red); border-color: #5a2b2b; }
+.badge.syms { border-radius: 8px; line-height: 1.5; }
 .kpis { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; margin: 12px 0; }
 .kpi .v { font-size: 18px; font-weight: 650; }
 .kpi .l { font-size: 11px; color: var(--muted); }
