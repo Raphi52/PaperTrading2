@@ -1,4 +1,4 @@
-# Univers figé de PaperTrading2 — 2026-10-07
+# Univers figé de PaperTrading — 2026-10-07
 # Les 100 paires USDT spot les plus échangées sur Binance (volume 24 h, data-api.binance.vision),
 # hors stablecoins (USDC, FDUSD, U…), or (XAUT), actions tokenisées (MSTRB, NVDAB, QQQB…),
 # jetons à effet de levier et jetons aux noms non latins. Liste RELUE à la main : Binance ne

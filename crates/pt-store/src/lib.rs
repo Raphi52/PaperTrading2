@@ -412,3 +412,53 @@ mod tests {
         assert_eq!(s.get_setting::<CostModel>("costs").unwrap(), Some(CostModel::default()));
     }
 }
+
+/// Nom du fichier de base dans le dossier de l'application.
+pub const DB_FILE: &str = "papertrading.sqlite";
+
+/// Ouvre la base de l'application dans `dir`. Le projet s'appelait
+/// « PaperTrading2 » : si la base n'existe pas encore sous le nouveau nom, on
+/// COPIE (sans rien effacer) l'ancienne, prise dans `dir` ou dans le dossier
+/// voisin `com.raphi52.papertrading2`, avec ses fichiers -wal/-shm.
+pub fn open_app_store(dir: &Path) -> Result<Store> {
+    let target = dir.join(DB_FILE);
+    if !target.exists() {
+        let legacy_dirs = [
+            Some(dir.to_path_buf()),
+            dir.parent().map(|p| p.join("com.raphi52.papertrading2")),
+        ];
+        for d in legacy_dirs.into_iter().flatten() {
+            let old = d.join("papertrading2.sqlite");
+            if old.exists() {
+                for suffix in ["", "-wal", "-shm"] {
+                    let src = d.join(format!("papertrading2.sqlite{suffix}"));
+                    if src.exists() {
+                        std::fs::copy(&src, dir.join(format!("{DB_FILE}{suffix}")))
+                            .with_context(|| format!("reprise de {}", src.display()))?;
+                    }
+                }
+                break;
+            }
+        }
+    }
+    Store::open(target)
+}
+
+#[cfg(test)]
+mod reprise_ancien_nom {
+    use super::*;
+
+    #[test]
+    fn copie_la_base_du_dossier_papertrading2() {
+        let root = std::env::temp_dir().join(format!("pt-reprise-{}", std::process::id()));
+        let old = root.join("com.raphi52.papertrading2");
+        let new = root.join("com.raphi52.papertrading");
+        std::fs::create_dir_all(&old).unwrap();
+        std::fs::create_dir_all(&new).unwrap();
+        drop(Store::open(old.join("papertrading2.sqlite")).unwrap());
+        drop(open_app_store(&new).unwrap());
+        assert!(new.join(DB_FILE).exists());
+        assert!(old.join("papertrading2.sqlite").exists(), "l'ancienne base reste intacte");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}
