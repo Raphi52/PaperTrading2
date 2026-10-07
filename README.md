@@ -36,20 +36,22 @@ C'est la réécriture complète de [PaperTrading](https://github.com/Raphi52/Pap
 
 ## Ce que disent les données (frais compris)
 
-Mesuré le 6 octobre 2026 sur BTC, ETH, SOL, BNB et XRP, pour les 31 stratégies du catalogue (33 essais au registre, portage compris). Frais de 0,1 % par côté et glissement de 0,02 %. Résultats affichés sur les mêmes 3 ans pour toutes les stratégies (« acheter et garder » : +230,9 % en 1j, +231,0 % en 4h, +228,4 % en 1h) ; verdicts décidés par la validation sur fenêtres glissantes de fin 2017 à 2026. Tableau complet : [`docs/comparaison-2026-10-06.md`](docs/comparaison-2026-10-06.md).
+Mesuré le 7 octobre 2026 sur BTC, ETH, SOL, BNB et XRP, pour les **101 stratégies** du catalogue (105 essais au registre, portage compris). Frais de 0,1 % par côté et glissement de 0,02 %. Résultats affichés sur les mêmes 3 ans pour toutes les stratégies (« acheter et garder » : +240,2 % en 1j) ; verdicts décidés par la validation sur fenêtres glissantes de fin 2017 à 2026. Tableau complet : [`docs/comparaison-2026-10-07.md`](docs/comparaison-2026-10-07.md). Le comparateur complet tourne en moins d'une minute.
 
 | Verdict | Nombre | Stratégies |
 |---|---:|---|
 | **Solide** | **0** | — |
-| Prometteuse | 1 | Cassure Keltner 4h : 13 fenêtres indépendantes gagnées sur 17 (2,5 % seule, 81 % une fois comptés les 33 essais) |
-| Indiscernable du hasard | 8 | MACD 1j, Ichimoku 4h, Donchian 20/10 4h, Supertrend 1j, **Momentum 28 jours 1j**, EMA 20/50 4h, **Au-dessus de la SMA 50 1j**, Turtle 55/20 1j |
-| Perdante | 22 | dont **toutes** les stratégies 1h |
+| Prometteuse | 4 | MACD 8/17/9 1j, Cassure Keltner 2,5 ATR 4h, Cassure Keltner 4h, Supertrend 7×2 1j : 13 fenêtres indépendantes gagnées sur 17 ou 18, mais plus significatif une fois comptés les 105 essais |
+| Indiscernable du hasard | 27 | dont MACD 1j, Ichimoku 4h, Donchian 20/10 4h, **Momentum 28 jours 1j**, **Au-dessus de la SMA 50 1j**, Turtle 55/20 1j |
+| Perdante | 70 | dont **les 25** stratégies 1h |
+
+> **Comparer plus de stratégies rend la barre plus haute.** Avec 105 essais, une stratégie doit battre le hasard dans presque toutes ses fenêtres pour que ce ne soit pas une chance attendue sur 105 tirages. C'est voulu : choisir la meilleure parmi 100 sans cette correction, c'est l'erreur qui faisait croire à la v1 qu'elle avait des gagnantes.
 
 - **Aucune stratégie du catalogue ne prouve qu'elle fait mieux qu'un achat au hasard investi la même part du temps.** Ce qu'elles apportent, c'est une pire baisse bien plus faible, parce qu'elles sont peu investies.
 - **MACD 1j et Turtle 55/20**, classées « Solides » par la première version du comparateur, sont **indiscernables du hasard** (détail ci-dessous).
 - **Les frais tuent les stratégies rapides.** Le croisement EMA 9/21 en 1h ferait **+168 % sans frais**, mais il tombe à **−46 % avec frais** (2 757 trades). Les stratégies 1h sont toutes perdantes.
-- **Une seule stratégie bat « acheter et garder » en rendement brut** sur ces 3 ans : **Au-dessus de la SMA 50 (1j)**, qui fait **+352,5 %** contre +230,9 %, avec une pire baisse de **33 %** contre 63 %. Elle est investie à parts égales sur chaque symbole tant que son prix est au-dessus de sa moyenne 50 jours, en liquide sinon (Detzel et al., 2021). Mais sur 2017-2026, elle ne bat un timing au hasard de même exposition que dans 9 fenêtres sur 17 : ce gain peut venir de la période. Elle est suivie en direct pour le vérifier sur des prix qu'elle n'a jamais vus.
-- **Le momentum 28 jours** (Liu & Tsyvinski, 2021), même principe, fait +193,1 % avec une pire baisse de 36 %, et reste lui aussi indiscernable du hasard (10 fenêtres sur 18).
+- **Une seule stratégie bat « acheter et garder » en rendement brut** sur ces 3 ans : **Au-dessus de la SMA 50 (1j)**, qui fait **+362,2 %** contre +240,2 %, avec une pire baisse de **33 %** contre 63 %. Elle est investie à parts égales sur chaque symbole tant que son prix est au-dessus de sa moyenne 50 jours, en liquide sinon (Detzel et al., 2021). Mais sur 2017-2026, elle ne bat un timing au hasard de même exposition que dans 9 fenêtres sur 17 : ce gain peut venir de la période. Elle est suivie en direct pour le vérifier sur des prix qu'elle n'a jamais vus.
+- **Le momentum 28 jours** (Liu & Tsyvinski, 2021), même principe, fait +201,1 % avec une pire baisse de 36 %, et reste lui aussi indiscernable du hasard (10 fenêtres sur 18).
 
 ## Coup de chance ou pas ? Validation sur fenêtres glissantes
 
