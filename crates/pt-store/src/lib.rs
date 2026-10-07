@@ -8,7 +8,7 @@
 //!   incohérent est REFUSÉ au lieu d'être utilisé en silence.
 
 use anyhow::{bail, Context, Result};
-use pt_core::engine::Engine;
+use pt_core::engine::{Decision, Engine};
 use pt_core::portfolio::{ClosedTrade, Fill, Side};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{de::DeserializeOwned, Serialize};
@@ -53,6 +53,23 @@ CREATE TABLE IF NOT EXISTS equity (
     exposure REAL NOT NULL,
     PRIMARY KEY (portfolio_id, time)
 );
+-- Journal des décisions (ajouté sans toucher aux tables existantes) :
+-- entrées, sorties, renforcements et signaux écartés, avec leur motif et un
+-- instantané JSON des indicateurs au moment de la décision.
+CREATE TABLE IF NOT EXISTS decisions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    portfolio_id INTEGER NOT NULL REFERENCES portfolios(id) ON DELETE CASCADE,
+    book TEXT NOT NULL,
+    time INTEGER NOT NULL,
+    symbol TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    price REAL,
+    indicators TEXT NOT NULL,
+    -- rejouer un enregistrement ne duplique rien
+    UNIQUE (portfolio_id, book, time, symbol, kind, reason)
+);
+CREATE INDEX IF NOT EXISTS decisions_by_portfolio ON decisions(portfolio_id, time);
 CREATE TABLE IF NOT EXISTS settings (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
@@ -224,6 +241,16 @@ impl Store {
         Ok(())
     }
 
+    /// `save_progress` puis vide le journal des décisions en mémoire, une fois
+    /// la transaction validée : sans cela il grossirait à chaque passage du mode
+    /// direct et serait réinséré en entier à chaque enregistrement.
+    pub fn save_progress_and_flush(&mut self, p: &mut LivePortfolio) -> Result<()> {
+        self.save_progress(p)?;
+        p.engine.decisions.clear();
+        p.benchmark.decisions.clear();
+        Ok(())
+    }
+
     pub fn set_active(&self, id: i64, active: bool) -> Result<()> {
         let n = self.conn.execute("UPDATE portfolios SET active=?2 WHERE id=?1", params![id, active])?;
         if n == 0 {
@@ -278,6 +305,31 @@ impl Store {
                 )?;
             }
         }
+        for (book, e) in books {
+            for d in &e.decisions {
+                tx.execute(
+                    "INSERT OR IGNORE INTO decisions (portfolio_id, book, time, symbol, kind, reason, price, indicators) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+                    params![
+                        p.id,
+                        book,
+                        d.time,
+                        d.symbol,
+                        d.kind.as_str(),
+                        d.reason,
+                        d.price.is_finite().then_some(d.price),
+                        serde_json::to_string(&d.indicators)?
+                    ],
+                )?;
+            }
+        }
+        // Rétention : les signaux ÉCARTÉS (des centaines par passage sur 100 cryptos)
+        // ne sont gardés que 30 jours ; entrées, sorties et renforts restent pour toujours.
+        if let Some(latest) = books.iter().flat_map(|(_, e)| e.decisions.iter().map(|d| d.time)).max() {
+            tx.execute(
+                "DELETE FROM decisions WHERE portfolio_id=?1 AND kind='SKIPPED' AND time < ?2",
+                params![p.id, latest - 30 * 86_400_000],
+            )?;
+        }
         tx.execute(
             "UPDATE portfolios SET last_error=?2, engine=?3, benchmark=?4 WHERE id=?1",
             params![
@@ -289,6 +341,34 @@ impl Store {
         )?;
         tx.commit()?;
         Ok(())
+    }
+
+    /// Journal des décisions d'un portefeuille (stratégie), du plus ancien au plus récent.
+    pub fn decisions(&self, id: i64) -> Result<Vec<Decision>> {
+        let mut st = self.conn.prepare(
+            "SELECT time, symbol, kind, reason, price, indicators FROM decisions WHERE portfolio_id=?1 AND book=?2 ORDER BY id",
+        )?;
+        let rows = st.query_map(params![id, STRATEGY], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, Option<f64>>(4)?,
+                r.get::<_, String>(5)?,
+            ))
+        })?;
+        rows.map(|r| {
+            let (time, symbol, kind, reason, price, ind) = r?;
+            let kind = match kind.as_str() {
+                "ENTRY" => pt_core::engine::DecisionKind::Entry,
+                "ADD" => pt_core::engine::DecisionKind::Add,
+                "EXIT" => pt_core::engine::DecisionKind::Exit,
+                _ => pt_core::engine::DecisionKind::Skipped,
+            };
+            Ok(Decision { time, symbol, kind, reason, price: price.unwrap_or(f64::NAN), indicators: serde_json::from_str(&ind)? })
+        })
+        .collect()
     }
 
     pub fn push_equity(&self, id: i64, row: EquityRow) -> Result<()> {
@@ -362,6 +442,47 @@ mod tests {
         assert_eq!(back.engine.portfolio.fills.len(), 3);
         s.push_equity(id, EquityRow { time: 5, equity: 10_010.0, benchmark: 9_990.0, exposure: 0.05 }).unwrap();
         assert_eq!(s.equity_curve(id).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn decisions_are_journaled_without_touching_history() {
+        let mut s = Store::in_memory().unwrap();
+        let (mut e, b) = engines();
+        let id = s.create("Test", 1, &e, &b).unwrap();
+        e.portfolio.buy("BTCUSDT", 1_000.0, 50_000.0, 10, &CostModel::default(), "entrée").unwrap();
+        let mut p = s.load(id).unwrap();
+        p.engine = e.clone();
+        s.save(&p).unwrap();
+        let before = serde_json::to_string(&strip(&p.engine)).unwrap();
+        let mut ind = std::collections::BTreeMap::new();
+        ind.insert("rsi14".to_string(), 61.5);
+        let d = |kind, reason: &str| Decision {
+            time: 20,
+            symbol: "BTCUSDT".into(),
+            kind,
+            reason: reason.into(),
+            price: 51_000.0,
+            indicators: ind.clone(),
+        };
+        use pt_core::engine::DecisionKind::*;
+        p.engine.decisions = vec![d(Entry, "SIGNAL D'ENTRÉE"), d(Exit, "SIGNAL DE SORTIE"), d(Skipped, "PLUS DE PLACE")];
+        s.save_progress(&p).unwrap();
+        s.save_progress(&p).unwrap(); // rejouer ne duplique rien
+        let got = s.decisions(id).unwrap();
+        assert_eq!(got, p.engine.decisions);
+        // Le journal vit dans sa table : l'état du moteur n'a pas grossi,
+        // et l'historique (exécutions, contrôles au chargement) est intact.
+        assert_eq!(serde_json::to_string(&strip(&p.engine)).unwrap(), before);
+        let back = s.load(id).unwrap();
+        assert_eq!(back.engine.portfolio.fills.len(), 1);
+        assert!(back.engine.decisions.is_empty());
+        // Le mode direct vide le journal après chaque enregistrement validé.
+        s.save_progress_and_flush(&mut p).unwrap();
+        assert!(p.engine.decisions.is_empty() && p.benchmark.decisions.is_empty());
+        p.engine.decisions = vec![d(Skipped, "SECOND PASSAGE")];
+        s.save_progress_and_flush(&mut p).unwrap();
+        assert!(p.engine.decisions.is_empty());
+        assert_eq!(s.decisions(id).unwrap().len(), 4);
     }
 
     #[test]
