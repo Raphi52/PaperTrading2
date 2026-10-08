@@ -121,7 +121,7 @@ const STABLES: &[&str] = &[
 const TOKENIZED_STOCKS: &[&str] =
     &["SPCXB", "SNDKB", "CRCLB", "MSTRB", "QQQB", "NVDAB", "MUB", "MRVLB", "SNXXB", "GOOGLB", "INTCB", "MRNAB", "BNCB"];
 
-/// Univers figé et relu (`crates/pt-data/univers.txt`) : `TOP100` le désigne partout.
+/// Univers figé et relu (`crates/pt-data/univers.txt`) : `TOP50` le désigne partout.
 pub const UNIVERSE: &str = include_str!("../univers.txt");
 
 /// Les `n` premiers symboles de l'univers figé.
@@ -184,10 +184,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn frozen_universe_has_100_distinct_cryptos() {
+    fn frozen_universe_has_50_distinct_cryptos() {
         let u = frozen_universe(1000);
-        assert_eq!(u.len(), 100);
-        assert_eq!(u.iter().collect::<std::collections::BTreeSet<_>>().len(), 100);
+        assert_eq!(u.len(), 50);
+        assert_eq!(u.iter().collect::<std::collections::BTreeSet<_>>().len(), 50);
         for s in &u {
             let base = s.strip_suffix("USDT").expect("paire USDT");
             assert!(base.is_ascii() && !STABLES.contains(&base) && !TOKENIZED_STOCKS.contains(&base), "{s}");

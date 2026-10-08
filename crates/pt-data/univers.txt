@@ -1,110 +1,70 @@
-# Univers figé de PaperTrading — 2026-10-07
-# Les 100 paires USDT spot les plus échangées sur Binance (volume 24 h, data-api.binance.vision),
-# hors stablecoins (USDC, FDUSD, U…), or (XAUT), actions tokenisées (MSTRB, NVDAB, QQQB…),
-# jetons à effet de levier et jetons aux noms non latins. Liste RELUE à la main : Binance ne
-# distingue pas une action tokenisée d'une crypto. Figée pour que backtests et validations
-# soient reproductibles.
-# BIAIS DU SURVIVANT : ce sont les 100 premières AUJOURD'HUI. Rejouer le passé sur cette liste
+# Univers figé de PaperTrading — 2026-10-08
+# Les 50 cryptos les plus POPULAIRES sur Binance : paires USDT spot classées par la MÉDIANE de
+# leur volume quotidien en USDT sur les 90 derniers jours (bougies 1d, data-api.binance.vision),
+# les jours d'avant la cotation comptant pour zéro. La médiane sur 90 jours retient ce qui est
+# échangé DURABLEMENT : un classement sur 24 h (l'ancienne liste de 100) faisait entrer des pics
+# d'un jour — 29 de ces 100 n'étaient plus dans le top 100 sur 90 jours (RLC, UMA, NMR… à
+# 0,1–0,2 M$/jour). Une crypto cotée depuis moins de 45 jours (HYPE, MARSCOIN) attend le
+# prochain relevé.
+# Exclus d'après les étiquettes que Binance pose lui-même (bapi get-products) : actions
+# tokenisées (bStocks), stablecoins, or (tCommodities) et jetons sous surveillance (Monitoring,
+# exposés à un retrait de la cote) ; plus EUR, WBTC et PAXG.
+# POURQUOI 50 : ces 50 font 92 % du volume des cryptos échangeables en USDT sur Binance ; les 50
+# suivantes n'ajoutent que 4 %, à 1–3 M$/jour, et près de la moitié sont des projets que Binance
+# classe lui-même à haut risque (Seed). Une stratégie ne tient que 10 positions : 50 candidates
+# laissent le choix, et chaque crypto de plus est une requête de plus à chaque passage du mode
+# direct. La 50e échange encore 3,3 M$ par jour (médiane).
+# BIAIS DU SURVIVANT : ce sont les 50 premières AUJOURD'HUI. Rejouer le passé sur cette liste
 # favorise les cryptos qui ont survécu et monté ; un résultat de backtest est donc plus flatteur
 # qu'il ne l'aurait été en temps réel. Chaque symbole n'entre dans une fenêtre qu'une fois coté
 # et préchauffé, et la référence « acheter et garder » utilise le même univers.
 BTCUSDT
 ETHUSDT
 SOLUSDT
-XRPUSDT
 ZECUSDT
-DOGEUSDT
-NEARUSDT
+XRPUSDT
 BNBUSDT
+DOGEUSDT
 SUIUSDT
-ADAUSDT
+NEARUSDT
 UNIUSDT
-AVAXUSDT
-ORCAUSDT
-NMRUSDT
-QNTUSDT
+TRXUSDT
 ENAUSDT
-HYPEUSDT
+ADAUSDT
+PEPEUSDT
+PUMPUSDT
+LINKUSDT
 WLDUSDT
 TAOUSDT
-RLCUSDT
-PUMPUSDT
-TRXUSDT
-ONDOUSDT
-PEPEUSDT
-INJUSDT
-FETUSDT
-TRUMPUSDT
-ACEUSDT
-SANDUSDT
-ZROUSDT
-AAVEUSDT
 LTCUSDT
-LINKUSDT
-PENGUUSDT
-MARSCOINUSDT
+AVAXUSDT
+AAVEUSDT
+TRUMPUSDT
 XLMUSDT
-HBARUSDT
+ONDOUSDT
+FETUSDT
 ARBUSDT
-ASTERUSDT
-MINAUSDT
-API3USDT
-TRBUSDT
-PROMUSDT
-DOTUSDT
-APTUSDT
-RENDERUSDT
-FILUSDT
+XPLUSDT
 BCHUSDT
+GRAMUSDT
+ASTERUSDT
+PENGUUSDT
+FILUSDT
+INJUSDT
+DOTUSDT
+HBARUSDT
 DASHUSDT
-RAYUSDT
-GTCUSDT
-MUBARAKUSDT
 ICPUSDT
-MOVRUSDT
+TUTUSDT
+POLUSDT
+APTUSDT
+ZAMAUSDT
+WLFIUSDT
+ACEUSDT
+ZROUSDT
 VIRTUALUSDT
 ETHFIUSDT
-XPLUSDT
-GRAMUSDT
-TIAUSDT
-TONUSDT
-OPUSDT
-METUSDT
-POLUSDT
-CAKEUSDT
-SEIUSDT
-EDUUSDT
-RADUSDT
-PYTHUSDT
-AEROUSDT
-CHIPUSDT
 SHIBUSDT
-ARUSDT
-MAGICUSDT
-WLFIUSDT
-UMAUSDT
-JTOUSDT
-ZAMAUSDT
-PARTIUSDT
-C98USDT
-SAGAUSDT
-ETCUSDT
-AXSUSDT
-LDOUSDT
-RESOLVUSDT
-JSTUSDT
-ORDIUSDT
-SYNUSDT
-NIGHTUSDT
-PENDLEUSDT
-LPTUSDT
-MIRAUSDT
-NILUSDT
-STRKUSDT
-OGNUSDT
-ZENUSDT
-HEMIUSDT
-SKYUSDT
-NFPUSDT
-STXUSDT
-ALGOUSDT
+DEXEUSDT
+BANKUSDT
+GIGGLEUSDT

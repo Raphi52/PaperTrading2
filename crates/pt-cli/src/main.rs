@@ -551,7 +551,7 @@ fn parse_symbols(raw: &str) -> Result<Vec<String>> {
     Ok(out)
 }
 
-/// `--symbols top100` : les 100 paires USDT les plus échangées sur Binance (24 h).
+/// `--symbols top50` : les 50 cryptos les plus populaires sur Binance (univers figé).
 /// Toute autre valeur est une liste explicite.
 async fn resolve_symbols(raw: &str) -> Result<Vec<String>> {
     let syms = parse_symbols(raw)?;

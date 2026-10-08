@@ -197,7 +197,7 @@ pub fn catalog() -> Vec<Preset> {
     );
     dip.pyramid = Some(Pyramid { step_pct: 6.0, max_layers: 3 });
     v.push(dip);
-    // Chaque stratégie scanne tout l'univers (jusqu'à une centaine de cryptos) mais
+    // Chaque stratégie scanne tout l'univers (jusqu'à 50 cryptos) mais
     // ne tient que 10 positions : les signaux simultanés les plus forts passent
     // d'abord, et une crypto nettement plus forte remplace la plus faible tenue.
     for preset in v.iter_mut().filter(|p| p.id != "buy_hold") {

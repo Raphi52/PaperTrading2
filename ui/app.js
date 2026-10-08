@@ -6,7 +6,7 @@ const TAURI = window.__TAURI__;
 const invoke = (cmd, args) => TAURI.core.invoke(cmd, args);
 const listen = (ev, fn) => TAURI.event.listen(ev, fn);
 
-const COMMON_SYMBOLS = ["TOP100", "BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT", "ADAUSDT", "AVAXUSDT", "DOGEUSDT", "LINKUSDT", "DOTUSDT"];
+const COMMON_SYMBOLS = ["TOP50", "BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT", "ADAUSDT", "AVAXUSDT", "DOGEUSDT", "LINKUSDT", "DOTUSDT"];
 const DEFAULT_SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT"];
 
 const state = { presets: [], settings: null, view: "portfolios", detailId: null, comparing: false };

@@ -227,8 +227,8 @@ pub struct CreateRequest {
     pub cash: f64,
 }
 
-/// `TOP100` (seul) : les 100 paires USDT les plus échangées sur Binance (24 h),
-/// sans stablecoins. Toute autre liste est rendue telle quelle.
+/// `TOP50` (seul) : les 50 cryptos les plus populaires sur Binance (univers figé,
+/// `crates/pt-data/univers.txt`). Toute autre liste est rendue telle quelle.
 async fn resolve_universe(state: &St<'_>, symbols: Vec<String>) -> Res<Vec<String>> {
     let n = match symbols.as_slice() {
         [one] => one.strip_prefix("TOP").and_then(|x| x.parse::<usize>().ok()),
@@ -236,7 +236,7 @@ async fn resolve_universe(state: &St<'_>, symbols: Vec<String>) -> Res<Vec<Strin
     };
     let Some(n) = n else {
         if symbols.iter().any(|s| s.starts_with("TOP") && s[3..].parse::<usize>().is_ok()) {
-            return Err("TOP100 se choisit seul : décoche les autres cryptos".into());
+            return Err("TOP50 se choisit seul : décoche les autres cryptos".into());
         }
         return Ok(symbols);
     };

@@ -53,9 +53,11 @@ Mesuré le 7 octobre 2026 sur BTC, ETH, SOL, BNB et XRP, pour les **101 stratég
 - **Une seule stratégie bat « acheter et garder » en rendement brut** sur ces 3 ans : **Au-dessus de la SMA 50 (1j)**, qui fait **+362,2 %** contre +240,2 %, avec une pire baisse de **33 %** contre 63 %. Elle est investie à parts égales sur chaque symbole tant que son prix est au-dessus de sa moyenne 50 jours, en liquide sinon (Detzel et al., 2021). Mais sur 2017-2026, elle ne bat un timing au hasard de même exposition que dans 9 fenêtres sur 17 : ce gain peut venir de la période. Elle est suivie en direct pour le vérifier sur des prix qu'elle n'a jamais vus.
 - **Le momentum 28 jours** (Liu & Tsyvinski, 2021), même principe, fait +201,1 % avec une pire baisse de 36 %, et reste lui aussi indiscernable du hasard (10 fenêtres sur 18).
 
-## Sur 100 cryptos (`--symbols top100`)
+## Sur les 50 cryptos les plus populaires (`--symbols top50`)
 
-Chaque stratégie peut scanner un **univers de 100 cryptos** (`crates/pt-data/univers.txt`) : les 100 paires USDT spot les plus échangées sur Binance le 7 octobre 2026, relues à la main pour retirer les stablecoins, l'or (XAUT) et les actions tokenisées (MSTRB, NVDAB, QQQB…), que Binance ne distingue d'une crypto par aucun champ. Une stratégie tient **10 positions au plus** : quand plus de cryptos signalent une entrée que de places libres, les signaux les plus forts passent (rendement des 20 dernières bougies rapporté à la volatilité), et une crypto nettement plus forte **remplace** la plus faible tenue (`switch_margin`). Tableau complet : [`docs/comparaison-univers-2026-10-07.md`](docs/comparaison-univers-2026-10-07.md), calculé en 4 minutes sur 16 cœurs.
+Chaque stratégie peut scanner un **univers de 50 cryptos** (`crates/pt-data/univers.txt`) : les plus populaires sur Binance au 8 octobre 2026, classées par la **médiane de leur volume quotidien sur 90 jours** (et non plus sur 24 h, qui faisait entrer des pics d'un jour). Les actions tokenisées, stablecoins, l'or et les jetons sous surveillance sont exclus d'après les étiquettes que Binance pose lui-même. **Pourquoi 50 et pas plus** : ces 50 font 92 % du volume ; les 50 suivantes n'en ajoutent que 4 %, à 1–3 M$/jour, et près de la moitié sont classées « Seed » (haut risque) par Binance. Une stratégie tient **10 positions au plus** : quand plus de cryptos signalent une entrée que de places libres, les signaux les plus forts passent (rendement des 20 dernières bougies rapporté à la volatilité), et une crypto nettement plus forte **remplace** la plus faible tenue (`switch_margin`). Tableau complet : [`docs/comparaison-univers-2026-10-07.md`](docs/comparaison-univers-2026-10-07.md), calculé en 4 minutes sur 16 cœurs.
+
+> Les chiffres ci-dessous datent de l'**ancienne liste de 100 cryptos** (volume 24 h du 7 octobre 2026) ; ils n'ont pas encore été recalculés sur les 50.
 
 | Verdict | Nombre |
 |---|---:|
@@ -65,7 +67,7 @@ Chaque stratégie peut scanner un **univers de 100 cryptos** (`crates/pt-data/un
 | Perdante | 84, dont les 25 stratégies 1h |
 
 - « Acheter et garder » les 100 cryptos ne fait que **+66,6 %** sur 3 ans (pire baisse 78 %). Plusieurs stratégies 1j font mieux en rendement brut (Cassure Keltner 2 ATR +212 %, Turtle 55/20 +196 %), mais **aucune ne prouve que ce n'est pas la chance**.
-- ⚠️ **Biais du survivant** : ce sont les 100 premières *aujourd'hui*. Rejouer le passé sur cette liste favorise les cryptos qui ont survécu et monté ; un backtest y est plus flatteur qu'il ne l'aurait été en temps réel. Seuls les portefeuilles en direct, sur des prix futurs, en sont exempts.
+- ⚠️ **Biais du survivant** : ce sont les premières *aujourd'hui*. Rejouer le passé sur cette liste favorise les cryptos qui ont survécu et monté ; un backtest y est plus flatteur qu'il ne l'aurait été en temps réel. Seuls les portefeuilles en direct, sur des prix futurs, en sont exempts.
 
 ## Coup de chance ou pas ? Validation sur fenêtres glissantes
 
