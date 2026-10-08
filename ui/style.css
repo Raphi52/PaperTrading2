@@ -55,8 +55,21 @@ label { display: block; color: var(--muted); font-size: 12px; }
 
 .top {
   position: sticky; top: 0; z-index: 5; display: flex; align-items: center; gap: 18px;
-  padding: 10px 20px; background: #0f141d; border-bottom: 1px solid var(--line);
+  padding: 10px 0 10px 20px; background: #0f141d; border-bottom: 1px solid var(--line);
+  user-select: none;
 }
+/* Le déplacement ne marche que sur l'élément qui porte `data-tauri-drag-region` :
+   les clics sur le logo et le nom doivent donc tomber sur `.brand`. */
+.brand * { pointer-events: none; }
+/* Boutons de fenêtre, collés au coin haut-droit comme ceux de Windows. */
+.winctl { display: flex; align-self: stretch; margin: -10px 0 -10px 0; }
+.winctl button {
+  width: 46px; padding: 0; border-radius: 0; background: transparent; color: var(--text);
+  display: flex; align-items: center; justify-content: center;
+}
+.winctl button:hover { background: rgba(255, 255, 255, .08); }
+.winctl #win-close:hover { background: #e81123; color: #fff; }
+.winctl svg { width: 10px; height: 10px; fill: none; stroke: currentColor; stroke-width: 1; pointer-events: none; }
 .brand { display: flex; align-items: center; gap: 10px; min-width: 300px; }
 .logo { width: 30px; height: 30px; color: var(--gold); }
 .brand-name { font-weight: 700; font-size: 15px; letter-spacing: .3px; }

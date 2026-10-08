@@ -684,12 +684,32 @@ $("#autostart").addEventListener("change", async (e) => {
   }
 });
 
+// ---------- barre de titre maison ----------
+// Fermer passe par la même demande de fermeture que la croix de Windows : si le
+// mode direct tourne, la fenêtre se range près de l'horloge au lieu de quitter.
+const MAX_ICON = `<svg viewBox="0 0 10 10"><rect x=".5" y=".5" width="9" height="9" /></svg>`;
+const RESTORE_ICON = `<svg viewBox="0 0 10 10"><rect x=".5" y="2.5" width="7" height="7" /><path d="M2.5 2.5V.5h7v7h-2" /></svg>`;
+function setupWindowControls() {
+  const win = TAURI.window.getCurrentWindow();
+  $("#win-min").addEventListener("click", () => win.minimize());
+  $("#win-max").addEventListener("click", () => win.toggleMaximize());
+  $("#win-close").addEventListener("click", () => win.close());
+  const syncMax = async () => {
+    const max = await win.isMaximized();
+    $("#win-max").innerHTML = max ? RESTORE_ICON : MAX_ICON;
+    $("#win-max").title = max ? "Restaurer" : "Agrandir";
+  };
+  win.onResized(syncMax);
+  syncMax();
+}
+
 // ---------- démarrage ----------
 async function boot() {
   if (!TAURI) {
     document.body.innerHTML = `<main><div class="empty">Cette interface doit être ouverte dans l'application PaperTrading.</div></main>`;
     return;
   }
+  setupWindowControls();
   state.presets = await call("catalog");
   state.settings = await call("get_settings");
   presetOptions($("#np-preset"), false);

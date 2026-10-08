@@ -7,8 +7,10 @@
   <link rel="stylesheet" href="style.css">
 </head>
 <body>
-  <header class="top">
-    <div class="brand">
+  <!-- La barre de titre de Windows est retirée (`decorations: false`) : cet en-tête
+       la remplace. On déplace la fenêtre en tirant sur son fond ou sur le logo. -->
+  <header class="top" data-tauri-drag-region>
+    <div class="brand" data-tauri-drag-region>
       <svg viewBox="0 0 32 32" class="logo" aria-hidden="true"><rect x="2" y="2" width="28" height="28" rx="7" fill="none" stroke="currentColor" stroke-width="2.4"/><polyline points="7,21 12,16 16,18 21,11 25,13" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linejoin="round"/></svg>
       <div>
         <div class="brand-name">PaperTrading</div>
@@ -26,6 +28,11 @@
       <span class="dot" id="engine-dot"></span>
       <span id="engine-text">…</span>
       <button class="ghost small" id="engine-toggle">…</button>
+    </div>
+    <div class="winctl" aria-label="Fenêtre">
+      <button id="win-min" title="Réduire" aria-label="Réduire"><svg viewBox="0 0 10 10"><path d="M0 5.5h10" /></svg></button>
+      <button id="win-max" title="Agrandir" aria-label="Agrandir"><svg viewBox="0 0 10 10"><rect x=".5" y=".5" width="9" height="9" /></svg></button>
+      <button id="win-close" title="Fermer" aria-label="Fermer"><svg viewBox="0 0 10 10"><path d="M0 0l10 10M10 0L0 10" /></svg></button>
     </div>
   </header>
 
