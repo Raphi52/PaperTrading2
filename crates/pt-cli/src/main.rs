@@ -1,9 +1,9 @@
-//! `pt` : backtests en ligne de commande, sur les vraies bougies Binance.
+//! `pt` : backtests en ligne de commande, sur les vraies bougies de Bitvavo en euros.
 //!
 //! Exemples :
 //!   pt presets
-//!   pt backtest --preset supertrend_10_3_4h --symbols BTCUSDT,ETHUSDT --days 1095
-//!   pt compare --symbols BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT,XRPUSDT --days 1095 --md rapport.md
+//!   pt backtest --preset supertrend_10_3_4h --symbols BTCEUR,ETHEUR --days 1095
+//!   pt compare --symbols BTCEUR,ETHEUR,SOLEUR,XRPEUR,ADAEUR --days 1095 --md rapport.md
 //!   pt validate --preset macd_1d --preset donchian_55_20_1d --days 3650 --md validation.md
 //!   pt walkforward --lookback 2 --md docs/walkforward.md
 //!   pt essais
@@ -11,12 +11,12 @@
 use anyhow::{bail, Result};
 use clap::{Parser, Subcommand};
 use pt_core::backtest::{evaluate, history_start, BacktestReport, EvalSettings};
-use pt_core::carry::{carry_catalog, carry_fingerprint, carry_validation, find_carry, CarryPreset, CarryReport};
 use pt_core::essais;
 use pt_core::validation::{rolling_validation, tested_strategies, Outcome, RollingConfig, RollingReport};
 use pt_core::walkforward::{score_candidates, walk_forward, Candidate, WalkForwardReport};
 use pt_core::{catalog, CostModel, External, Preset, Timeframe};
-use pt_data::{fetch_fear_greed, BinanceClient, FundingCache, FundingClient, HistoryCache};
+use pt_data::universe::{check_tradable, frozen_universe, normalize_symbol, top_alias};
+use pt_data::{fetch_fear_greed, BitvavoClient, HistoryCache};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
@@ -34,8 +34,8 @@ struct Cli {
 
 #[derive(clap::Args, Clone)]
 struct Common {
-    /// Symboles Binance spot, séparés par des virgules.
-    #[arg(long, default_value = "BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT,XRPUSDT")]
+    /// Paires en euros de Bitvavo (ex. BTCEUR), séparées par des virgules ; ou `top50`.
+    #[arg(long, default_value = "BTCEUR,ETHEUR,SOLEUR,XRPEUR,ADAEUR")]
     symbols: String,
     /// Profondeur d'historique, en jours.
     #[arg(long, default_value_t = 1095)]
@@ -44,7 +44,7 @@ struct Common {
     #[arg(long, default_value_t = 0.3)]
     oos: f64,
     /// Frais par côté, en pourcentage.
-    #[arg(long, default_value_t = 0.1)]
+    #[arg(long, default_value_t = 0.25)]
     fee: f64,
     /// Glissement par côté, en points de base.
     #[arg(long, default_value_t = 2.0)]
@@ -133,7 +133,7 @@ enum Cmd {
     /// Sélection glissante : pour chaque fenêtre, joue la stratégie qui a le mieux
     /// battu le hasard sur les fenêtres déjà terminées, puis juge ce procédé.
     Walkforward {
-        #[arg(long, default_value = "BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT,XRPUSDT")]
+        #[arg(long, default_value = "BTCEUR,ETHEUR,SOLEUR,XRPEUR,ADAEUR")]
         symbols: String,
         /// Profondeur d'historique, en jours.
         #[arg(long, default_value_t = 3650)]
@@ -147,7 +147,7 @@ enum Cmd {
         /// Fenêtres terminées regardées pour choisir (plusieurs valeurs : 1,2,4 ; chacune est un essai).
         #[arg(long, value_delimiter = ',', default_value = "2")]
         lookback: Vec<usize>,
-        #[arg(long, default_value_t = 0.1)]
+        #[arg(long, default_value_t = 0.25)]
         fee: f64,
         #[arg(long, default_value_t = 2.0)]
         slippage_bps: f64,
@@ -162,7 +162,7 @@ enum Cmd {
     Suivre {
         #[arg(long)]
         preset: String,
-        #[arg(long, default_value = "BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT,XRPUSDT")]
+        #[arg(long, default_value = "BTCEUR,ETHEUR,SOLEUR,XRPEUR,ADAEUR")]
         symbols: String,
         #[arg(long, default_value_t = 10_000.0)]
         cash: f64,
@@ -174,36 +174,12 @@ enum Cmd {
         #[arg(long)]
         donnees: Option<PathBuf>,
     },
-    /// Portage du financement des perpétuels : validation sur fenêtres glissantes.
-    Portage {
-        /// Variante (option répétable) ; par défaut, toutes.
-        #[arg(long = "preset")]
-        presets: Vec<String>,
-        #[arg(long, default_value = "BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT,XRPUSDT")]
-        symbols: String,
-        /// Profondeur d'historique, en jours (le financement Binance commence en septembre 2019).
-        #[arg(long, default_value_t = 3650)]
-        days: i64,
-        #[arg(long, default_value_t = 180)]
-        window: i64,
-        #[arg(long, default_value_t = 90)]
-        step: i64,
-        /// Frais du comptant par côté, en %.
-        #[arg(long, default_value_t = 0.1)]
-        fee: f64,
-        #[arg(long, default_value_t = 2.0)]
-        slippage_bps: f64,
-        #[arg(long, default_value_t = 10_000.0)]
-        cash: f64,
-        #[arg(long)]
-        md: Option<PathBuf>,
-    },
     /// Est-ce un coup de chance ? Rejoue des stratégies sur des fenêtres glissantes.
     Validate {
         /// Stratégie à valider (option répétable).
         #[arg(long = "preset", required = true)]
         presets: Vec<String>,
-        #[arg(long, default_value = "BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT,XRPUSDT")]
+        #[arg(long, default_value = "BTCEUR,ETHEUR,SOLEUR,XRPEUR,ADAEUR")]
         symbols: String,
         /// Profondeur d'historique, en jours (les symboles cotés plus tard entrent dès qu'ils sont prêts).
         #[arg(long, default_value_t = 3650)]
@@ -217,7 +193,7 @@ enum Cmd {
         /// Nombre de stratégies essayées avant de retenir celles-ci (par défaut, et au minimum : le registre des essais).
         #[arg(long)]
         tested: Option<usize>,
-        #[arg(long, default_value_t = 0.1)]
+        #[arg(long, default_value_t = 0.25)]
         fee: f64,
         #[arg(long, default_value_t = 2.0)]
         slippage_bps: f64,
@@ -419,45 +395,6 @@ fn app_data_dir(asked: Option<PathBuf>) -> Result<PathBuf> {
     Ok(PathBuf::from(base).join("com.raphi52.papertrading"))
 }
 
-fn carry_markdown(r: &CarryReport) -> String {
-    let t = &r.sign_test;
-    let mut s = format!("## {}\n\n**{}** — {}\n\n", r.preset_name, r.verdict.label(), r.verdict_reason);
-    s.push_str(&format!(
-        "- {} fenêtres de {} jours, décalées de {} jours ; le test garde une fenêtre sur {} pour qu'elles ne se chevauchent pas (découpage le moins favorable retenu) : {} gagnée(s), {} perdue(s), {} nulle(s).\n",
-        r.windows.len(), r.window_days, r.step_days, r.stride, t.wins, t.losses, t.ties
-    ));
-    s.push_str(&format!(
-        "- Une fenêtre est gagnée si elle finit en gain : le portage n'est pas exposé au prix, sa référence à exposition égale vaut 0 %.\n- Probabilité à pile ou face : {:.6} ; corrigée pour {} stratégies essayées : {:.6}.\n",
-        t.p_value, r.tested_strategies, r.p_adjusted
-    ));
-    s.push_str(&format!(
-        "- Rendement médian par fenêtre : {:+.2} % · pire fenêtre : {:+.2} % · fenêtres indépendantes mises bout à bout : {:+.1} % par an.\n\n",
-        r.median_return_pct, r.worst_return_pct, r.annualized_pct
-    ));
-    s.push_str("| Début | Fin | Symboles | Rendement | dont financement | Frais | Pire baisse | Acheter-garder | Pire baisse réf. | Couvert | Opérations | Liquidations | Résultat |\n");
-    s.push_str("|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|\n");
-    for w in &r.windows {
-        s.push_str(&format!(
-            "| {} | {} | {} | {:+.2} % | {:+.2} % | {:.2} % | {:.2} % | {:+.1} % | {:.1} % | {:.0} % | {} | {} | {} |\n",
-            date(w.start),
-            date(w.end - 1),
-            w.symbols.len(),
-            w.return_pct,
-            w.funding_pct,
-            w.fees_pct,
-            w.max_drawdown_pct,
-            w.benchmark_return_pct,
-            w.benchmark_max_drawdown_pct,
-            w.hedged_pct,
-            w.trades,
-            w.liquidations,
-            outcome_label(w.outcome)
-        ));
-    }
-    s.push('\n');
-    s
-}
-
 fn outcome_label(o: Outcome) -> &'static str {
     match o {
         Outcome::Win => "gagnée",
@@ -537,42 +474,53 @@ fn costs(c: &Common) -> CostModel {
     CostModel { fee_rate: c.fee / 100.0, slippage_bps: c.slippage_bps }
 }
 
-/// Symboles : en majuscules, sans doublon, jamais vide.
+/// Symboles : forme contrôlée par `normalize_symbol` (paires en EUR), sans doublon, jamais vide.
 fn parse_symbols(raw: &str) -> Result<Vec<String>> {
     let mut out: Vec<String> = Vec::new();
-    for s in raw.split(',').map(|s| s.trim().to_uppercase()).filter(|s| !s.is_empty()) {
+    for s in raw.split(',') {
+        let Some(s) = normalize_symbol(s).map_err(anyhow::Error::msg)? else { continue };
         if !out.contains(&s) {
             out.push(s);
         }
     }
     if out.is_empty() {
-        bail!("aucun symbole : --symbols attend une liste comme BTCUSDT,ETHUSDT");
+        bail!("aucun symbole : --symbols attend une liste comme BTCEUR,ETHEUR");
     }
     Ok(out)
 }
 
-/// `--symbols top50` : les 50 cryptos les plus populaires sur Binance (univers figé).
+/// `--symbols top50` : les 50 cryptos les plus échangées en euros sur Bitvavo (univers figé).
 /// Toute autre valeur est une liste explicite.
-async fn resolve_symbols(raw: &str) -> Result<Vec<String>> {
-    let syms = parse_symbols(raw)?;
+fn resolve_alias(syms: Vec<String>) -> Result<Vec<String>> {
     let n = match syms.as_slice() {
-        [one] => one.strip_prefix("TOP").and_then(|x| x.parse::<usize>().ok()),
+        [one] => top_alias(one),
         _ => None,
     };
-    let Some(n) = n else { return Ok(syms) };
+    let Some(n) = n else {
+        if syms.iter().any(|s| top_alias(s).is_some()) {
+            bail!("--symbols topN se choisit seul, sans autre symbole");
+        }
+        return Ok(syms);
+    };
     if !(1..=400).contains(&n) {
         bail!("--symbols top{n} refusé : entre top1 et top400");
     }
-    let out = pt_data::binance::frozen_universe(n);
+    let out = frozen_universe(n);
     if out.len() < n {
         bail!("--symbols top{n} refusé : l'univers figé compte {} cryptos", out.len());
     }
-    eprintln!(
-        "… univers top{n} : {} paires ({} … {})",
-        out.len(),
-        out.first().map_or("", |s| s),
-        out.last().map_or("", |s| s)
-    );
+    Ok(out)
+}
+
+/// Symboles d'une commande : alias résolu, puis chaque paire contrôlée contre la liste
+/// des marchés Bitvavo du moment (absente ou suspendue : refusée avant tout calcul).
+async fn resolve_symbols(raw: &str) -> Result<Vec<String>> {
+    let out = resolve_alias(parse_symbols(raw)?)?;
+    let markets = BitvavoClient::new().eur_markets().await?;
+    check_tradable(&out, &markets).map_err(anyhow::Error::msg)?;
+    if out.len() > 1 && top_alias(&raw.trim().to_uppercase()).is_some() {
+        eprintln!("… univers {} : {} paires ({} … {})", raw.trim(), out.len(), out[0], out[out.len() - 1]);
+    }
     Ok(out)
 }
 
@@ -701,7 +649,7 @@ fn markdown(rows: &[BacktestReport], syms: &[String], c: &Common) -> String {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
     let mut loader = Loader {
-        cache: HistoryCache::new(&cli.cache, BinanceClient::new()),
+        cache: HistoryCache::new(&cli.cache, BitvavoClient::new()),
         fear_greed: None,
         series: BTreeMap::new(),
     };
@@ -712,17 +660,6 @@ async fn main() -> Result<()> {
             let missing = essais::unregistered_strategies(&reg, &catalog(), &date(now));
             println!("Stratégies à compter dans la correction : {} (registre ∪ catalogue).", tested_strategies());
             println!("Variantes de sélection inscrites : {}.", essais::selection_trials_in(&reg, &[]));
-            let carry_missing: Vec<String> = carry_catalog()
-                .iter()
-                .filter(|p| !reg.iter().any(|t| t.id == p.id && t.fingerprint == carry_fingerprint(p)))
-                .map(|p| format!("{}\tstrategie\t{}\t{}", date(now), p.id, carry_fingerprint(p)))
-                .collect();
-            if !carry_missing.is_empty() {
-                println!("Variantes de portage absentes de {} : ajoute ces lignes.", essais::REGISTRY_PATH);
-                for l in &carry_missing {
-                    println!("{l}");
-                }
-            }
             if missing.is_empty() {
                 println!("Toutes les stratégies du catalogue sont inscrites dans {}.", essais::REGISTRY_PATH);
             } else {
@@ -845,16 +782,16 @@ async fn main() -> Result<()> {
                 bail!("donne un nom au portefeuille (80 caractères au plus)");
             }
             if !(100.0..=1e9).contains(&cash) {
-                bail!("le capital doit être entre 100 et 1 milliard");
+                bail!("le capital doit être entre 100 € et 1 milliard d'euros");
             }
             let mut syms = resolve_symbols(&raw).await?;
             syms.sort();
-            let client = BinanceClient::new();
+            let client = BitvavoClient::new();
             for s in &syms {
                 client
                     .recent(s, p.timeframe, 5)
                     .await
-                    .map_err(|e| anyhow::anyhow!("{s} introuvable sur Binance spot : {e:#}"))?;
+                    .map_err(|e| anyhow::anyhow!("{s} : prix indisponibles sur Bitvavo : {e:#}"))?;
             }
             let dir = app_data_dir(donnees)?;
             std::fs::create_dir_all(&dir)?;
@@ -870,49 +807,11 @@ async fn main() -> Result<()> {
             let benchmark = pt_core::Engine::new(bh, syms.clone(), cash, costs, created);
             let id = store.create(name, created, &engine, &benchmark)?;
             println!(
-                "portefeuille n° {id} « {name} » créé dans {} : {} sur {}, {cash:.0} $. L'application le fait avancer à son prochain passage.",
+                "portefeuille n° {id} « {name} » créé dans {} : {} sur {}, {cash:.0} €. L'application le fait avancer à son prochain passage.",
                 dir.display(),
                 p.name,
                 syms.join(", ")
             );
-        }
-        Cmd::Portage { presets, symbols: raw, days, window, step, fee, slippage_bps, cash, md } => {
-            let syms = resolve_symbols(&raw).await?;
-            check_range("--days", days, 365..=3650)?;
-            let start = now - days * DAY_MS;
-            let cost = CostModel { fee_rate: fee / 100.0, slippage_bps };
-            let chosen: Vec<CarryPreset> = if presets.is_empty() {
-                carry_catalog()
-            } else {
-                presets
-                    .iter()
-                    .map(|id| find_carry(id).ok_or_else(|| anyhow::anyhow!("variante de portage inconnue : {id}")))
-                    .collect::<Result<_>>()?
-            };
-            let funding_cache = FundingCache::new(&cli.cache, FundingClient::new());
-            let mut prices = BTreeMap::new();
-            let mut funding = BTreeMap::new();
-            for s in &syms {
-                eprintln!("… {s} : bougies 1h et taux de financement");
-                prices.insert(s.clone(), loader.cache.history(s, Timeframe::H1, start).await?);
-                funding.insert(s.clone(), funding_cache.history(s, start).await?);
-            }
-            let tested = tested_strategies();
-            let mut text = format!(
-                "# Portage du financement des perpétuels — {}\n\nAchat au comptant et vente du perpétuel en même quantité : le prix s'annule, le financement versé toutes les 8 h reste. La moitié de chaque poche sert de marge (levier 1×). Frais : comptant {fee:.2} % par côté, perpétuel {:.3} % par côté (preneur), glissement {slippage_bps} pb par jambe. L'écart de prix entre perpétuel et comptant n'est pas modélisé, et la trésorerie ne rapporte rien.\n\n",
-                syms.join(", "),
-                chosen.first().map_or(0.05, |p| p.perp_fee_rate * 100.0)
-            );
-            for p in &chosen {
-                let r = carry_validation(p, &prices, &funding, cost, cash, window, step, tested)?;
-                eprintln!("  {:<20} {} — {}", p.id, r.verdict.label(), r.verdict_reason);
-                text.push_str(&carry_markdown(&r));
-            }
-            println!("{text}");
-            if let Some(path) = md {
-                std::fs::write(&path, &text)?;
-                eprintln!("rapport écrit : {}", path.display());
-            }
         }
         Cmd::Validate { presets, symbols: raw, days, window, step, tested, fee, slippage_bps, cash, md } => {
             let syms = resolve_symbols(&raw).await?;
@@ -971,12 +870,28 @@ mod tests {
     fn empty_symbol_list_is_refused() {
         assert!(parse_symbols("").is_err());
         assert!(parse_symbols(" , ,,").is_err());
-        assert_eq!(parse_symbols("btcusdt").unwrap(), vec!["BTCUSDT"]);
+        assert_eq!(parse_symbols("btceur").unwrap(), vec!["BTCEUR"]);
+        assert!(parse_symbols("").unwrap_err().to_string().contains("BTCEUR,ETHEUR"));
     }
 
     #[test]
     fn repeated_symbols_count_once() {
-        assert_eq!(parse_symbols("BTCUSDT, btcusdt,ETHUSDT,BTCUSDT").unwrap(), vec!["BTCUSDT", "ETHUSDT"]);
+        assert_eq!(parse_symbols("BTCEUR, btceur,ETH-EUR,BTCEUR").unwrap(), vec!["BTCEUR", "ETHEUR"]);
+    }
+
+    /// Mêmes refus que l'application : paires hors EUR, caractères interdits, alias hors bornes.
+    #[test]
+    fn only_eur_pairs_are_accepted() {
+        for old in ["BTCUSDT", "OGN-USDT", "BTC"] {
+            assert!(parse_symbols(old).unwrap_err().to_string().contains("seules les paires en EUR"), "{old}");
+        }
+        assert!(parse_symbols("BTC/EUR!").unwrap_err().to_string().starts_with("symbole invalide"));
+        let n = pt_data::universe::universe_size();
+        assert_eq!(resolve_alias(parse_symbols(&format!("top{n}")).unwrap()).unwrap().len(), n);
+        for bad in ["top0".to_string(), "top401".to_string(), format!("top{}", n + 1)] {
+            assert!(resolve_alias(parse_symbols(&bad).unwrap()).is_err(), "{bad}");
+        }
+        assert!(resolve_alias(parse_symbols("top10,BTCEUR").unwrap()).is_err());
     }
 
     #[test]

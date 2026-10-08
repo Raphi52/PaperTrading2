@@ -445,7 +445,7 @@ mod tests {
     use crate::testutil::synthetic;
 
     fn series(n: usize, seeds: &[u64]) -> BTreeMap<String, Vec<Candle>> {
-        seeds.iter().map(|s| (format!("S{s}USDT"), synthetic(n, *s))).collect()
+        seeds.iter().map(|s| (format!("S{s}EUR"), synthetic(n, *s))).collect()
     }
 
     #[test]
@@ -607,7 +607,7 @@ mod tests {
                         c
                     })
                     .collect();
-                (format!("S{s}USDT"), c)
+                (format!("S{s}EUR"), c)
             })
             .collect();
         let period_start = 700 * day;
@@ -652,7 +652,7 @@ mod tests {
                         c
                     })
                     .collect();
-                (format!("S{s}USDT"), c)
+                (format!("S{s}EUR"), c)
             })
             .collect()
     }

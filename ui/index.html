@@ -42,7 +42,7 @@
       <div class="section-head">
         <div>
           <h1>Portefeuilles en direct</h1>
-          <p class="muted">Chaque portefeuille suit une stratégie sur les prix réels de Binance, avec de l'argent fictif. Une référence « acheter et garder » démarre en même temps, avec le même capital et les mêmes frais.</p>
+          <p class="muted">Chaque portefeuille suit une stratégie sur les prix réels de Bitvavo, en paires euros qu'on peut vraiment acheter depuis la France, avec de l'argent fictif. Une référence « acheter et garder » démarre en même temps, avec le même capital et les mêmes frais.</p>
         </div>
         <button id="new-portfolio-btn">Nouveau portefeuille</button>
       </div>
@@ -50,7 +50,7 @@
         <div class="grid-4">
           <label>Nom<input name="name" required maxlength="80" placeholder="Ex. Supertrend majeures"></label>
           <label>Stratégie<select name="preset" id="np-preset"></select></label>
-          <label>Capital fictif (USDT)<input name="cash" type="number" min="100" step="100" value="10000"></label>
+          <label>Capital fictif (EUR)<input name="cash" type="number" min="100" step="100" value="10000"></label>
           <div class="form-actions"><button type="submit">Créer</button><button type="button" class="ghost" id="np-cancel">Annuler</button></div>
         </div>
         <div class="label">Symboles</div>
@@ -78,7 +78,7 @@
         <div class="grid-4">
           <label>Stratégie<select name="preset" id="bt-preset"></select></label>
           <label>Période (jours)<input name="days" type="number" min="30" max="3650" value="1095"></label>
-          <label>Capital (USDT)<input name="cash" type="number" min="100" step="100" value="10000"></label>
+          <label>Capital (EUR)<input name="cash" type="number" min="100" step="100" value="10000"></label>
           <div class="form-actions"><button type="submit" id="bt-run">Lancer</button></div>
         </div>
         <div class="label">Symboles</div>
@@ -109,7 +109,7 @@
       <form id="cmp-form" class="panel">
         <div class="grid-4">
           <label>Période affichée (jours)<input name="days" type="number" min="90" max="3650" value="1095"></label>
-          <label>Capital (USDT)<input name="cash" type="number" min="100" step="100" value="10000"></label>
+          <label>Capital (EUR)<input name="cash" type="number" min="100" step="100" value="10000"></label>
           <div></div>
           <div class="form-actions"><button type="submit" id="cmp-run">Tout comparer</button></div>
           <label>Historique de validation (jours)<input name="vdays" type="number" min="365" max="3650" value="3650"></label>
@@ -142,11 +142,11 @@
         <div class="grid-4">
           <label>Frais par côté (%)<input name="fee" type="number" step="0.001" min="0" max="5"></label>
           <label>Glissement par côté (points de base)<input name="slip" type="number" step="0.5" min="0" max="500"></label>
-          <label>Capital par défaut (USDT)<input name="cash" type="number" step="100" min="100"></label>
+          <label>Capital par défaut (EUR)<input name="cash" type="number" step="100" min="100"></label>
           <label>Part hors échantillon (%)<input name="oos" type="number" step="5" min="10" max="90"></label>
           <label>Intervalle du mode direct (s)<input name="tick" type="number" step="5" min="10" max="3600"></label>
         </div>
-        <p class="muted small">Les frais s'appliquent aux nouveaux portefeuilles et aux backtests. Binance spot facture 0,1 % par côté au tarif standard. Un aller-retour coûte donc environ <span id="rt-cost"></span>.</p>
+        <p class="muted small">Les frais s'appliquent aux nouveaux portefeuilles et aux backtests. Bitvavo facture 0,25 % par côté pour un ordre exécuté immédiatement, sous 100 000 € échangés sur 30 jours. Un aller-retour coûte donc environ <span id="rt-cost"></span>.</p>
         <div class="form-actions"><button type="submit">Enregistrer</button></div>
       </form>
       <div class="panel">
@@ -158,7 +158,7 @@
       <div class="panel">
         <h2>Données</h2>
         <p class="muted small" id="app-info"></p>
-        <p class="muted small">Aucune clé d'API n'est nécessaire : l'application ne lit que des données publiques (bougies Binance, indice Fear &amp; Greed d'alternative.me). Elle n'envoie aucun ordre réel.</p>
+        <p class="muted small">Aucune clé d'API n'est nécessaire : l'application ne lit que des données publiques (bougies Bitvavo, indice Fear &amp; Greed d'alternative.me). Elle n'envoie aucun ordre réel.</p>
       </div>
     </section>
   </main>

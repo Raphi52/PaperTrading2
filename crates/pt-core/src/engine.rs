@@ -34,8 +34,9 @@ pub struct Tick {
     pub close_time: i64,
 }
 
-/// Montant minimal d'un ordre (ordre de grandeur du minimum Binance spot).
-pub const MIN_NOTIONAL: f64 = 10.0;
+/// Montant minimal d'un ordre, en euros : `minOrderInQuoteAsset` de Bitvavo, identique
+/// (5,00 €) pour les 426 paires EUR ouvertes au négoce le 2026-10-08 (`/v2/markets`).
+pub const MIN_NOTIONAL: f64 = 5.0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PendingKind {

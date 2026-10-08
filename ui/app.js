@@ -6,8 +6,9 @@ const TAURI = window.__TAURI__;
 const invoke = (cmd, args) => TAURI.core.invoke(cmd, args);
 const listen = (ev, fn) => TAURI.event.listen(ev, fn);
 
-const COMMON_SYMBOLS = ["TOP50", "BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT", "ADAUSDT", "AVAXUSDT", "DOGEUSDT", "LINKUSDT", "DOTUSDT"];
-const DEFAULT_SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT"];
+// Paires en euros achetables sur Bitvavo (voir crates/pt-data/univers.txt).
+const COMMON_SYMBOLS = ["TOP50", "BTCEUR", "ETHEUR", "XRPEUR", "SOLEUR", "ADAEUR", "SUIEUR", "LINKEUR", "DOGEEUR", "AVAXEUR", "DOTEUR"];
+const DEFAULT_SYMBOLS = ["BTCEUR", "ETHEUR", "SOLEUR", "XRPEUR", "ADAEUR"];
 
 const state = { presets: [], settings: null, view: "portfolios", detailId: null, comparing: false };
 
@@ -15,7 +16,7 @@ const state = { presets: [], settings: null, view: "portfolios", detailId: null,
 const $ = (sel, root = document) => root.querySelector(sel);
 const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 const nf = (d) => new Intl.NumberFormat("fr-FR", { minimumFractionDigits: d, maximumFractionDigits: d });
-const money = (v) => (v == null || !isFinite(v) ? "—" : nf(2).format(v) + " $");
+const money = (v) => (v == null || !isFinite(v) ? "—" : nf(2).format(v) + " €");
 const num = (v, d = 2) => (v == null || !isFinite(v) ? "—" : nf(d).format(v));
 const pct = (v, d = 1) => (v == null || !isFinite(v) ? "—" : (v > 0 ? "+" : "") + nf(d).format(v) + " %");
 const cls = (v) => (v > 0 ? "pos" : v < 0 ? "neg" : "");
@@ -82,8 +83,8 @@ function symbolPicker(el, initial) {
   const extra = new Set(initial.filter((s) => !COMMON_SYMBOLS.includes(s)));
   function render() {
     const all = [...COMMON_SYMBOLS, ...extra];
-    el.innerHTML = all.map((s) => `<span class="chip ${chosen.has(s) ? "on" : ""}" data-s="${esc(s)}">${esc(s.replace(/USDT$/, ""))}</span>`).join("")
-      + `<input placeholder="Autre : ex. NEARUSDT" maxlength="20">`;
+    el.innerHTML = all.map((s) => `<span class="chip ${chosen.has(s) ? "on" : ""}" data-s="${esc(s)}">${esc(s.replace(/EUR$/, ""))}</span>`).join("")
+      + `<input placeholder="Autre : ex. NEAR ou NEAREUR" maxlength="20">`;
   }
   el.addEventListener("click", (e) => {
     const s = e.target.dataset?.s;
@@ -94,9 +95,11 @@ function symbolPicker(el, initial) {
   el.addEventListener("keydown", (e) => {
     if (e.target.tagName !== "INPUT" || e.key !== "Enter") return;
     e.preventDefault();
-    let s = e.target.value.trim().toUpperCase();
+    let s = e.target.value.trim().toUpperCase().replace(/-/g, "");
     if (!s) return;
-    if (!/USDT$|USDC$|BTC$|EUR$|^TOP\d+$/.test(s)) s += "USDT";
+    // Seules les paires en euros s'achètent : « NEAR » devient « NEAREUR ». Une crypto que
+    // Bitvavo ne cote pas en euros est refusée, avec son motif, à la validation.
+    if (!/EUR$|^TOP\d+$/.test(s)) s += "EUR";
     extra.add(s);
     chosen.add(s);
     render();
@@ -723,7 +726,7 @@ async function boot() {
   renderSettings();
   call("get_autostart").then(renderAutostart).catch(() => ($("#autostart").disabled = true));
   const info = await call("app_info");
-  $("#app-info").innerHTML = `Version ${esc(info.version)} · données dans <span class="mono">${esc(info.data_dir)}</span> · bougies : <span class="mono">${esc(info.binance_url)}</span>`;
+  $("#app-info").innerHTML = `Version ${esc(info.version)} · données dans <span class="mono">${esc(info.data_dir)}</span> · bougies : <span class="mono">${esc(info.market_url)}</span>`;
   renderEngine(await call("engine_status"));
   await listen("engine-status", (e) => renderEngine(e.payload));
   await listen("portfolios-changed", () => {

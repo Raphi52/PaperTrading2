@@ -1,7 +1,7 @@
 //! État partagé de l'application.
 
 use pt_core::CostModel;
-use pt_data::BinanceClient;
+use pt_data::BitvavoClient;
 use pt_store::Store;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -64,7 +64,7 @@ type FearGreedCache = Option<(i64, Vec<(i64, f64)>)>;
 pub struct AppState {
     pub store: Mutex<Store>,
     pub status: Mutex<EngineStatus>,
-    pub client: BinanceClient,
+    pub client: BitvavoClient,
     pub cache_dir: PathBuf,
     pub data_dir: PathBuf,
     pub fear_greed: Mutex<FearGreedCache>,
@@ -79,7 +79,7 @@ impl AppState {
         AppState {
             store: Mutex::new(store),
             status: Mutex::new(EngineStatus { running, ..EngineStatus::default() }),
-            client: BinanceClient::new(),
+            client: BitvavoClient::new(),
             cache_dir: data_dir.join("cache"),
             data_dir,
             fear_greed: Mutex::new(None),

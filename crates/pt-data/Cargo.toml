@@ -1,6 +1,6 @@
 [package]
 name = "pt-data"
-description = "Données de marché publiques : bougies Binance (clôturées uniquement) et indice Fear & Greed, avec cache disque."
+description = "Données de marché publiques : bougies Bitvavo en EUR (clôturées uniquement), univers de paires achetables et indice Fear & Greed, avec cache disque."
 version.workspace = true
 edition.workspace = true
 license.workspace = true

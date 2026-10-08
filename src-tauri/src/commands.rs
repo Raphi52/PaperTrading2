@@ -5,6 +5,7 @@ use pt_core::backtest::{evaluate, history_start, BacktestReport, CurvePoint, Eva
 use pt_core::portfolio::{ClosedTrade, Fill};
 use pt_core::validation::{tested_strategies, RollingConfig, RollingReport};
 use pt_core::{catalog as all_presets, find, Engine, External, Preset, Timeframe};
+use pt_data::universe::{check_tradable, frozen_universe, normalize_symbol, top_alias, universe_size};
 use pt_data::HistoryCache;
 use pt_store::{EquityRow, LivePortfolio};
 use serde::{Deserialize, Serialize};
@@ -227,24 +228,28 @@ pub struct CreateRequest {
     pub cash: f64,
 }
 
-/// `TOP50` (seul) : les 50 cryptos les plus populaires sur Binance (univers figé,
-/// `crates/pt-data/univers.txt`). Toute autre liste est rendue telle quelle.
+/// `TOP{n}` (seul) : les n premières cryptos de l'univers figé (les plus échangées en
+/// euros sur Bitvavo, `crates/pt-data/univers.txt`). Toute autre liste est rendue telle quelle.
 async fn resolve_universe(state: &St<'_>, symbols: Vec<String>) -> Res<Vec<String>> {
+    let _ = &state.client;
+    resolve_alias(symbols)
+}
+
+fn resolve_alias(symbols: Vec<String>) -> Res<Vec<String>> {
     let n = match symbols.as_slice() {
-        [one] => one.strip_prefix("TOP").and_then(|x| x.parse::<usize>().ok()),
+        [one] => top_alias(one),
         _ => None,
     };
     let Some(n) = n else {
-        if symbols.iter().any(|s| s.starts_with("TOP") && s[3..].parse::<usize>().is_ok()) {
-            return Err("TOP50 se choisit seul : décoche les autres cryptos".into());
+        if symbols.iter().any(|s| top_alias(s).is_some()) {
+            return Err(format!("TOP{} se choisit seul : décoche les autres cryptos", universe_size()));
         }
         return Ok(symbols);
     };
     if !(1..=400).contains(&n) {
         return Err(format!("TOP{n} refusé : entre TOP1 et TOP400"));
     }
-    let _ = &state.client;
-    let mut out = pt_data::binance::frozen_universe(n);
+    let mut out = frozen_universe(n);
     if out.len() < n {
         return Err(format!("TOP{n} refusé : l'univers figé compte {} cryptos", out.len()));
     }
@@ -252,16 +257,26 @@ async fn resolve_universe(state: &St<'_>, symbols: Vec<String>) -> Res<Vec<Strin
     Ok(out)
 }
 
+/// Refuse toute paire qui ne s'achète pas en euros sur Bitvavo MAINTENANT (liste des
+/// marchés relue à chaque demande : une paire peut être suspendue ou retirée).
+async fn require_tradable(state: &St<'_>, symbols: &[String]) -> Res<()> {
+    let markets = state.client.eur_markets().await.map_err(|e| format!("liste des marchés Bitvavo indisponible : {e:#}"))?;
+    check_tradable(symbols, &markets)
+}
+
+/// Capital fictif, en euros.
+fn check_cash(cash: f64) -> Res<()> {
+    if !(100.0..=1e9).contains(&cash) {
+        return Err("le capital doit être entre 100 € et 1 milliard d'euros".into());
+    }
+    Ok(())
+}
+
+/// Symboles saisis : forme contrôlée par `normalize_symbol`, sans doublon, de 1 à 20.
 fn clean_symbols(raw: &[String]) -> Res<Vec<String>> {
     let mut out: Vec<String> = Vec::new();
     for s in raw {
-        let s = s.trim().to_uppercase();
-        if s.is_empty() {
-            continue;
-        }
-        if !s.chars().all(|c| c.is_ascii_alphanumeric()) || s.len() > 20 {
-            return Err(format!("symbole invalide : {s}"));
-        }
+        let Some(s) = normalize_symbol(s)? else { continue };
         if !out.contains(&s) {
             out.push(s);
         }
@@ -281,15 +296,14 @@ pub async fn create_portfolio(state: St<'_>, req: CreateRequest) -> Res<i64> {
     }
     let preset = find(&req.preset_id).ok_or_else(|| format!("stratégie inconnue : {}", req.preset_id))?;
     let symbols = resolve_universe(&state, clean_symbols(&req.symbols)?).await?;
-    if !(100.0..=1e9).contains(&req.cash) {
-        return Err("le capital doit être entre 100 et 1 milliard".into());
-    }
+    check_cash(req.cash)?;
+    require_tradable(&state, &symbols).await?;
     for s in symbols.iter().take(20) {
         state
             .client
             .recent(s, preset.timeframe, 5)
             .await
-            .map_err(|e| format!("{s} introuvable sur Binance spot : {e:#}"))?;
+            .map_err(|e| format!("{s} : prix indisponibles sur Bitvavo : {e:#}"))?;
     }
     let settings = state.settings();
     let now = pt_data::now_ms();
@@ -410,6 +424,7 @@ async fn evaluate_one(
 pub async fn run_backtest(state: St<'_>, req: BacktestRequest) -> Res<BacktestReport> {
     let preset = find(&req.preset_id).ok_or_else(|| format!("stratégie inconnue : {}", req.preset_id))?;
     let symbols = resolve_universe(&state, clean_symbols(&req.symbols)?).await?;
+    require_tradable(&state, &symbols).await?;
     let mut r = evaluate_one(&state, preset, &symbols, req.days, req.cash, req.validation.as_ref()).await?;
     r.curve = downsample::<CurvePoint>(&r.curve, 1500);
     r.benchmark_curve = downsample::<CurvePoint>(&r.benchmark_curve, 1500);
@@ -454,6 +469,7 @@ struct Progress {
 #[tauri::command]
 pub async fn run_comparison(app: AppHandle, state: St<'_>, req: CompareRequest) -> Res<Vec<CompareRow>> {
     let symbols = resolve_universe(&state, clean_symbols(&req.symbols)?).await?;
+    require_tradable(&state, &symbols).await?;
     if let Some(v) = &req.validation {
         v.config(req.cash)?; // refuse les paramètres invalides avant 30 calculs
     }
@@ -513,7 +529,8 @@ pub async fn run_comparison(app: AppHandle, state: St<'_>, req: CompareRequest) 
 pub struct AppInfo {
     pub version: &'static str,
     pub data_dir: String,
-    pub binance_url: String,
+    /// Source des bougies (Bitvavo par défaut, `PT_MARKET_URL`).
+    pub market_url: String,
 }
 
 /// Lancement au démarrage de Windows : entrée `PaperTrading` de
@@ -557,7 +574,7 @@ pub fn app_info(state: St) -> AppInfo {
     AppInfo {
         version: env!("CARGO_PKG_VERSION"),
         data_dir: state.data_dir.display().to_string(),
-        binance_url: std::env::var("PT_BINANCE_URL").unwrap_or_else(|_| pt_data::binance::DEFAULT_BASE_URL.to_string()),
+        market_url: pt_data::bitvavo::market_url(),
     }
 }
 
@@ -581,4 +598,55 @@ pub async fn trade_candles(state: St<'_>, symbol: String, timeframe: String, fro
 #[tauri::command]
 pub fn portfolio_decisions(state: St, id: i64) -> Res<Vec<pt_core::engine::Decision>> {
     state.store.lock().expect("base").decisions(id).map_err(|e| format!("{e:#}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn v(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// Cas 1 à 7 : saisie des symboles dans l'application.
+    #[test]
+    fn saisie_des_symboles() {
+        assert_eq!(clean_symbols(&v(&[" btceur ", "eth-eur"])).unwrap(), ["BTCEUR", "ETHEUR"]);
+        assert_eq!(clean_symbols(&v(&["BTCEUR", "btceur", "BTC-EUR"])).unwrap(), ["BTCEUR"]);
+        for empty in [v(&[]), v(&[""]), v(&[" ", ""])] {
+            assert_eq!(clean_symbols(&empty).unwrap_err(), "choisis entre 1 et 20 symboles");
+        }
+        let many: Vec<String> = (0..21).map(|i| format!("A{i}EUR")).collect();
+        assert_eq!(clean_symbols(&many).unwrap_err(), "choisis entre 1 et 20 symboles");
+        assert!(clean_symbols(&v(&["BTC/EUR!"])).unwrap_err().starts_with("symbole invalide"));
+        for old in ["BTCUSDT", "ETHUSDC", "BTC"] {
+            assert!(clean_symbols(&v(&[old])).unwrap_err().contains("seules les paires en EUR"), "{old}");
+        }
+    }
+
+    /// Cas 10 à 12 : alias de l'univers figé.
+    #[test]
+    fn alias_de_l_univers() {
+        let n = universe_size();
+        assert_eq!(resolve_alias(v(&[&format!("TOP{n}")])).unwrap().len(), n);
+        assert_eq!(resolve_alias(v(&["TOP3"])).unwrap(), ["BTCEUR", "ETHEUR", "XRPEUR"]);
+        for out in ["TOP0", "TOP401"] {
+            assert!(resolve_alias(v(&[out])).unwrap_err().contains("entre TOP1 et TOP400"), "{out}");
+        }
+        let too_big = format!("TOP{}", n + 1);
+        assert!(resolve_alias(v(&[&too_big])).unwrap_err().contains(&format!("compte {n} cryptos")));
+        assert!(resolve_alias(v(&["TOP10", "BTCEUR"])).unwrap_err().contains("se choisit seul"));
+        assert_eq!(resolve_alias(v(&["BTCEUR"])).unwrap(), ["BTCEUR"]);
+    }
+
+    /// Cas 18 : capital hors bornes, et ses jumeaux acceptés.
+    #[test]
+    fn capital_borne() {
+        for bad in [50.0, 0.0, -1.0, 2e9, f64::NAN] {
+            assert!(check_cash(bad).is_err(), "{bad}");
+        }
+        for ok in [100.0, 10_000.0, 1e9] {
+            assert!(check_cash(ok).is_ok(), "{ok}");
+        }
+    }
 }

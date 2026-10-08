@@ -1,6 +1,6 @@
 # PaperTrading
 
-Paper trading crypto en **Rust + Tauri** : des stratégies suivies sur les prix réels de Binance avec de l'argent fictif, **frais compris**, et **toujours comparées à « acheter et garder »**.
+Paper trading crypto en **Rust + Tauri** : des stratégies suivies sur les prix réels de **Bitvavo, en paires euros** avec de l'argent fictif, **frais compris**, et **toujours comparées à « acheter et garder »**. Chaque paire de l'univers s'achète réellement en euros depuis la France : le jour où l'on passe à l'argent réel, seule la connexion à la plateforme change, pas les paires, les prix, les frais ni le montant minimal d'un ordre.
 
 C'est la réécriture complète de [PaperTrading](https://github.com/Raphi52/PaperTrading) (Python). Le premier projet ne gagnait pas d'argent. Sur ses propres données (304 portefeuilles, 16 jours), le rendement médian était de **+0,38 %**, alors que BTC prenait **+3,8 %** et SOL **+11,5 %** sur la même période. Ce dépôt corrige les causes de cet échec, une par une. Le code et les tests empêchent qu'elles reviennent.
 
@@ -36,7 +36,7 @@ C'est la réécriture complète de [PaperTrading](https://github.com/Raphi52/Pap
 
 ## Ce que disent les données (frais compris)
 
-Mesuré le 7 octobre 2026 sur BTC, ETH, SOL, BNB et XRP, pour les **101 stratégies** du catalogue (105 essais au registre, portage compris). Frais de 0,1 % par côté et glissement de 0,02 %. Résultats affichés sur les mêmes 3 ans pour toutes les stratégies (« acheter et garder » : +240,2 % en 1j) ; verdicts décidés par la validation sur fenêtres glissantes de fin 2017 à 2026. Tableau complet : [`docs/comparaison-2026-10-07.md`](docs/comparaison-2026-10-07.md). Le comparateur complet tourne en moins d'une minute.
+Mesuré le 7 octobre 2026, **sur l'ancienne source de prix (paires USDT, frais de 0,1 %), avant le passage aux paires euros de Bitvavo du 8 octobre 2026 ; pas encore recalculé**, sur BTC, ETH, SOL, BNB et XRP, pour les **101 stratégies** du catalogue (105 essais au registre, portage compris). Frais de 0,1 % par côté et glissement de 0,02 %. Résultats affichés sur les mêmes 3 ans pour toutes les stratégies (« acheter et garder » : +240,2 % en 1j) ; verdicts décidés par la validation sur fenêtres glissantes de fin 2017 à 2026. Tableau complet : [`docs/comparaison-2026-10-07.md`](docs/comparaison-2026-10-07.md). Le comparateur complet tourne en moins d'une minute.
 
 | Verdict | Nombre | Stratégies |
 |---|---:|---|
@@ -53,11 +53,11 @@ Mesuré le 7 octobre 2026 sur BTC, ETH, SOL, BNB et XRP, pour les **101 stratég
 - **Une seule stratégie bat « acheter et garder » en rendement brut** sur ces 3 ans : **Au-dessus de la SMA 50 (1j)**, qui fait **+362,2 %** contre +240,2 %, avec une pire baisse de **33 %** contre 63 %. Elle est investie à parts égales sur chaque symbole tant que son prix est au-dessus de sa moyenne 50 jours, en liquide sinon (Detzel et al., 2021). Mais sur 2017-2026, elle ne bat un timing au hasard de même exposition que dans 9 fenêtres sur 17 : ce gain peut venir de la période. Elle est suivie en direct pour le vérifier sur des prix qu'elle n'a jamais vus.
 - **Le momentum 28 jours** (Liu & Tsyvinski, 2021), même principe, fait +201,1 % avec une pire baisse de 36 %, et reste lui aussi indiscernable du hasard (10 fenêtres sur 18).
 
-## Sur les 50 cryptos les plus populaires (`--symbols top50`)
+## Sur les 50 cryptos les plus échangées en euros (`--symbols top50`)
 
-Chaque stratégie peut scanner un **univers de 50 cryptos** (`crates/pt-data/univers.txt`) : les plus populaires sur Binance au 8 octobre 2026, classées par la **médiane de leur volume quotidien sur 90 jours** (et non plus sur 24 h, qui faisait entrer des pics d'un jour). Les actions tokenisées, stablecoins, l'or et les jetons sous surveillance sont exclus d'après les étiquettes que Binance pose lui-même. **Pourquoi 50 et pas plus** : ces 50 font 92 % du volume ; les 50 suivantes n'en ajoutent que 4 %, à 1–3 M$/jour, et près de la moitié sont classées « Seed » (haut risque) par Binance. Une stratégie tient **10 positions au plus** : quand plus de cryptos signalent une entrée que de places libres, les signaux les plus forts passent (rendement des 20 dernières bougies rapporté à la volatilité), et une crypto nettement plus forte **remplace** la plus faible tenue (`switch_margin`). Tableau complet : [`docs/comparaison-univers-2026-10-07.md`](docs/comparaison-univers-2026-10-07.md), calculé en 4 minutes sur 16 cœurs.
+Chaque stratégie peut scanner un **univers de 50 cryptos** (`crates/pt-data/univers.txt`) : les plus échangées **en euros sur Bitvavo** au 8 octobre 2026, classées par la **médiane de leur volume quotidien en EUR sur 90 jours** (les jours d'avant la cotation comptent pour zéro). Toutes s'achètent en euros : le test `univers_tout_achetable` le vérifie contre la liste des marchés Bitvavo relevée le même jour (`crates/pt-data/fixtures/bitvavo-markets.json`). Stablecoins, or tokenisé, jetons enveloppés et paires cotées depuis moins de 45 jours sont exclus. Ces 50 font 87 % du volume en euros ; la 50e échange encore 0,25 M€ par jour. Dans l'application comme dans `pt`, une paire qui n'est pas cotée en euros sur Bitvavo au moment de la demande (absente ou suspendue) est refusée avec son motif.
 
-> Les chiffres ci-dessous datent de l'**ancienne liste de 100 cryptos** (volume 24 h du 7 octobre 2026) ; ils n'ont pas encore été recalculés sur les 50.
+> Les chiffres ci-dessous datent de l'**ancienne liste de 100 cryptos en USDT** (volume 24 h du 7 octobre 2026) ; ils n'ont pas encore été recalculés sur les 50 paires euros.
 
 | Verdict | Nombre |
 |---|---:|
@@ -85,26 +85,9 @@ Les deux stratégies que la première version du comparateur classait « Solides
 
 Pourquoi ne pas comparer simplement au Sharpe d'« acheter et garder » ? Parce qu'une stratégie qui achète **au hasard**, en restant souvent en liquide, « gagnerait » mécaniquement toutes les fenêtres baissières. La référence à exposition égale élimine ce biais. Le test ne retient que des fenêtres sans chevauchement, et garde le découpage le moins favorable.
 
-## Portage du financement des perpétuels (`pt portage`)
+## Portage du financement des perpétuels : retiré
 
-Une stratégie qui ne parie pas sur la direction du prix : acheter un symbole au comptant et vendre en même quantité son contrat perpétuel. Le prix s'annule entre les deux jambes ; il reste le **financement**, versé toutes les 8 h par les acheteurs de perpétuels aux vendeurs quand le taux est positif. C'est une prime documentée (Schmeling, Schrimpf & Todorov, « Crypto carry », BIS Working Paper 1087, 2023), pas un timing.
-
-Le modèle (`crates/pt-core/src/carry.rs`) est volontairement prudent :
-- la moitié de chaque poche est au comptant, l'autre sert de marge au perpétuel (levier 1×) ;
-- frais du perpétuel à **0,05 %** par côté, tarif preneur d'un utilisateur standard ([Binance](https://www.binance.com/fr/support/articles/360033544231)), en plus de 0,1 % au comptant et du glissement sur chaque jambe ;
-- rééquilibrage quand la hausse ronge la marge, et liquidation si une bougie l'épuise ;
-- non modélisés : l'écart de prix entre perpétuel et comptant, et les intérêts de la trésorerie.
-
-Le même code sert au backtest et au mode direct (`carry_live_increments_equal_one_shot`). Une fenêtre est gagnée si elle finit en gain, puisque le portage n'est pas exposé au prix. Historique des taux : septembre 2019 à aujourd'hui. Rapport complet : [`docs/portage-2026-10-06.md`](docs/portage-2026-10-06.md).
-
-| Variante | Fenêtres indépendantes gagnées | Corrigée pour 33 essais | Par an (fenêtres bout à bout) | Pire fenêtre de 6 mois | Verdict |
-|---|---:|---:|---:|---:|---|
-| Permanent | **11 / 14** | 95 % | **+4,7 %** | −2,1 % | **Prometteuse, pas prouvée** |
-| Filtré sur 7 jours de taux | 10 / 14 | 100 % | +4,8 % | −1,0 % | Compatible avec la chance |
-
-- **La prime a existé, mais elle s'est presque éteinte.** +3 à +14 % par semestre en 2020-2021 ; pertes pendant le marché baissier de 2022-2023, quand le financement est devenu négatif ; puis **de −0,1 % à +0,9 % par semestre pour les fenêtres commencées depuis 2025**.
-- Aucune liquidation sur 27 fenêtres. Pire baisse en cours de fenêtre : 2,5 %, contre 22 à 69 % pour « acheter et garder ».
-- Le portage n'est pas encore suivi en direct dans l'application : son rendement actuel ne le justifie pas.
+La stratégie de portage (acheter au comptant, vendre le contrat perpétuel en même quantité et toucher le financement) a été **retirée le 8 octobre 2026**, avec la commande `pt portage`. Elle reposait sur des contrats perpétuels et leurs taux de financement, que la plateforme des prix (Bitvavo) ne propose pas : elle n'était donc pas reproductible avec de vrais euros depuis la France. Son dernier rapport reste archivé dans [`docs/portage-2026-10-06.md`](docs/portage-2026-10-06.md) : prime presque éteinte depuis 2025 (de −0,1 % à +0,9 % par semestre), et verdict « Prometteuse, pas prouvée ». Ses variantes restent au registre des essais, qui ne fait que grandir.
 
 ## Améliorer en boucle sans se mentir
 
@@ -141,12 +124,11 @@ Prérequis : [Rust](https://rustup.rs) stable. Sous Windows, il faut aussi les B
 cargo run -p papertrading            # l'application de bureau
 cargo test --workspace                # les tests
 cargo run --release -p pt-cli -- presets
-cargo run --release -p pt-cli -- backtest --preset macd_1d --symbols BTCUSDT,ETHUSDT --days 1095
+cargo run --release -p pt-cli -- backtest --preset macd_1d --symbols BTCEUR,ETHEUR --days 1095
 cargo run --release -p pt-cli -- compare --days 1095 --validation-days 3650 --window 180 --step 90 --md rapport.md
 cargo run --release -p pt-cli -- validate --preset macd_1d --preset donchian_55_20_1d --days 3650 --window 180 --step 90 --md validation.md
 cargo run --release -p pt-cli -- walkforward --lookback 2 --md walkforward.md
 cargo run --release -p pt-cli -- essais
-cargo run --release -p pt-cli -- portage --md portage.md
 cargo run --release -p pt-cli -- suivre --preset sma_trend_50_1d --nom "Tendance SMA 50"
 ```
 
@@ -155,8 +137,7 @@ cargo run --release -p pt-cli -- suivre --preset sma_trend_50_1d --nom "Tendance
 Variables d'environnement facultatives :
 
 - `PT_DATA_DIR` : dossier des données de l'application. Par défaut, c'est le dossier de données de l'utilisateur.
-- `PT_BINANCE_URL` : source des bougies. Par défaut, `https://data-api.binance.vision`, le point d'accès public en lecture seule de Binance.
-- `PT_BINANCE_FUTURES_URL` : source des taux de financement (`pt portage`). Par défaut, `https://fapi.binance.com`, en lecture seule et sans clé.
+- `PT_MARKET_URL` : source des bougies. Par défaut, `https://api.bitvavo.com`, le point d'accès public de Bitvavo, en lecture seule et sans clé.
 
 Installateur Windows : `cargo install tauri-cli --version "^2" --locked`, puis `cargo tauri build`. Il produit `target/release/bundle/nsis/PaperTrading_0.1.0_x64-setup.exe` (3,4 Mo). L'installation se fait pour l'utilisateur courant, sans droits d'administrateur, dans `%LOCALAPPDATA%\PaperTrading2`, avec un raccourci dans le menu Démarrer et un désinstalleur. `/S` l'installe sans fenêtre ; depuis Git Bash, préfixe la commande de `MSYS_NO_PATHCONV=1`, sinon `/S` devient `S:/` et l'assistant s'ouvre. Testé le 6 octobre 2026 : la version installée reprend la base existante (`%APPDATA%\com.raphi52.papertrading2`) et ses portefeuilles. Depuis le renommage en PaperTrading, la base vit dans `%APPDATA%\com.raphi52.papertrading\papertrading.sqlite` ; au premier lancement, l'ancienne base est copiée, jamais effacée.
 
@@ -165,10 +146,10 @@ Installateur Windows : `cargo install tauri-cli --version "^2" --locked`, puis `
 ## Architecture
 
 ```
-crates/pt-core    indicateurs, comptabilité, stratégies, moteur, backtest, validation, sélection glissante, portage du financement, registre des essais (lu à la compilation) — aucun accès réseau ni disque
-crates/pt-data    bougies Binance (clôturées seulement), taux de financement des perpétuels, Fear & Greed, cache disque
+crates/pt-core    indicateurs, comptabilité, stratégies, moteur, backtest, validation, sélection glissante, registre des essais (lu à la compilation) — aucun accès réseau ni disque
+crates/pt-data    bougies Bitvavo en EUR (clôturées seulement), univers et contrôle des paires achetables, Fear & Greed, cache disque
 crates/pt-store   SQLite : état, exécutions complètes, courbe de valeur
-crates/pt-cli     `pt` : backtest, comparaison, validation, sélection glissante, portage, registre des essais, création de portefeuilles
+crates/pt-cli     `pt` : backtest, comparaison, validation, sélection glissante, registre des essais, création de portefeuilles
 src-tauri         application de bureau : boucle du mode direct + commandes
 ui                interface HTML/CSS/JS sans dépendance externe
 ```
@@ -177,11 +158,11 @@ Tout ce qui décide d'un trade vit dans `pt-core`, sous forme de fonctions pures
 
 ## Ce qui n'a pas été repris, et pourquoi
 
-- **Trading réel** (Binance, Jupiter, Uniswap, PancakeSwap, clés privées) : un outil de paper trading n'a pas à détenir de clés. Aucune stratégie n'a démontré d'avantage qui justifierait de l'argent réel.
+- **Trading réel** (plateformes centralisées, Jupiter, Uniswap, PancakeSwap, clés privées) : un outil de paper trading n'a pas à détenir de clés. Les paires, les frais (0,25 % par côté) et le minimum d'ordre (5 €) sont déjà ceux de Bitvavo, pour que le passage à l'argent réel ne change que la connexion. Aucune stratégie n'a démontré d'avantage qui justifierait de l'argent réel.
 - **Sniper de tokens DEX** : ses résultats reposaient sur des exécutions et des « rug pulls » simulés au hasard, donc invérifiables.
 - **Copie de « whales », du Congrès et d'investisseurs légendaires** : les signaux étaient générés aléatoirement (`_simulate_legendary_trader`).
 - **Martingale et renforcement sans stop** : risque de ruine.
-- **Ventes à découvert** : impossibles sur Binance spot. Les simuler sans coût d'emprunt surestime les résultats. Le portage vend bien un perpétuel, mais toujours couvert par le comptant, et son coût (le financement) est exactement ce qu'il mesure.
+- **Ventes à découvert** : impossibles au comptant. Les simuler sans coût d'emprunt surestime les résultats.
 - **Alertes Telegram, tableaux de bord Streamlit et Next.js** : remplacés par l'application Tauri.
 
 ## Licence

@@ -1,7 +1,7 @@
 //! Bougies et unités de temps.
 //!
 //! Règle de conception n°1 : le moteur ne voit QUE des bougies clôturées.
-//! L'ancien bot calculait ses indicateurs sur la bougie Binance encore en cours :
+//! L'ancien bot calculait ses indicateurs sur la bougie encore en cours :
 //! un signal pouvait s'allumer en milieu de bougie puis disparaître.
 
 use serde::{Deserialize, Serialize};
@@ -46,7 +46,7 @@ pub enum Timeframe {
 impl Timeframe {
     pub const ALL: [Timeframe; 5] = [Timeframe::M15, Timeframe::M30, Timeframe::H1, Timeframe::H4, Timeframe::D1];
 
-    /// Code d'intervalle Binance.
+    /// Code d'intervalle des bougies (identique chez Bitvavo).
     pub fn as_str(&self) -> &'static str {
         match self {
             Timeframe::M15 => "15m",

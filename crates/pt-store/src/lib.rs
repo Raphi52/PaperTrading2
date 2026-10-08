@@ -419,7 +419,7 @@ mod tests {
     use pt_core::{find, CostModel};
 
     fn engines() -> (Engine, Engine) {
-        let syms = vec!["BTCUSDT".to_string(), "ETHUSDT".to_string()];
+        let syms = vec!["BTCEUR".to_string(), "ETHEUR".to_string()];
         let e = Engine::new(find("macd_1d").unwrap(), syms.clone(), 10_000.0, CostModel::default(), 0);
         let b = Engine::new(find("buy_hold").unwrap(), syms, 10_000.0, CostModel::default(), 0);
         (e, b)
@@ -430,9 +430,9 @@ mod tests {
         let mut s = Store::in_memory().unwrap();
         let (mut e, b) = engines();
         let id = s.create("Test", 1, &e, &b).unwrap();
-        e.portfolio.buy("BTCUSDT", 1_000.0, 50_000.0, 10, &CostModel::default(), "entrée").unwrap();
-        e.portfolio.sell_all("BTCUSDT", 51_000.0, 20, &CostModel::default(), "sortie").unwrap();
-        e.portfolio.buy("ETHUSDT", 500.0, 2_000.0, 30, &CostModel::default(), "entrée").unwrap();
+        e.portfolio.buy("BTCEUR", 1_000.0, 50_000.0, 10, &CostModel::default(), "entrée").unwrap();
+        e.portfolio.sell_all("BTCEUR", 51_000.0, 20, &CostModel::default(), "sortie").unwrap();
+        e.portfolio.buy("ETHEUR", 500.0, 2_000.0, 30, &CostModel::default(), "entrée").unwrap();
         let mut p = s.load(id).unwrap();
         p.engine = e.clone();
         s.save(&p).unwrap();
@@ -449,7 +449,7 @@ mod tests {
         let mut s = Store::in_memory().unwrap();
         let (mut e, b) = engines();
         let id = s.create("Test", 1, &e, &b).unwrap();
-        e.portfolio.buy("BTCUSDT", 1_000.0, 50_000.0, 10, &CostModel::default(), "entrée").unwrap();
+        e.portfolio.buy("BTCEUR", 1_000.0, 50_000.0, 10, &CostModel::default(), "entrée").unwrap();
         let mut p = s.load(id).unwrap();
         p.engine = e.clone();
         s.save(&p).unwrap();
@@ -458,7 +458,7 @@ mod tests {
         ind.insert("rsi14".to_string(), 61.5);
         let d = |kind, reason: &str| Decision {
             time: 20,
-            symbol: "BTCUSDT".into(),
+            symbol: "BTCEUR".into(),
             kind,
             reason: reason.into(),
             price: 51_000.0,
@@ -490,7 +490,7 @@ mod tests {
         let mut s = Store::in_memory().unwrap();
         let (mut e, b) = engines();
         let id = s.create("Test", 1, &e, &b).unwrap();
-        e.portfolio.buy("BTCUSDT", 1_000.0, 50_000.0, 10, &CostModel::default(), "entrée").unwrap();
+        e.portfolio.buy("BTCEUR", 1_000.0, 50_000.0, 10, &CostModel::default(), "entrée").unwrap();
         let mut p = s.load(id).unwrap();
         p.engine = e;
         s.save(&p).unwrap();

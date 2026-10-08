@@ -238,7 +238,7 @@ mod tests {
         let state = AppState::new(Store::in_memory().unwrap(), dir);
         let now = pt_data::now_ms();
         let from = now - 10 * 86_400_000;
-        let syms = vec!["BTCUSDT".to_string(), "ETHUSDT".to_string()];
+        let syms = vec!["BTCEUR".to_string(), "ETHEUR".to_string()];
         let e = Engine::new(find("supertrend_7_2_1h").unwrap(), syms.clone(), 10_000.0, CostModel::default(), from);
         let b = Engine::new(find("buy_hold").unwrap(), syms, 10_000.0, CostModel::default(), from);
         let id = state.store.lock().unwrap().create("test", now, &e, &b).unwrap();
@@ -266,5 +266,32 @@ mod tests {
             p2.engine.equity(),
             p2.benchmark.equity()
         );
+    }
+
+    /// Cas 13 (réseau) : un portefeuille créé avant le passage aux paires EUR (symboles
+    /// USDT) ne fait pas planter le passage : il est marqué « données indisponibles »,
+    /// et les portefeuilles en EUR continuent d'avancer.
+    #[tokio::test]
+    #[ignore]
+    async fn live_old_usdt_portfolio_is_flagged_not_fatal() {
+        let dir = std::env::temp_dir().join("pt-live-test-usdt");
+        let state = AppState::new(Store::in_memory().unwrap(), dir);
+        let now = pt_data::now_ms();
+        let from = now - 10 * 86_400_000;
+        let mk = |sym: &str| {
+            let syms = vec![sym.to_string()];
+            let e = Engine::new(find("supertrend_7_2_1h").unwrap(), syms.clone(), 10_000.0, CostModel::default(), from);
+            let b = Engine::new(find("buy_hold").unwrap(), syms, 10_000.0, CostModel::default(), from);
+            state.store.lock().unwrap().create(sym, now, &e, &b).unwrap()
+        };
+        let old = mk("BTCUSDT");
+        let new = mk("BTCEUR");
+        let (bars, _errors) = tick(&state).await.unwrap();
+        assert!(bars >= 200, "{bars} bougies traitées");
+        let o = state.store.lock().unwrap().load(old).unwrap();
+        assert_eq!(o.last_error.as_deref(), Some("données indisponibles : BTCUSDT"));
+        let n = state.store.lock().unwrap().load(new).unwrap();
+        assert_eq!(n.last_error, None);
+        assert!(n.engine.states["BTCEUR"].last_bar_open_time.is_some(), "le portefeuille EUR doit avancer");
     }
 }

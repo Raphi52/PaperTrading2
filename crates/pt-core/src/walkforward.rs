@@ -342,7 +342,7 @@ mod tests {
                         c
                     })
                     .collect();
-                (format!("S{s}USDT"), c)
+                (format!("S{s}EUR"), c)
             })
             .collect()
     }

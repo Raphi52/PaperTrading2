@@ -12,7 +12,9 @@ use std::collections::BTreeMap;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
 pub struct CostModel {
-    /// Frais par côté, en fraction (0.001 = 0,1 %, tarif Binance spot standard).
+    /// Frais par côté, en fraction (0.0025 = 0,25 %). Par défaut : tarif Bitvavo d'un ordre
+    /// exécuté immédiatement (« taker »), sous 100 000 € échangés sur 30 jours, sur les
+    /// paires crypto en EUR (<https://bitvavo.com/en/fees>, relevé du 2026-10-08).
     pub fee_rate: f64,
     /// Glissement par côté, en points de base (2 = 0,02 %).
     pub slippage_bps: f64,
@@ -20,7 +22,7 @@ pub struct CostModel {
 
 impl Default for CostModel {
     fn default() -> Self {
-        CostModel { fee_rate: 0.001, slippage_bps: 2.0 }
+        CostModel { fee_rate: 0.0025, slippage_bps: 2.0 }
     }
 }
 
@@ -281,13 +283,21 @@ impl Portfolio {
 mod tests {
     use super::*;
 
+    /// Règles réelles de la plateforme : 0,25 % par côté, 5 € d'ordre minimal.
+    #[test]
+    fn default_costs_are_the_real_platform_ones() {
+        assert_eq!(CostModel::default().fee_rate, 0.0025);
+        assert_eq!(CostModel::default().slippage_bps, 2.0);
+        assert_eq!(crate::engine::MIN_NOTIONAL, 5.0);
+    }
+
     #[test]
     fn pnl_includes_both_fees() {
         let costs = CostModel { fee_rate: 0.001, slippage_bps: 0.0 };
         let mut p = Portfolio::new(10_000.0);
-        p.buy("BTCUSDT", 1_000.0, 100.0, 0, &costs, "test").unwrap();
+        p.buy("BTCEUR", 1_000.0, 100.0, 0, &costs, "test").unwrap();
         // Prix inchangé : on doit perdre exactement les deux frais.
-        let t = p.sell_all("BTCUSDT", 100.0, 1, &costs, "test").unwrap();
+        let t = p.sell_all("BTCEUR", 100.0, 1, &costs, "test").unwrap();
         let expected = -(1.0 + 999.0 * 0.001);
         assert!((t.pnl - expected).abs() < 1e-9, "pnl={} attendu={}", t.pnl, expected);
         assert!((p.cash - (10_000.0 + expected)).abs() < 1e-9);
@@ -298,9 +308,9 @@ mod tests {
     fn breakeven_covers_round_trip() {
         let costs = CostModel::default();
         let mut p = Portfolio::new(10_000.0);
-        p.buy("ETHUSDT", 2_000.0, 50.0, 0, &costs, "t").unwrap();
-        let be = p.positions["ETHUSDT"].breakeven(&costs);
-        let t = p.sell_all("ETHUSDT", be, 1, &costs, "t").unwrap();
+        p.buy("ETHEUR", 2_000.0, 50.0, 0, &costs, "t").unwrap();
+        let be = p.positions["ETHEUR"].breakeven(&costs);
+        let t = p.sell_all("ETHEUR", be, 1, &costs, "t").unwrap();
         assert!(t.pnl.abs() < 1e-6, "au point mort le gain doit être nul, obtenu {}", t.pnl);
         assert!(be > 50.0 * (1.0 + costs.round_trip() * 0.9));
     }
@@ -309,14 +319,14 @@ mod tests {
     fn layering_averages_and_keeps_invariants() {
         let costs = CostModel::default();
         let mut p = Portfolio::new(10_000.0);
-        p.buy("SOLUSDT", 1_000.0, 100.0, 0, &costs, "l1").unwrap();
-        p.buy("SOLUSDT", 1_000.0, 80.0, 1, &costs, "l2").unwrap();
-        let pos = &p.positions["SOLUSDT"];
+        p.buy("SOLEUR", 1_000.0, 100.0, 0, &costs, "l1").unwrap();
+        p.buy("SOLEUR", 1_000.0, 80.0, 1, &costs, "l2").unwrap();
+        let pos = &p.positions["SOLEUR"];
         assert_eq!(pos.layers, 2);
         assert!(pos.avg_price < 100.0 && pos.avg_price > 80.0);
         assert!((pos.cost - 2_000.0).abs() < 1e-9);
         p.check_invariants().unwrap();
-        p.sell_all("SOLUSDT", 90.0, 2, &costs, "exit").unwrap();
+        p.sell_all("SOLEUR", 90.0, 2, &costs, "exit").unwrap();
         p.check_invariants().unwrap();
         assert!(p.positions.is_empty());
     }

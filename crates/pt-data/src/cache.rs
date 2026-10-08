@@ -1,18 +1,18 @@
 //! Cache disque des bougies clôturées (un fichier CSV par symbole et unité de temps).
 //! Une bougie clôturée ne change plus : on ne télécharge que ce qui manque.
 
-use crate::binance::BinanceClient;
+use crate::bitvavo::BitvavoClient;
 use anyhow::{Context, Result};
 use pt_core::{Candle, Timeframe};
 use std::path::{Path, PathBuf};
 
 pub struct HistoryCache {
     dir: PathBuf,
-    client: BinanceClient,
+    client: BitvavoClient,
 }
 
 impl HistoryCache {
-    pub fn new(dir: impl AsRef<Path>, client: BinanceClient) -> Self {
+    pub fn new(dir: impl AsRef<Path>, client: BitvavoClient) -> Self {
         HistoryCache { dir: dir.as_ref().to_path_buf(), client }
     }
 
@@ -55,7 +55,7 @@ impl HistoryCache {
         Ok(())
     }
 
-    /// Fichier qui retient la date la plus ancienne déjà demandée à Binance pour ce
+    /// Fichier qui retient la date la plus ancienne déjà demandée à la plateforme pour ce
     /// symbole. Sans lui, un symbole coté APRÈS la date demandée (SOL en 2020 pour un
     /// historique de 10 ans) paraissait toujours incomplet et était retéléchargé en
     /// entier à chaque appel.
@@ -63,7 +63,7 @@ impl HistoryCache {
         self.dir.join(format!("{}_{}.depuis", symbol.to_uppercase(), tf.as_str()))
     }
 
-    /// Bougies clôturées depuis `start_ms`, complétées depuis Binance si besoin.
+    /// Bougies clôturées depuis `start_ms`, complétées depuis Bitvavo si besoin.
     pub async fn history(&self, symbol: &str, tf: Timeframe, start_ms: i64) -> Result<Vec<Candle>> {
         std::fs::create_dir_all(&self.dir).with_context(|| format!("création {}", self.dir.display()))?;
         let path = self.file(symbol, tf);
@@ -82,7 +82,7 @@ impl HistoryCache {
         }
         pt_core::candle::validate_series(&cached).map_err(|e| anyhow::anyhow!("{symbol} {tf} : {e}"))?;
         if cached.is_empty() {
-            anyhow::bail!("{symbol} {tf} : aucune bougie (symbole inconnu de Binance ?)");
+            anyhow::bail!("{symbol} {tf} : aucune bougie (paire non cotée en EUR sur Bitvavo ?)");
         }
         Self::write(&path, &cached)?;
         // Écrit APRÈS les bougies : un téléchargement interrompu ne marque jamais

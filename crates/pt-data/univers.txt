@@ -1,70 +1,67 @@
 # Univers figé de PaperTrading — 2026-10-08
-# Les 50 cryptos les plus POPULAIRES sur Binance : paires USDT spot classées par la MÉDIANE de
-# leur volume quotidien en USDT sur les 90 derniers jours (bougies 1d, data-api.binance.vision),
-# les jours d'avant la cotation comptant pour zéro. La médiane sur 90 jours retient ce qui est
-# échangé DURABLEMENT : un classement sur 24 h (l'ancienne liste de 100) faisait entrer des pics
-# d'un jour — 29 de ces 100 n'étaient plus dans le top 100 sur 90 jours (RLC, UMA, NMR… à
-# 0,1–0,2 M$/jour). Une crypto cotée depuis moins de 45 jours (HYPE, MARSCOIN) attend le
-# prochain relevé.
-# Exclus d'après les étiquettes que Binance pose lui-même (bapi get-products) : actions
-# tokenisées (bStocks), stablecoins, or (tCommodities) et jetons sous surveillance (Monitoring,
-# exposés à un retrait de la cote) ; plus EUR, WBTC et PAXG.
-# POURQUOI 50 : ces 50 font 92 % du volume des cryptos échangeables en USDT sur Binance ; les 50
-# suivantes n'ajoutent que 4 %, à 1–3 M$/jour, et près de la moitié sont des projets que Binance
-# classe lui-même à haut risque (Seed). Une stratégie ne tient que 10 positions : 50 candidates
-# laissent le choix, et chaque crypto de plus est une requête de plus à chaque passage du mode
-# direct. La 50e échange encore 3,3 M$ par jour (médiane).
+# Les 50 cryptos les plus échangées en EUROS sur Bitvavo, la plateforme dont viennent les prix :
+# chacune s'achète réellement en euros depuis la France (marché XXX-EUR ouvert au négoce dans
+# /v2/markets, relevé figé dans crates/pt-data/fixtures/bitvavo-markets.json et vérifié par le
+# test univers_tout_achetable). Classement : MÉDIANE du volume quotidien en EUR (volume × clôture)
+# sur les 90 derniers jours (bougies 1d de api.bitvavo.com), les jours d'avant la cotation
+# comptant pour zéro. La médiane retient ce qui est échangé DURABLEMENT, pas un pic d'un jour.
+# Exclus : stablecoins (USDC, EURC…), or tokenisé et jetons enveloppés (PAXG, WBTC…), et les
+# paires cotées depuis moins de 45 jours (LAPTOP, TREAD, PNT, CT, CNPY, DRV, FOLD, XDP), qui attendent le prochain relevé.
+# POURQUOI 50 : ces 50 font 87 % du volume en EUR des cryptos de Bitvavo ; les 50 suivantes
+# n'ajoutent que 6 %. La 50e échange encore 0.25 M€ par jour (médiane) : assez pour
+# qu'un ordre de quelques milliers d'euros ne déplace pas le prix. Une stratégie ne tient que
+# 10 positions : 50 candidates laissent le choix.
 # BIAIS DU SURVIVANT : ce sont les 50 premières AUJOURD'HUI. Rejouer le passé sur cette liste
 # favorise les cryptos qui ont survécu et monté ; un résultat de backtest est donc plus flatteur
 # qu'il ne l'aurait été en temps réel. Chaque symbole n'entre dans une fenêtre qu'une fois coté
 # et préchauffé, et la référence « acheter et garder » utilise le même univers.
-BTCUSDT
-ETHUSDT
-SOLUSDT
-ZECUSDT
-XRPUSDT
-BNBUSDT
-DOGEUSDT
-SUIUSDT
-NEARUSDT
-UNIUSDT
-TRXUSDT
-ENAUSDT
-ADAUSDT
-PEPEUSDT
-PUMPUSDT
-LINKUSDT
-WLDUSDT
-TAOUSDT
-LTCUSDT
-AVAXUSDT
-AAVEUSDT
-TRUMPUSDT
-XLMUSDT
-ONDOUSDT
-FETUSDT
-ARBUSDT
-XPLUSDT
-BCHUSDT
-GRAMUSDT
-ASTERUSDT
-PENGUUSDT
-FILUSDT
-INJUSDT
-DOTUSDT
-HBARUSDT
-DASHUSDT
-ICPUSDT
-TUTUSDT
-POLUSDT
-APTUSDT
-ZAMAUSDT
-WLFIUSDT
-ACEUSDT
-ZROUSDT
-VIRTUALUSDT
-ETHFIUSDT
-SHIBUSDT
-DEXEUSDT
-BANKUSDT
-GIGGLEUSDT
+BTCEUR
+XRPEUR
+ETHEUR
+SOLEUR
+ADAEUR
+HYPEEUR
+SUIEUR
+TAOEUR
+PUMPEUR
+LINKEUR
+ONDOEUR
+NEAREUR
+FETEUR
+XLMEUR
+WLDEUR
+UNIEUR
+PEPEEUR
+DOGEEUR
+ENAEUR
+AVAXEUR
+HBAREUR
+LTCEUR
+ARBEUR
+DOTEUR
+BCHEUR
+SHIBEUR
+ETHFIEUR
+INJEUR
+AAVEEUR
+XPLEUR
+EPICEUR
+RENDEREUR
+TIAEUR
+PENGUEUR
+PROMEUR
+VETEUR
+USELESSEUR
+TRXEUR
+PYTHEUR
+COTIEUR
+VIRTUALEUR
+NPCEUR
+ZROEUR
+JUPEUR
+TRUMPEUR
+QNTEUR
+FARTCOINEUR
+SYNEUR
+BNBEUR
+SPXEUR
