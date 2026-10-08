@@ -14,7 +14,9 @@ use std::collections::BTreeMap;
 pub struct CostModel {
     /// Frais par côté, en fraction (0.0025 = 0,25 %). Par défaut : tarif Bitvavo d'un ordre
     /// exécuté immédiatement (« taker »), sous 100 000 € échangés sur 30 jours, sur les
-    /// paires crypto en EUR (<https://bitvavo.com/en/fees>, relevé du 2026-10-08).
+    /// paires crypto en EUR (<https://bitvavo.com/en/fees>, relevé du 2026-10-08). Grille confirmée le
+    /// 2026-10-08 par <https://www.cafedelabourse.com/fiches-courtiers/bitvavo> : paires EUR, maker 0,15 %,
+    /// taker 0,25 % sous 100 000 € sur 30 jours glissants.
     pub fee_rate: f64,
     /// Glissement par côté, en points de base (2 = 0,02 %).
     pub slippage_bps: f64,
