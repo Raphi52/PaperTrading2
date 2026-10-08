@@ -1,6 +1,7 @@
 // Pas de console noire derrière la fenêtre en version publiée.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod accounts;
 mod commands;
 mod live;
 mod state;
@@ -60,6 +61,9 @@ fn main() {
             commands::set_autostart,
             commands::trade_candles,
             commands::portfolio_decisions,
+            accounts::list_accounts,
+            accounts::save_account,
+            accounts::delete_account,
         ])
         .run(tauri::generate_context!())
         .expect("impossible de démarrer PaperTrading");

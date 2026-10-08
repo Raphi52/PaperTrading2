@@ -296,6 +296,7 @@ mod tests {
         pt_core::candle::validate_series(&v).unwrap();
         assert!(v[0].open_time - start < H, "première bougie trop tardive");
         let max_gap = v.windows(2).map(|w| w[1].open_time - w[0].open_time).max().unwrap();
+        // fix-ok: le 1er passage (t10.log) échouait sur « trou de 6 h » ; cause mesurée par requête ciblée sur l'API : interruption réelle de Bitvavo, pas la pagination. Seuil 12 h ; une page perdue (1 000 h) reste détectée (défaut réinjecté, t12r.log rouge).
         assert!(max_gap <= 12 * H, "trou de {} h", max_gap / H);
         let expected = (v.last().unwrap().open_time - v[0].open_time) / H + 1;
         assert!(v.len() as f64 >= 0.99 * expected as f64, "{} bougies sur {expected} heures", v.len());

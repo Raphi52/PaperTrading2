@@ -273,6 +273,7 @@ fn check_cash(cash: f64) -> Res<()> {
 }
 
 /// Symboles saisis : forme contrôlée par `normalize_symbol`, sans doublon, de 1 à 20.
+// fix-ok: l'ancien contrôle (commands.rs:261 au commit 671787d) refusait `BTC-EUR` (tiret) et acceptait `BTCUSDT`, paire fermée aux résidents de l'EEE ; il est remplacé par `normalize_symbol` (tests de ce fichier) et `require_tradable` (refus de TUTEUR vu dans l'app, app-refus-tut.png).
 fn clean_symbols(raw: &[String]) -> Res<Vec<String>> {
     let mut out: Vec<String> = Vec::new();
     for s in raw {

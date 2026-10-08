@@ -22,6 +22,7 @@
       <button data-view="backtest">Backtest</button>
       <button data-view="compare">Comparateur</button>
       <button data-view="strategies">Stratégies</button>
+      <button data-view="accounts">Comptes</button>
       <button data-view="settings">Réglages</button>
     </nav>
     <div class="engine" id="engine">
@@ -136,6 +137,23 @@
     </section>
 
     <!-- RÉGLAGES -->
+    <!-- COMPTES -->
+    <section id="view-accounts" class="view" hidden>
+      <div class="section-head"><div><h1>Comptes de trading</h1>
+        <p class="muted small">Les clés d'API des plateformes où tu placeras de vrais euros. Elles sont rangées dans le Gestionnaire d'identification de Windows, chiffrées pour ta session : jamais dans la base, jamais dans un fichier, et jamais réaffichées ici.</p>
+      </div></div>
+      <div class="panel">
+        <p class="muted small">Aujourd'hui l'application n'envoie <b>aucun ordre réel</b> : ces clés sont prêtes pour le jour où le trading réel sera branché. Crée des clés <b>sans droit de retrait</b>, avec seulement « consulter » et « trader ». Vérifie aussi que la plateforme est autorisée en France (registre de l'AMF) avant d'y déposer des euros.</p>
+        <table id="acc-table"><thead><tr><th>Plateforme</th><th>État</th><th>Clé</th><th>Enregistrée le</th><th></th></tr></thead><tbody></tbody></table>
+      </div>
+      <form id="acc-form" class="panel" hidden autocomplete="off">
+        <h2 id="acc-form-title"></h2>
+        <p class="muted small" id="acc-form-help"></p>
+        <div class="grid-4" id="acc-fields"></div>
+        <div class="form-actions"><button type="submit">Enregistrer</button><button type="button" class="ghost" id="acc-cancel">Annuler</button></div>
+      </form>
+    </section>
+
     <section id="view-settings" class="view" hidden>
       <div class="section-head"><div><h1>Réglages</h1></div></div>
       <form id="settings-form" class="panel">
@@ -165,5 +183,6 @@
 
   <div id="toast" role="status"></div>
   <script src="app.js"></script>
+  <script src="comptes.js"></script>
 </body>
 </html>

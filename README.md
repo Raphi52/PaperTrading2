@@ -115,6 +115,7 @@ Résultat, de novembre 2018 à octobre 2026 :
 - **Comparateur** : tout le catalogue d'un coup, sur la même période pour toutes les stratégies, validé sur fenêtres glissantes et classé par verdict : Solide, Prometteuse, Indiscernable du hasard, Perdante. Environ 1 minute une fois l'historique en cache.
 - **Stratégies** : ce que chaque stratégie calcule, ses sorties et sa taille de position.
 - **Réglages** : frais, glissement, capital par défaut, part hors échantillon.
+- **Comptes** : les clés d'API de 8 plateformes au comptant en euros (Bitvavo, Kraken, Coinbase Advanced Trade, Bitstamp, OKX, Bybit EU, Crypto.com Exchange, One Trading). Elles sont rangées dans le Gestionnaire d'identification de Windows (`PaperTrading/<plateforme>`), jamais dans la base ni dans un fichier, et ne sont jamais réaffichées : seuls l'état, les 4 derniers caractères de la clé publique et la date sont montrés. L'application n'envoie encore aucun ordre réel : ces clés préparent le branchement du trading réel.
 
 ## Démarrer
 
@@ -150,7 +151,7 @@ crates/pt-core    indicateurs, comptabilité, stratégies, moteur, backtest, val
 crates/pt-data    bougies Bitvavo en EUR (clôturées seulement), univers et contrôle des paires achetables, Fear & Greed, cache disque
 crates/pt-store   SQLite : état, exécutions complètes, courbe de valeur
 crates/pt-cli     `pt` : backtest, comparaison, validation, sélection glissante, registre des essais, création de portefeuilles
-src-tauri         application de bureau : boucle du mode direct + commandes
+src-tauri         application de bureau : boucle du mode direct + commandes ; accounts.rs = clés d'API (Gestionnaire d'identification de Windows)
 ui                interface HTML/CSS/JS sans dépendance externe
 ```
 
