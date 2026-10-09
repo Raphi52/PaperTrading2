@@ -64,3 +64,24 @@ pub fn random_walk(n: usize, seed: u64) -> Vec<Candle> {
     }
     out
 }
+
+/// Comme [`random_walk`], mais l'ouverture s'écarte de la clôture précédente (± 1 %),
+/// comme sur un marché réel : une décision prise à la clôture s'exécute à un autre prix.
+pub fn random_walk_gapped(n: usize, seed: u64) -> Vec<Candle> {
+    let mut state = seed.wrapping_mul(2862933555777941757).wrapping_add(3037000493);
+    let mut rnd = move || {
+        state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        ((state >> 33) as f64) / (1u64 << 31) as f64
+    };
+    let mut out = Vec::with_capacity(n);
+    let mut price = 100.0;
+    for i in 0..n {
+        let open = (price * (1.0 + (rnd() - 0.5) * 0.02)).max(0.01);
+        let close = (open * (1.0 + (rnd() - 0.5) * 0.06)).max(0.01);
+        let high = open.max(close) * (1.0 + rnd() * 0.01);
+        let low = open.min(close) * (1.0 - rnd() * 0.01);
+        out.push(candle(i as i64, open, high, low, close));
+        price = close;
+    }
+    out
+}
