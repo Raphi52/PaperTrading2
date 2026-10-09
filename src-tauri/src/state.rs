@@ -31,6 +31,9 @@ impl Settings {
         if !(0.0..=500.0).contains(&self.costs.slippage_bps) {
             return Err("le glissement doit être entre 0 et 500 points de base".into());
         }
+        // fix-ok: le réglage de liquidité ajouté le 2026-10-09 n'était borné nulle part ; un
+        // écart négatif rendrait un coût sous le minimum de 2 pb
+        // (test settings_reject_negative_liquidity).
         if let Some(l) = &self.costs.liquidity {
             l.validate()?;
         }

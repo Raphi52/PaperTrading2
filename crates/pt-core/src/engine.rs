@@ -80,6 +80,9 @@ struct Candidate {
     volume_24h: Option<f64>,
 }
 
+// fix-ok: le moteur exécutait sans regarder le volume (ancien engine.rs:535-537), d'où un coût
+// identique sur BTC-EUR (93,7 M€/24 h) et NPC-EUR (0,45 M€/24 h) ; mesuré le 2026-10-09 :
+// 7,3 % des quarts d'heure absents des bougies Bitvavo, d'où une fenêtre comptée en temps.
 /// Euros échangés (volume × clôture) par les bougies ouvertes dans les 24 h qui précèdent
 /// `end`, parmi `closed` (triées). Fenêtre en TEMPS, pas en nombre de bougies : Bitvavo ne
 /// rend aucune bougie pour un quart d'heure sans échange, un marché qui n'échange pas

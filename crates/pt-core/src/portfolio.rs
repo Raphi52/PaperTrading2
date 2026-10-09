@@ -91,6 +91,9 @@ impl CostModel {
         CostModel { fee_rate: 0.0, slippage_bps: 0.0, liquidity: None }
     }
 
+    // fix-ok: le glissement était fixé à 2 pb pour toute paire (ancien portfolio.rs:27, appliqué
+    // tel quel par buy_price/sell_price). Mesuré sur les carnets Bitvavo du 2026-10-09 pour un
+    // ordre de 1 446 € : 0,1 pb sur BTC-EUR, 28,7 pb sur NPC-EUR, 5,49 pb en moyenne sur 50 paires.
     /// Glissement d'un ordre de `notional` € sur un marché qui a échangé `volume_24h` €
     /// sur les 24 h précédentes. Liquidité inconnue (`None`, historique trop court) ou
     /// modèle absent : `slippage_bps`. Volume nul ou illisible : le plafond. Toujours fini.
