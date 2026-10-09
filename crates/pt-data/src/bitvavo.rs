@@ -111,7 +111,7 @@ impl BitvavoClient {
         let mut pages: Vec<Vec<Candle>> = Vec::new();
         let mut end = now;
         while end >= start {
-            let batch = self.candles(symbol, tf, Some(start), Some(end), MAX_LIMIT).await?;
+            let batch = self.candles(symbol, tf, Some(page_start(start, end, tf)), Some(end), MAX_LIMIT).await?;
             let Some(first) = batch.first().copied() else { break };
             let full = batch.len() == MAX_LIMIT;
             pages.push(batch);
@@ -140,6 +140,16 @@ impl BitvavoClient {
         let body = self.get(&format!("{}/v2/markets", self.base), "liste des marchés").await?;
         Ok(crate::universe::tradable_eur(&body))
     }
+}
+
+/// Début demandé pour une page `[start, end]` : Bitvavo refuse (400, errorCode 205) une
+/// fenêtre plus étroite qu'un intervalle (sondé le 2026-10-09 sur BTC-EUR 15m :
+/// `[t, t+899999]` refusé, `[t, t+900000]` accepté). C'est le cas après une page pleine qui
+/// s'arrête une bougie après `start`. Le début est alors reculé d'assez pour couvrir un
+/// intervalle, ce qui garde la bougie ouverte à `start` ; les plus anciennes sont écartées
+/// par `assemble`.
+fn page_start(start: i64, end: i64, tf: Timeframe) -> i64 {
+    start.min(end - tf.millis())
 }
 
 /// Adresse d'une page de bougies : jamais plus de 1 000 par requête (au-delà, refus 400).
@@ -266,6 +276,92 @@ mod tests {
         pt_core::candle::validate_series(&v).unwrap();
         // Aucune page (paire pas encore cotée) : série vide, pas d'erreur.
         assert!(assemble(Vec::new(), 0, now).is_empty());
+    }
+
+    /// Une fenêtre d'au moins un intervalle est envoyée telle quelle ; une plus étroite est
+    /// élargie vers le passé jusqu'à un intervalle exactement, jamais au-delà.
+    #[test]
+    fn fenetre_d_au_moins_un_intervalle() {
+        let q = Timeframe::M15.millis();
+        let t = 1_788_862_500_000; // ONDO-EUR 15m, 2026-10-09
+        assert_eq!(page_start(t, t + q, Timeframe::M15), t); // limite acceptée par Bitvavo
+        assert_eq!(page_start(t, t + 5 * q, Timeframe::M15), t);
+        assert_eq!(page_start(t, t + q - 1, Timeframe::M15), t - 1); // refusée sinon
+        assert_eq!(page_start(t, t, Timeframe::M15), t - q);
+    }
+
+    /// Faux Bitvavo local, sans réseau. Il applique les règles mesurées sur l'API :
+    /// au plus 1 000 bougies, la plus récente d'abord, et refus 400 (errorCode 205)
+    /// d'une fenêtre plus étroite qu'un intervalle (sondé le 2026-10-09 sur BTC-EUR 15m :
+    /// `[t, t+899999]` refusé, `[t, t+900000]` accepté). Rend l'adresse et les fenêtres reçues.
+    fn faux_bitvavo(tf: Timeframe) -> (String, std::sync::Arc<std::sync::Mutex<Vec<(i64, i64)>>>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = format!("http://{}", listener.local_addr().unwrap());
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log = seen.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut s) = stream else { continue };
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 4096];
+                while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match s.read(&mut chunk) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                    }
+                }
+                let req = String::from_utf8_lossy(&buf);
+                let path = req.split_whitespace().nth(1).unwrap_or("");
+                let param = |k: &str| -> Option<i64> {
+                    path.split(['?', '&']).find_map(|kv| kv.strip_prefix(&format!("{k}="))?.parse().ok())
+                };
+                let now = crate::now_ms();
+                let (start, end, limit) = (param("start").unwrap(), param("end").unwrap(), param("limit").unwrap());
+                log.lock().unwrap().push((start, end));
+                let step = tf.millis();
+                let (status, body) = if limit > MAX_LIMIT as i64 || end - start < step {
+                    ("400 Bad Request", r#"{"errorCode":205,"error":"Invalid parameters to get candlesticks."}"#.to_string())
+                } else {
+                    // Bougies cotées depuis FIRST_CANDLE_MS, jusqu'à celle en cours.
+                    let from = start.max(FIRST_CANDLE_MS) - FIRST_CANDLE_MS;
+                    let first = (from + step - 1) / step * step + FIRST_CANDLE_MS;
+                    let last = end.min(now);
+                    let mut t: Vec<i64> = (0..).map(|i| first + i * step).take_while(|&t| t <= last).collect();
+                    t.reverse();
+                    t.truncate(limit as usize);
+                    let rows: Vec<String> = t.iter().map(|o| format!(r#"[{o},"1","1","1","1","1"]"#)).collect();
+                    ("200 OK", format!("[{}]", rows.join(",")))
+                };
+                let _ = write!(
+                    s,
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+            }
+        });
+        (addr, seen)
+    }
+
+    /// Une période de 1 001 bougies (1 000 clôturées + celle en cours) : la page pleine
+    /// s'arrête une bougie après le début, et la page suivante ne doit pas demander une
+    /// fenêtre de moins d'un intervalle (cas ONDO-EUR 15m du 2026-10-09). Entrée qui ferait
+    /// échouer une correction fausse : `start = ouverture en cours − 1 000 intervalles`
+    /// — arrêter la boucle au lieu d'élargir la fenêtre perdrait la bougie ouverte à `start`.
+    #[tokio::test]
+    async fn jamais_de_fenetre_plus_etroite_qu_un_intervalle() {
+        for tf in [Timeframe::M15, Timeframe::D1] {
+            let (base, seen) = faux_bitvavo(tf);
+            let step = tf.millis();
+            let forming = (crate::now_ms() - FIRST_CANDLE_MS) / step * step + FIRST_CANDLE_MS;
+            let start = forming - 1000 * step;
+            let v = BitvavoClient::with_base(&base).closed_since("ONDOEUR", tf, start).await.unwrap();
+            let windows = seen.lock().unwrap().clone();
+            assert!(windows.iter().all(|(s, e)| e - s >= step), "{tf} : fenêtres demandées {windows:?}");
+            assert_eq!(v.first().map(|c| c.open_time), Some(start), "{tf} : bougie de début perdue");
+            assert_eq!(v.len(), 1000, "{tf}");
+            pt_core::candle::validate_series(&v).unwrap();
+        }
     }
 
     /// Test réseau, lancé seulement avec `cargo test -- --ignored`.
