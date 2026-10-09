@@ -22,6 +22,6 @@ pub use backtest::{backtest, BacktestReport, CurvePoint, Metrics, Verdict};
 pub use candle::{Candle, Timeframe};
 pub use catalog::{catalog, find};
 pub use engine::Engine;
-pub use portfolio::{ClosedTrade, CostModel, Fill, Portfolio, Position, Side};
+pub use portfolio::{ClosedTrade, CostModel, Fill, Liquidity, Portfolio, Position, Side};
 pub use strategy::{compute_signals, External, Preset, Signal};
 pub use validation::{rolling_validation, Robustness, RollingConfig, RollingReport};

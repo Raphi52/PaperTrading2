@@ -51,6 +51,11 @@ pub struct Pending {
     pub reason: String,
     /// ATR(14) à la clôture de la décision, pour placer le stop.
     pub atr: f64,
+    /// Euros échangés sur les 24 h avant la décision (voir [`volume_24h_eur`]), pour le
+    /// coût d'exécution. Absent (historique trop court, ordre enregistré avant le
+    /// 2026-10-09) : glissement minimal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub volume_24h: Option<f64>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -72,6 +77,30 @@ struct Candidate {
     time: i64,
     price: f64,
     indicators: BTreeMap<String, f64>,
+    volume_24h: Option<f64>,
+}
+
+/// Euros échangés (volume × clôture) par les bougies ouvertes dans les 24 h qui précèdent
+/// `end`, parmi `closed` (triées). Fenêtre en TEMPS, pas en nombre de bougies : Bitvavo ne
+/// rend aucune bougie pour un quart d'heure sans échange, un marché qui n'échange pas
+/// paraît donc moins liquide. Un volume illisible ou négatif compte pour zéro. `None` si
+/// l'historique ne couvre pas les 24 h : liquidité inconnue.
+pub fn volume_24h_eur(closed: &[Candle], end: i64) -> Option<f64> {
+    let start = end - crate::portfolio::DAY_MS;
+    if closed.first()?.open_time > start {
+        return None;
+    }
+    let mut sum = 0.0;
+    for c in closed.iter().rev() {
+        if c.open_time < start {
+            break;
+        }
+        let v = c.volume * c.close;
+        if c.open_time < end && v.is_finite() && v > 0.0 {
+            sum += v;
+        }
+    }
+    Some(sum)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -156,6 +185,10 @@ pub struct Engine {
     /// sortie par remplacement). Jamais sérialisé.
     #[serde(skip)]
     pub last_indicators: BTreeMap<String, BTreeMap<String, f64>>,
+    /// Volume des 24 h à la dernière clôture de chaque crypto, pour une sortie décidée
+    /// par remplacement (`allocate`). Jamais sérialisé : rempli dans le même passage.
+    #[serde(skip)]
+    pub last_volume_24h: BTreeMap<String, Option<f64>>,
 }
 
 impl Engine {
@@ -172,6 +205,7 @@ impl Engine {
             record: false,
             decisions: Vec::new(),
             last_indicators: BTreeMap::new(),
+            last_volume_24h: BTreeMap::new(),
         }
     }
 
@@ -307,8 +341,12 @@ impl Engine {
         while let Some(c) = rest.next() {
             if free > 0 {
                 free -= 1;
-                self.states.get_mut(&c.symbol).expect("état").pending =
-                    Some(Pending { kind: PendingKind::Enter, reason: "SIGNAL D'ENTRÉE".into(), atr: c.atr });
+                self.states.get_mut(&c.symbol).expect("état").pending = Some(Pending {
+                    kind: PendingKind::Enter,
+                    reason: "SIGNAL D'ENTRÉE".into(),
+                    atr: c.atr,
+                    volume_24h: c.volume_24h,
+                });
                 self.log(c.time, &c.symbol, DecisionKind::Entry, "SIGNAL D'ENTRÉE", c.price, c.indicators);
                 continue;
             }
@@ -355,10 +393,19 @@ impl Engine {
             }
             let out_reason = format!("CHANGEMENT → {}", c.symbol);
             let in_reason = format!("CHANGEMENT (remplace {weak})");
-            self.states.get_mut(&weak).expect("état").pending =
-                Some(Pending { kind: PendingKind::Exit, reason: out_reason.clone(), atr: c.atr });
-            self.states.get_mut(&c.symbol).expect("état").pending =
-                Some(Pending { kind: PendingKind::Enter, reason: in_reason.clone(), atr: c.atr });
+            let weak_volume = self.last_volume_24h.get(&weak).copied().flatten();
+            self.states.get_mut(&weak).expect("état").pending = Some(Pending {
+                kind: PendingKind::Exit,
+                reason: out_reason.clone(),
+                atr: c.atr,
+                volume_24h: weak_volume,
+            });
+            self.states.get_mut(&c.symbol).expect("état").pending = Some(Pending {
+                kind: PendingKind::Enter,
+                reason: in_reason.clone(),
+                atr: c.atr,
+                volume_24h: c.volume_24h,
+            });
             let weak_price = self.marks.get(&weak).copied().unwrap_or(f64::NAN);
             let mut weak_ind = self.last_snap(&weak);
             weak_ind.insert("strength".to_string(), weak_strength);
@@ -392,11 +439,15 @@ impl Engine {
             }
         }
         state.strength = strength.is_finite().then_some(strength);
+        // Liquidité connue à la clôture : elle fixera le coût de l'ordre décidé ici.
+        let volume_24h = volume_24h_eur(hist, bar.close_time + 1);
+        self.last_volume_24h.insert(symbol.to_string(), volume_24h);
 
         // 1. Sorties touchées pendant la bougie.
         let mut in_bar_exit: Option<(f64, String)> = None;
         if let Some(pos) = self.portfolio.positions.get(symbol) {
             if pos.entry_time <= bar.open_time {
+                let qty = pos.qty;
                 let stop_label = if state.trailing_active { "STOP SUIVEUR" } else { "STOP" };
                 let mut exit: Option<(f64, String)> = None;
                 if let Some(stop) = pos.stop {
@@ -416,9 +467,10 @@ impl Engine {
                     }
                 }
                 if let Some((price, reason)) = exit {
-                    self.portfolio
-                        .sell_all(symbol, price, bar.close_time, &self.costs, &reason)
-                        .expect("position présente");
+                    // Pendant la bougie, seules les bougies déjà closes sont connues.
+                    let before = volume_24h_eur(&hist[..hist.len() - 1], bar.open_time);
+                    let costs = self.costs.for_order(before, qty * price);
+                    self.portfolio.sell_all(symbol, price, bar.close_time, &costs, &reason).expect("position présente");
                     state.pending = None;
                     state.trailing_active = false;
                     in_bar_exit = Some((price, reason));
@@ -458,16 +510,20 @@ impl Engine {
             }
             let pending = if exits.max_bars.is_some_and(|m| pos.bars_held >= m) {
                 Some(Pending {
-                    kind: PendingKind::Exit, reason: format!("DURÉE MAX ({} bougies)", pos.bars_held), atr
+                    kind: PendingKind::Exit,
+                    reason: format!("DURÉE MAX ({} bougies)", pos.bars_held),
+                    atr,
+                    volume_24h,
                 })
             } else if sig.exit {
-                Some(Pending { kind: PendingKind::Exit, reason: "SIGNAL DE SORTIE".into(), atr })
+                Some(Pending { kind: PendingKind::Exit, reason: "SIGNAL DE SORTIE".into(), atr, volume_24h })
             } else if let Some(py) = self.preset.pyramid {
                 (pos.layers < py.max_layers && bar.close <= pos.last_fill_price * (1.0 - py.step_pct / 100.0)).then(
                     || Pending {
                         kind: PendingKind::Add,
                         reason: format!("RENFORCEMENT {}/{}", pos.layers + 1, py.max_layers),
                         atr,
+                        volume_24h,
                     },
                 )
             } else {
@@ -491,6 +547,7 @@ impl Engine {
                     time: bar.close_time,
                     price: bar.close,
                     indicators: snap(),
+                    volume_24h,
                 });
             }
         } else {
@@ -498,8 +555,12 @@ impl Engine {
             let can_enter =
                 in_window && self.portfolio.positions.len() + self.pending_entries() < self.max_positions();
             let state = self.states.get_mut(symbol).expect("état");
-            state.pending =
-                can_enter.then(|| Pending { kind: PendingKind::Enter, reason: "SIGNAL D'ENTRÉE".into(), atr });
+            state.pending = can_enter.then(|| Pending {
+                kind: PendingKind::Enter,
+                reason: "SIGNAL D'ENTRÉE".into(),
+                atr,
+                volume_24h,
+            });
             if can_enter {
                 self.log(bar.close_time, symbol, DecisionKind::Entry, "SIGNAL D'ENTRÉE", bar.close, snap());
             } else if in_window {
@@ -518,10 +579,9 @@ impl Engine {
         };
         match pending.kind {
             PendingKind::Exit => {
-                if self.portfolio.positions.contains_key(symbol) {
-                    self.portfolio
-                        .sell_all(symbol, price, time, &self.costs, &pending.reason)
-                        .expect("position présente");
+                if let Some(pos) = self.portfolio.positions.get(symbol) {
+                    let costs = self.costs.for_order(pending.volume_24h, pos.qty * price);
+                    self.portfolio.sell_all(symbol, price, time, &costs, &pending.reason).expect("position présente");
                     self.states.get_mut(symbol).expect("état").trailing_active = false;
                 }
             }
@@ -541,8 +601,9 @@ impl Engine {
                     self.log(time, symbol, DecisionKind::Skipped, &why, price, ind);
                     return;
                 }
+                let costs = self.costs.for_order(pending.volume_24h, notional);
                 self.portfolio
-                    .buy(symbol, notional, price, time, &self.costs, &pending.reason)
+                    .buy(symbol, notional, price, time, &costs, &pending.reason)
                     .expect("trésorerie vérifiée");
                 self.set_levels(symbol, pending.atr);
             }
@@ -555,8 +616,9 @@ impl Engine {
                     self.log(time, symbol, DecisionKind::Skipped, &why, price, ind);
                     return;
                 }
+                let costs = self.costs.for_order(pending.volume_24h, notional);
                 self.portfolio
-                    .buy(symbol, notional, price, time, &self.costs, &pending.reason)
+                    .buy(symbol, notional, price, time, &costs, &pending.reason)
                     .expect("trésorerie vérifiée");
                 self.set_levels(symbol, pending.atr);
             }
@@ -890,5 +952,155 @@ mod tests {
         close_all(&mut e, 1, &[("A", false, 1.0), ("B", true, 50.0), ("C", false, 0.0)]);
         let held: Vec<&String> = e.portfolio.positions.keys().collect();
         assert_eq!(held, ["A"]);
+    }
+
+    /// Mêmes prix, volumes multipliés par `factor` : seul le carnet change.
+    fn scaled(c: &[Candle], factor: f64) -> Vec<Candle> {
+        c.iter().map(|x| Candle { volume: x.volume * factor, ..*x }).collect()
+    }
+
+    /// Audit de réalisme du 2026-10-09 : sur Bitvavo, un ordre de 1 446 € coûte 0,1 pb sur
+    /// BTC-EUR et 28,7 pb sur NPC-EUR (carnets relevés vers 08:30 UTC). Le simulateur
+    /// facturait 2 pb partout. Un marché mince doit coûter plus cher qu'un marché profond.
+    #[test]
+    fn thin_market_entry_pays_more_than_liquid() {
+        use crate::testutil::synthetic;
+        let base = synthetic(400, 21);
+        let first_buy = |factor: f64| {
+            let series = scaled(&base, factor);
+            let mut e = Engine::new(find("buy_hold").unwrap(), vec!["A".into()], 10_000.0, CostModel::default(), 0);
+            let feeds: BTreeMap<String, Feed> = [("A".to_string(), Feed { closed: &series, forming: None })].into();
+            e.advance(&feeds, &External::default(), |_, _| {});
+            let f = e.portfolio.fills.first().expect("un achat").clone();
+            let open = series.iter().find(|c| c.open_time == f.time).expect("ouverture d'exécution").open;
+            (f.price, open)
+        };
+        let (thin, open_thin) = first_buy(0.001);
+        let (deep, open_deep) = first_buy(1_000.0);
+        assert_eq!(open_thin, open_deep, "mêmes prix des deux côtés");
+        assert!(
+            (deep - open_deep * (1.0 + 2.0 / 10_000.0)).abs() < 1e-9,
+            "marché profond : le minimum de 2 pb, {deep}"
+        );
+        assert!(thin > deep, "marché mince : l'achat doit coûter plus cher ({thin} contre {deep})");
+    }
+
+    /// Jumeau côté vente : un stop touché sur un marché mince se vend moins bien.
+    #[test]
+    fn thin_market_stop_exit_sells_lower() {
+        let hist: Vec<Candle> = (0..30).map(|i| candle(i, 100.0, 101.0, 99.0, 100.0)).collect();
+        let exit_vs_stop = |factor: f64| {
+            let mut e = stop_engine(5.0, None);
+            e.costs = CostModel::default();
+            let h = scaled(&hist, factor);
+            e.close_bar("A", &h, Signal { enter: true, exit: false }, 1.0, f64::NAN, false);
+            e.on_next_open("A", h.last().unwrap().close_time + 1, 100.0);
+            let stop = e.portfolio.positions["A"].stop.expect("stop placé");
+            let mut h2 = h.clone();
+            h2.push(Candle { volume: h[0].volume, ..candle(30, 100.0, 100.0, 90.0, 92.0) });
+            e.close_bar("A", &h2, Signal::default(), 1.0, f64::NAN, false);
+            let t = e.portfolio.closed.first().expect("stop touché").clone();
+            assert_eq!(t.exit_reason, "STOP");
+            t.exit_price / stop
+        };
+        let thin = exit_vs_stop(0.001);
+        let deep = exit_vs_stop(1_000.0);
+        assert!((deep - (1.0 - 2.0 / 10_000.0)).abs() < 1e-9, "marché profond : le minimum de 2 pb, {deep}");
+        assert!(thin < deep, "marché mince : le stop doit se vendre moins bien ({thin} contre {deep})");
+    }
+
+    /// Cas 3 : liquidité inconnue (historique de moins de 24 h, ordre enregistré avant le
+    /// modèle) : le minimum de 2 pb, comme avant.
+    #[test]
+    fn unknown_liquidity_pays_the_floor() {
+        let thin: Vec<Candle> =
+            scaled(&(0..24).map(|i| candle(i, 100.0, 101.0, 99.0, 100.0)).collect::<Vec<_>>(), 0.001);
+        assert_eq!(volume_24h_eur(&thin[..23], thin[22].close_time + 1), None, "23 h d'historique : inconnue");
+        assert!(volume_24h_eur(&thin, thin[23].close_time + 1).is_some(), "jumeau : 24 h couvertes");
+        let fill = |hist: &[Candle]| {
+            let mut e = stop_engine(5.0, None);
+            e.costs = CostModel::default();
+            e.close_bar("A", hist, Signal { enter: true, exit: false }, 1.0, f64::NAN, false);
+            e.on_next_open("A", hist.last().unwrap().close_time + 1, 100.0);
+            e.portfolio.fills[0].price
+        };
+        assert!((fill(&thin[..23]) - 100.0 * (1.0 + 2.0 / 10_000.0)).abs() < 1e-9);
+        assert!(fill(&thin) > 100.0 * (1.0 + 2.0 / 10_000.0), "jumeau : 24 h d'un marché mince coûtent plus");
+        // Ordre en attente enregistré avant le modèle : relu sans liquidité.
+        let old: Pending = serde_json::from_str(r#"{"kind":"Enter","reason":"SIGNAL D'ENTRÉE","atr":1.0}"#).unwrap();
+        assert_eq!(old.volume_24h, None);
+        let mut e = stop_engine(5.0, None);
+        e.costs = CostModel::default();
+        e.states.get_mut("A").unwrap().pending = Some(old);
+        e.on_next_open("A", 0, 100.0);
+        assert!((e.portfolio.fills[0].price - 100.0 * (1.0 + 2.0 / 10_000.0)).abs() < 1e-9);
+    }
+
+    /// Cas 4 et 6 : la fenêtre compte 24 h de TEMPS ; une bougie absente (aucun échange
+    /// sur Bitvavo) ou au volume illisible n'ajoute rien.
+    #[test]
+    fn liquidity_window_is_24h_of_time_not_bar_count() {
+        let full: Vec<Candle> = (0..49).map(|i| candle(i, 100.0, 100.0, 100.0, 100.0)).collect();
+        let eur = |c: &Candle| c.volume * c.close;
+        let end = full[48].close_time + 1;
+        let expected: f64 = full[25..49].iter().map(eur).sum();
+        assert_eq!(volume_24h_eur(&full, end), Some(expected), "24 bougies horaires");
+        let gaps: Vec<Candle> =
+            full.iter().filter(|c| !(30..40).contains(&(c.open_time / 3_600_000))).copied().collect();
+        let with_gaps: f64 =
+            full[25..49].iter().filter(|c| !(30..40).contains(&(c.open_time / 3_600_000))).map(eur).sum();
+        assert_eq!(
+            volume_24h_eur(&gaps, end),
+            Some(with_gaps),
+            "10 heures sans échange : 14 bougies, pas 24 plus anciennes"
+        );
+        let mut bad = full.clone();
+        bad[47].volume = f64::NAN;
+        bad[46].volume = -5.0;
+        let without: f64 = full[25..46].iter().chain(&full[48..49]).map(eur).sum();
+        assert_eq!(volume_24h_eur(&bad, end), Some(without), "volume illisible ou négatif : zéro");
+        // Une bougie de 1 jour couvre seule sa fenêtre.
+        let day = Candle { open_time: 0, close_time: crate::portfolio::DAY_MS - 1, ..full[0] };
+        assert_eq!(volume_24h_eur(&[day], crate::portfolio::DAY_MS), Some(eur(&day)));
+        assert_eq!(volume_24h_eur(&[], end), None, "aucun historique : inconnue");
+    }
+
+    /// R4 : un stop touché pendant une bougie ne lit pas le volume de cette bougie (encore
+    /// inconnu à l'instant du stop), seulement celui des bougies déjà closes.
+    #[test]
+    fn in_bar_exit_liquidity_ignores_the_bar_in_progress() {
+        let hist: Vec<Candle> =
+            scaled(&(0..30).map(|i| candle(i, 100.0, 101.0, 99.0, 100.0)).collect::<Vec<_>>(), 0.001);
+        let exit_price = |hist: &[Candle], stop_bar_volume: f64| {
+            let mut e = stop_engine(5.0, None);
+            e.costs = CostModel::default();
+            e.close_bar("A", hist, Signal { enter: true, exit: false }, 1.0, f64::NAN, false);
+            e.on_next_open("A", hist.last().unwrap().close_time + 1, 100.0);
+            let stop = e.portfolio.positions["A"].stop.expect("stop placé");
+            let mut h2 = hist.to_vec();
+            h2.push(Candle { volume: stop_bar_volume, ..candle(30, 100.0, 100.0, 90.0, 92.0) });
+            e.close_bar("A", &h2, Signal::default(), 1.0, f64::NAN, false);
+            e.portfolio.closed[0].exit_price / stop
+        };
+        assert_eq!(exit_price(&hist, 1.0), exit_price(&hist, 1e9), "le volume de la bougie en cours ne compte pas");
+        // Jumeau : le volume des bougies déjà closes, lui, compte.
+        let mut busier = hist.clone();
+        for c in busier.iter_mut().skip(10) {
+            c.volume *= 1_000.0;
+        }
+        assert!(exit_price(&busier, 1.0) > exit_price(&hist, 1.0));
+    }
+
+    /// Cas 12 côté moteur : sans coûts, l'achat se fait au prix d'ouverture exact.
+    #[test]
+    fn zero_costs_fill_at_open_on_thin_market() {
+        use crate::testutil::synthetic;
+        let series = scaled(&synthetic(200, 21), 1e-6);
+        let mut e = Engine::new(find("buy_hold").unwrap(), vec!["A".into()], 10_000.0, CostModel::zero(), 0);
+        let feeds: BTreeMap<String, Feed> = [("A".to_string(), Feed { closed: &series, forming: None })].into();
+        e.advance(&feeds, &External::default(), |_, _| {});
+        let f = &e.portfolio.fills[0];
+        let open = series.iter().find(|c| c.open_time == f.time).unwrap().open;
+        assert_eq!(f.price, open);
     }
 }

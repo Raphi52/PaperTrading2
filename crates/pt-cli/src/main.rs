@@ -471,7 +471,7 @@ fn tested_count(asked: Option<usize>) -> Result<usize> {
 }
 
 fn costs(c: &Common) -> CostModel {
-    CostModel { fee_rate: c.fee / 100.0, slippage_bps: c.slippage_bps }
+    CostModel { fee_rate: c.fee / 100.0, slippage_bps: c.slippage_bps, ..CostModel::default() }
 }
 
 /// Symboles : forme contrôlée par `normalize_symbol` (paires en EUR), sans doublon, jamais vide.
@@ -753,7 +753,7 @@ async fn main() -> Result<()> {
                 .iter()
                 .map(|p| Candidate { preset: p, series: &loader.series[&p.timeframe], ext: &ext })
                 .collect();
-            let cost = CostModel { fee_rate: fee / 100.0, slippage_bps };
+            let cost = CostModel { fee_rate: fee / 100.0, slippage_bps, ..CostModel::default() };
             eprintln!("… {} stratégies rejouées sur une grille commune de fenêtres", candidates.len());
             let scores = score_candidates(&candidates, cost, window, step, cash)?;
             let mut text = format!(
@@ -824,7 +824,7 @@ async fn main() -> Result<()> {
                 initial_cash: cash,
             };
             cfg.check()?;
-            let cost = CostModel { fee_rate: fee / 100.0, slippage_bps };
+            let cost = CostModel { fee_rate: fee / 100.0, slippage_bps, ..CostModel::default() };
             let mut text = format!(
                 "# Validation sur fenêtres glissantes — {}\n\nFrais {fee:.2} % par côté, glissement {slippage_bps} pb, historique demandé : {days} jours. Chaque fenêtre repart de zéro et se compare à « acheter et garder » ramené à la même exposition : `(1 + R)^f − 1`, ce qu'un timing au hasard investi la fraction `f` du temps obtient en moyenne.\n\n",
                 syms.join(", ")

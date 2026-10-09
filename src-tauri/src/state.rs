@@ -31,6 +31,9 @@ impl Settings {
         if !(0.0..=500.0).contains(&self.costs.slippage_bps) {
             return Err("le glissement doit être entre 0 et 500 points de base".into());
         }
+        if let Some(l) = &self.costs.liquidity {
+            l.validate()?;
+        }
         if !(100.0..=1e9).contains(&self.default_cash) {
             return Err("le capital par défaut doit être entre 100 et 1 milliard".into());
         }
@@ -103,5 +106,30 @@ impl AppState {
         let v = pt_data::fetch_fear_greed().await?;
         *self.fear_greed.lock().expect("cache") = Some((now, v.clone()));
         Ok(v)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Cas 10 : un réglage de liquidité négatif est refusé, comme un glissement hors bornes.
+    #[test]
+    fn settings_reject_negative_liquidity() {
+        assert!(Settings::default().validate().is_ok());
+        let mut bad = Settings::default();
+        bad.costs.liquidity.as_mut().expect("modèle par défaut").spread_bps = -1.0;
+        assert!(bad.validate().unwrap_err().contains("liquidité"), "{:?}", bad.validate());
+        // Jumeau : modèle coupé, accepté.
+        let mut off = Settings::default();
+        off.costs.liquidity = None;
+        assert!(off.validate().is_ok());
+        // Réglages enregistrés avant le modèle (sans le champ) : relus avec le modèle calibré.
+        let old: Settings = serde_json::from_str(
+            r#"{"costs":{"fee_rate":0.0025,"slippage_bps":2.0},"default_cash":10000.0,"oos_fraction":0.3,"tick_seconds":30}"#,
+        )
+        .unwrap();
+        assert_eq!(old.costs, CostModel::default());
+        assert!(old.validate().is_ok());
     }
 }

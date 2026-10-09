@@ -496,7 +496,10 @@ mod tests {
         let c = s.values().next().unwrap();
         let start = common_start(&bh, &s).unwrap();
         let i = c.iter().position(|x| x.open_time == start).unwrap();
-        let qty = 1_000.0 * (1.0 - costs.fee_rate) / costs.buy_price(c[i + 1].open);
+        // Glissement fixé par la liquidité des 24 h connues à la décision (clôture de i).
+        let order = costs.for_order(crate::engine::volume_24h_eur(&c[..=i], c[i].close_time + 1), 1_000.0);
+        assert!(order.slippage_bps > costs.slippage_bps, "le calcul à la main passe bien par le modèle");
+        let qty = 1_000.0 * (1.0 - costs.fee_rate) / order.buy_price(c[i + 1].open);
         let expected = qty * c.last().unwrap().close;
         assert!((rep.metrics.final_equity - expected).abs() < 1e-6, "{} vs {}", rep.metrics.final_equity, expected);
         assert_eq!(rep.verdict, Verdict::Reference);
