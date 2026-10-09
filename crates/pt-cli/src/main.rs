@@ -903,6 +903,7 @@ mod tests {
         assert!(!p.active);
         assert_eq!(p.last_error.as_deref(), Some("doublon de 3"));
         assert!(archive_in(&dir, &[id + 1], "motif").unwrap_err().to_string().contains("introuvable"));
+        drop(s); // Windows : la base doit être fermée pour supprimer le dossier
         let _ = std::fs::remove_dir_all(&dir);
     }
 
