@@ -31,9 +31,12 @@ impl Settings {
         if !(0.0..=500.0).contains(&self.costs.slippage_bps) {
             return Err("le glissement doit être entre 0 et 500 points de base".into());
         }
-        // fix-ok: le réglage de liquidité ajouté le 2026-10-09 n'était borné nulle part ; un
-        // écart négatif rendrait un coût sous le minimum de 2 pb
-        // (test settings_reject_negative_liquidity).
+        // fix-ok: le réglage de liquidité ajouté le 2026-10-09 n'était borné nulle part : un
+        // coefficient négatif ou démesuré était accepté sans alerte et faussait le coût en
+        // silence (écart négatif : paires minces ramenées au minimum ; exposant négatif :
+        // marchés profonds plus chers ; plafond négatif : modèle éteint). Le minimum de 2 pb,
+        // lui, tient déjà par le clamp de CostModel::order_slippage_bps (portfolio.rs) ; cette
+        // borne refuse le réglage absurde (test settings_reject_negative_liquidity).
         if let Some(l) = &self.costs.liquidity {
             l.validate()?;
         }
@@ -123,6 +126,12 @@ mod tests {
         let mut bad = Settings::default();
         bad.costs.liquidity.as_mut().expect("modèle par défaut").spread_bps = -1.0;
         assert!(bad.validate().unwrap_err().contains("liquidité"), "{:?}", bad.validate());
+        // Ce que la borne empêche : pas un coût sous 2 pb (le clamp le garantit déjà), mais un
+        // coût faussé en silence. Paire mince (0,1 M€/jour), ordre de 1 446 € : 2 pb au lieu
+        // des ~12 pb du modèle calibré.
+        let thin = (Some(100_000.0), 1_446.0);
+        assert_eq!(bad.costs.order_slippage_bps(thin.0, thin.1), 2.0);
+        assert!(Settings::default().costs.order_slippage_bps(thin.0, thin.1) > 10.0);
         // Jumeau : modèle coupé, accepté.
         let mut off = Settings::default();
         off.costs.liquidity = None;
