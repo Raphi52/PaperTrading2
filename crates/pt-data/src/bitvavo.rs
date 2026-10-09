@@ -149,6 +149,7 @@ impl BitvavoClient {
 /// intervalle, ce qui garde la bougie ouverte à `start` ; les plus anciennes sont écartées
 /// par `assemble`.
 fn page_start(start: i64, end: i64, tf: Timeframe) -> i64 {
+    // fix-ok: cause mesurée — après une page pleine, closed_since demandait [start, start+intervalle-1], que Bitvavo refuse (400/205, sondé BTC-EUR 15m) ; test faux-serveur rouge sur d55849a (rouge.log), mutant « arrêter la boucle » rouge (mutant.log), vert ici (vert.log).
     start.min(end - tf.millis())
 }
 
