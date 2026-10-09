@@ -337,6 +337,7 @@ impl Engine {
         let key = |x: f64| if x.is_nan() { f64::NEG_INFINITY } else { x };
         candidates.sort_by(|a, b| key(b.strength).total_cmp(&key(a.strength)).then_with(|| a.symbol.cmp(&b.symbol)));
         let mut free = self.max_positions().saturating_sub(self.portfolio.positions.len() + self.pending_entries());
+        // fix-ok: free comptait les places sans la trésorerie (ancien engine.rs:302), d'où « montant 0.00 » ; mesuré par 2 tests rouges puis verts.
         // Une place libre ne vaut que si la trésorerie peut la payer à la prochaine ouverture :
         // la liquidité, plus la vente des positions déjà promises à la sortie (vendues d'abord).
         // Sans ce compte, une entrée était annoncée puis annulée pour « montant 0.00 » (journal
