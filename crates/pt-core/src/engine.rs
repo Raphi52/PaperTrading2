@@ -337,13 +337,30 @@ impl Engine {
         let key = |x: f64| if x.is_nan() { f64::NEG_INFINITY } else { x };
         candidates.sort_by(|a, b| key(b.strength).total_cmp(&key(a.strength)).then_with(|| a.symbol.cmp(&b.symbol)));
         let mut free = self.max_positions().saturating_sub(self.portfolio.positions.len() + self.pending_entries());
+        // Une place libre ne vaut que si la trésorerie peut la payer à la prochaine ouverture :
+        // la liquidité, plus la vente des positions déjà promises à la sortie (vendues d'abord).
+        // Sans ce compte, une entrée était annoncée puis annulée pour « montant 0.00 » (journal
+        // du 2026-10-09 : 15 681 entrées sur 25 386), et le remplacement n'était jamais tenté.
+        let mut available = self.portfolio.cash
+            + self
+                .portfolio
+                .positions
+                .iter()
+                .filter(|(s, _)| {
+                    matches!(self.states.get(*s).and_then(|st| st.pending.as_ref()), Some(p) if p.kind == PendingKind::Exit)
+                })
+                .map(|(s, p)| p.qty * self.marks.get(s).copied().unwrap_or(p.avg_price))
+                .sum::<f64>();
         let skip = |e: &mut Engine, c: Candidate, why: &str| {
             e.log(c.time, &c.symbol, DecisionKind::Skipped, why, c.price, c.indicators);
         };
         let mut rest = candidates.into_iter();
         while let Some(c) = rest.next() {
-            if free > 0 {
+            if free > 0 && available >= MIN_NOTIONAL {
                 free -= 1;
+                let fill = self.costs.buy_price(c.price);
+                let stop = self.preset.exits.stop.and_then(|d| d.below(fill, c.atr));
+                available -= self.entry_notional(fill, stop).min(available);
                 self.states.get_mut(&c.symbol).expect("état").pending = Some(Pending {
                     kind: PendingKind::Enter,
                     reason: "SIGNAL D'ENTRÉE".into(),
@@ -354,8 +371,13 @@ impl Engine {
                 continue;
             }
             let Some(margin) = self.preset.switch_margin else {
-                skip(self, c, "PLUS DE PLACE");
-                rest.for_each(|c| skip(self, c, "PLUS DE PLACE"));
+                let why = if free > 0 {
+                    format!("PLUS DE TRÉSORERIE (disponible {available:.2} < minimum {MIN_NOTIONAL})")
+                } else {
+                    "PLUS DE PLACE".to_string()
+                };
+                skip(self, c, &why);
+                rest.for_each(|c| skip(self, c, &why));
                 break;
             };
             if c.strength.is_nan() {
@@ -955,6 +977,53 @@ mod tests {
         close_all(&mut e, 1, &[("A", false, 1.0), ("B", true, 50.0), ("C", false, 0.0)]);
         let held: Vec<&String> = e.portfolio.positions.keys().collect();
         assert_eq!(held, ["A"]);
+    }
+
+    /// 10 places, mais chaque position prend 40 % : la trésorerie est vide bien avant
+    /// les places. Journal du direct (2026-10-09) : 15 681 entrées sur 25 386 annoncées
+    /// puis annulées pour « montant 0.00 », parce qu'une place libre était comptée
+    /// sans regarder s'il restait de quoi la payer.
+    fn cash_bound(margin: Option<f64>) -> Engine {
+        let mut p = find("buy_hold").unwrap();
+        p.max_positions = Some(10);
+        p.sizing = Sizing::Fixed { position_pct: 40.0 };
+        p.switch_margin = margin;
+        let syms = ["A", "B", "C", "D", "E"].iter().map(|s| s.to_string()).collect();
+        let mut e = Engine::new(p, syms, 1_000.0, CostModel { fee_rate: 0.0, slippage_bps: 0.0, liquidity: None }, 0);
+        e.record = true;
+        e
+    }
+
+    fn unfunded(e: &Engine) -> Vec<&Decision> {
+        e.decisions.iter().filter(|d| d.reason.starts_with("ENTRÉE ANNULÉE (montant")).collect()
+    }
+
+    #[test]
+    fn an_entry_is_announced_only_if_cash_can_pay_it() {
+        let mut e = cash_bound(None);
+        let sigs = [("A", true, 5.0), ("B", true, 4.0), ("C", true, 3.0), ("D", true, 2.0), ("E", true, 1.0)];
+        close_all(&mut e, 0, &sigs);
+        assert!(unfunded(&e).is_empty(), "entrées annoncées sans trésorerie : {:?}", unfunded(&e));
+        let held: Vec<&String> = e.portfolio.positions.keys().collect();
+        assert_eq!(held, ["A", "B", "C"], "400 + 400 + les 200 restants");
+        let announced = e.decisions.iter().filter(|d| d.kind == DecisionKind::Entry).count();
+        assert_eq!(announced, held.len(), "chaque entrée annoncée est exécutée");
+        let skipped: Vec<&str> =
+            e.decisions.iter().filter(|d| d.kind == DecisionKind::Skipped).map(|d| d.symbol.as_str()).collect();
+        assert_eq!(skipped, ["D", "E"], "les plus faibles sont écartées, au journal");
+    }
+
+    #[test]
+    fn with_no_cash_left_a_stronger_signal_switches_instead_of_being_cancelled() {
+        let mut e = cash_bound(Some(1.0));
+        let first = [("A", true, 3.0), ("B", true, 2.0), ("C", true, 1.0), ("D", false, 0.0), ("E", false, 0.0)];
+        close_all(&mut e, 0, &first);
+        assert!(e.portfolio.cash < MIN_NOTIONAL, "trésorerie vide, 7 places encore libres");
+        let second = [("A", false, 3.0), ("B", false, 2.0), ("C", false, 1.0), ("D", true, 9.0), ("E", false, 0.0)];
+        close_all(&mut e, 1, &second);
+        assert!(unfunded(&e).is_empty(), "entrée annulée au lieu d'un remplacement : {:?}", unfunded(&e));
+        let held: Vec<&String> = e.portfolio.positions.keys().collect();
+        assert_eq!(held, ["A", "B", "D"], "C, la plus faible, vendue pour payer D");
     }
 
     /// Mêmes prix, volumes multipliés par `factor` : seul le carnet change.
