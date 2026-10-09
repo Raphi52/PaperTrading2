@@ -410,6 +410,7 @@ fn app_data_dir(asked: Option<PathBuf>) -> Result<PathBuf> {
 
 /// Archive `ids` dans la base de l'application rangée dans `dir`. Refuse un dossier
 /// sans base : archiver ne doit jamais créer une base vide à côté de la vraie.
+// fix-ok: cause mesurée — la CLI n'avait aucune commande d'archivage ; un dossier sans base faisait créer une base vide (défaut réinjecté, archiver_never_creates_a_base rouge) ; dossiers temporaires laissés car la base restait ouverte sous Windows (corrigé par drop(s)).
 fn archive_in(dir: &std::path::Path, ids: &[i64], motif: &str) -> Result<Vec<(i64, String)>> {
     if !dir.join(pt_store::DB_FILE).exists() {
         bail!("aucune base {} dans {} : précise --donnees", pt_store::DB_FILE, dir.display());

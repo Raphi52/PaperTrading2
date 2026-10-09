@@ -262,6 +262,7 @@ impl Store {
     /// Archive des portefeuilles : inactifs (via `set_active`), motif écrit dans
     /// `last_error`, historique gardé. Tout ou rien : un numéro inconnu ou répété,
     /// un motif vide ou plus de `MAX_ARCHIVE` numéros, et rien n'est écrit.
+    // fix-ok: cause mesurée — aucune commande n'archivait hors de l'interface (enum Cmd sans variante d'archivage, set_active n'écrit pas de motif) ; sans transaction un numéro inconnu archivait quand même les autres (défaut réinjecté, archive_is_all_or_nothing rouge).
     pub fn archive(&mut self, ids: &[i64], reason: &str) -> Result<()> {
         let reason = reason.trim();
         if ids.is_empty() {
