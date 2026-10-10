@@ -38,6 +38,11 @@ pub struct Tick {
 /// (5,00 €) pour les 426 paires EUR ouvertes au négoce le 2026-10-08 (`/v2/markets`).
 pub const MIN_NOTIONAL: f64 = 5.0;
 
+/// En direct, une exécution prévue plus de 5 minutes avant l'instant présent a été manquée :
+/// l'application était fermée. Mesuré le 2026-10-10 sur 4 906 exécutions en marche normale :
+/// 0,86 min au plus entre l'ouverture d'une bougie et son traitement.
+pub const MISSED_AFTER_MS: i64 = 5 * 60_000;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PendingKind {
     Enter,
@@ -313,6 +318,18 @@ impl Engine {
             }
         }
         processed
+    }
+
+    /// [`Engine::advance`] en direct, à l'instant `now` (horloge réelle).
+    pub fn advance_live(
+        &mut self,
+        feeds: &BTreeMap<String, Feed>,
+        ext: &External,
+        now: i64,
+        on_tick: impl FnMut(Tick, &Engine),
+    ) -> usize {
+        let _ = now;
+        self.advance(feeds, ext, on_tick)
     }
 
     fn max_positions(&self) -> usize {
@@ -881,6 +898,116 @@ mod tests {
             .into();
             live.advance(&feeds, &ext, |_, _| {});
             assert_eq!(one.portfolio, live.portfolio, "{id} : le direct diverge du backtest");
+            assert_eq!(one.states, live.states, "{id}");
+            assert!(!one.portfolio.fills.is_empty(), "{id} : aucun trade, test sans valeur");
+        }
+    }
+
+    /// Un vrai bot éteint ne trade pas. Au redémarrage, les bougies manquées sont rejouées
+    /// (indicateurs, état), mais aucune exécution n'est datée pendant la fermeture : ce qui
+    /// tient encore part au prix du moment, à la réouverture.
+    #[test]
+    fn restart_after_closure_never_fills_in_the_past() {
+        use crate::portfolio::Side;
+        const H: i64 = 3_600_000;
+        // 0-51 plates à 100 ; 52 touche 80 (stop à 90) et clôt à 85 ; remontée ; 56 en cours.
+        let mut c: Vec<Candle> = (0..52).map(|i| candle(i, 100.0, 100.0, 100.0, 100.0)).collect();
+        c.push(candle(52, 100.0, 100.0, 80.0, 85.0));
+        c.push(candle(53, 85.0, 95.0, 85.0, 95.0));
+        c.push(candle(54, 95.0, 110.0, 95.0, 110.0));
+        c.push(candle(55, 110.0, 118.0, 110.0, 118.0));
+        let forming = candle(56, 119.0, 120.0, 119.0, 120.0);
+        let ext = External::default();
+
+        // Dernier passage avant la fermeture : 0-49 closes, 50 en cours depuis 30 s.
+        let mut p = find("buy_hold").unwrap();
+        p.exits.stop = Some(Distance::Percent(10.0));
+        let mut e = Engine::new(p, vec!["A".into()], 10_000.0, CostModel::zero(), 49 * H);
+        e.record = true;
+        let last_pass = 50 * H + 30_000;
+        let feeds: BTreeMap<String, Feed> = [("A".to_string(), Feed { closed: &c[..50], forming: Some(&c[50]) })].into();
+        e.advance_live(&feeds, &ext, last_pass, |_, _| {});
+        let first: Vec<_> = e.portfolio.fills.iter().map(|f| (f.side, f.time, f.price)).collect();
+        assert_eq!(first, vec![(Side::Buy, 50 * H, 100.0)], "sans fermeture : à l'ouverture suivante, comme le backtest");
+
+        // Réouverture 20 min après l'ouverture de 56 : 50-55 closes pendant la fermeture.
+        let now = 56 * H + 20 * 60_000;
+        let feeds: BTreeMap<String, Feed> = [("A".to_string(), Feed { closed: &c[..56], forming: Some(&forming) })].into();
+        e.advance_live(&feeds, &ext, now, |_, _| {});
+        for f in &e.portfolio.fills {
+            assert!(!(f.time > last_pass && f.time < now), "exécution datée pendant la fermeture : {f:?}");
+        }
+        let sell = e.portfolio.fills.iter().find(|f| f.side == Side::Sell).expect("stop touché pendant la fermeture");
+        assert_eq!((sell.time, sell.price), (now, 120.0), "vendu au prix du moment, à la réouverture, pas au stop (90)");
+        assert!(
+            e.decisions.iter().any(|d| d.kind == DecisionKind::Exit && d.reason.contains("fermeture")),
+            "le journal dit pourquoi : {:?}",
+            e.decisions
+        );
+
+        // « Acheter et garder » créé pendant la fermeture (entrées permises dès 53).
+        let mut b = Engine::new(find("buy_hold").unwrap(), vec!["A".into()], 10_000.0, CostModel::zero(), 53 * H);
+        b.advance_live(&feeds, &ext, now, |_, _| {});
+        let got: Vec<_> = b.portfolio.fills.iter().map(|f| (f.side, f.time, f.price)).collect();
+        assert_eq!(got, vec![(Side::Buy, now, 120.0)], "un seul achat, au prix du moment, à la réouverture");
+    }
+
+    /// La borne de 5 minutes, des deux côtés : à 5 min pile, l'ordre part normalement à
+    /// l'ouverture ; une milliseconde de plus, il est manqué et part au prix du moment.
+    #[test]
+    fn missed_order_threshold_is_five_minutes() {
+        const H: i64 = 3_600_000;
+        let c: Vec<Candle> = (0..50).map(|i| candle(i, 100.0, 100.0, 100.0, 100.0)).collect();
+        let forming = candle(50, 101.0, 103.0, 101.0, 103.0);
+        let feeds: BTreeMap<String, Feed> = [("A".to_string(), Feed { closed: &c, forming: Some(&forming) })].into();
+        let at_limit = 50 * H + MISSED_AFTER_MS;
+        for (now, expected) in [(at_limit, (50 * H, 101.0)), (at_limit + 1, (at_limit + 1, 103.0))] {
+            let mut e = Engine::new(find("buy_hold").unwrap(), vec!["A".into()], 10_000.0, CostModel::zero(), 49 * H);
+            e.advance_live(&feeds, &External::default(), now, |_, _| {});
+            let got: Vec<_> = e.portfolio.fills.iter().map(|f| (f.time, f.price)).collect();
+            assert_eq!(got, vec![expected], "passage à {} ms de l'ouverture", now - 50 * H);
+        }
+    }
+
+    /// En marche normale (un passage peu après chaque ouverture), le mode direct reste
+    /// EXACTEMENT le backtest d'un bloc : la règle de fermeture ne touche rien d'autre.
+    #[test]
+    fn live_mode_without_closure_matches_backtest() {
+        use crate::testutil::synthetic;
+        const H: i64 = 3_600_000;
+        let a = synthetic(1600, 21);
+        let b: Vec<Candle> = synthetic(1550, 22)
+            .into_iter()
+            .map(|mut c| {
+                c.open_time += 50 * H;
+                c.close_time += 50 * H;
+                c
+            })
+            .collect();
+        let ext = External::default();
+        for id in ["supertrend_7_2_1h", "bollinger_reversion_1h", "dip_buyer_4h", "buy_hold"] {
+            let preset = find(id).unwrap();
+            let syms = vec!["A".to_string(), "B".to_string()];
+            let mut one = Engine::new(preset.clone(), syms.clone(), 10_000.0, CostModel::default(), 200 * H);
+            let all: BTreeMap<String, Feed> = [
+                ("A".to_string(), Feed { closed: &a, forming: None }),
+                ("B".to_string(), Feed { closed: &b, forming: None }),
+            ]
+            .into();
+            one.advance(&all, &ext, |_, _| {});
+
+            let mut live = Engine::new(preset, syms, 10_000.0, CostModel::default(), 200 * H);
+            for ka in 1..=a.len() {
+                let open = a[ka - 1].close_time + 1; // ouverture de la bougie en cours
+                let kb = b.partition_point(|c| c.close_time < open);
+                let feeds: BTreeMap<String, Feed> = [
+                    ("A".to_string(), Feed { closed: &a[..ka], forming: a.get(ka) }),
+                    ("B".to_string(), Feed { closed: &b[..kb], forming: b.get(kb) }),
+                ]
+                .into();
+                live.advance_live(&feeds, &ext, open + 30_000, |_, _| {});
+            }
+            assert_eq!(one.portfolio, live.portfolio, "{id} : sans fermeture, le direct diverge du backtest");
             assert_eq!(one.states, live.states, "{id}");
             assert!(!one.portfolio.fills.is_empty(), "{id} : aucun trade, test sans valeur");
         }
