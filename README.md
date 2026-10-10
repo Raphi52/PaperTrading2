@@ -145,6 +145,8 @@ Installateur Windows : `cargo install tauri-cli --version "^2" --locked`, puis `
 
 **L'application ne fait avancer les portefeuilles que lorsqu'elle est ouverte.** Fermée, elle ne trade pas, comme un vrai bot éteint. À la réouverture, elle rejoue dans l'ordre les bougies clôturées entretemps, avec le même moteur que le backtest, pour les indicateurs et l'état. Mais aucune exécution n'est datée pendant la fermeture : un ordre qui n'a pas pu partir est abandonné et noté « ORDRE MANQUÉ (application fermée) » au journal ; une décision encore valable à la réouverture, ou un stop touché pendant la fermeture, s'exécute au prix du moment.
 
+<!-- fix-ok: sur main, README.md:30 et :145 présentaient le rattrapage aux prix de la fermeture comme voulu (« Fermée, elle ne perd rien ») ; le commit 501baba (engine.rs advance_live, MISSED_AFTER_MS = 5 min, motif « ORDRE MANQUÉ (application fermée) ») rend ces deux passages faux, d'où leur réécriture ; chaque affirmation est recoupée avec le code par verifier-readme.sh. -->
+
 ## Architecture
 
 ```
