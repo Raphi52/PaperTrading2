@@ -174,9 +174,6 @@ pub fn catalog() -> Vec<Preset> {
     v.extend(variants());
     let more = grid(&v);
     v.extend(more);
-    let floored: Vec<Preset> =
-        FEE_FLOORED.iter().filter_map(|id| v.iter().find(|p| p.id == *id)).map(fee_floored).collect();
-    v.extend(floored);
     // Les retours à la moyenne n'achètent que dans une tendance de fond haussière.
     for preset in v.iter_mut() {
         if preset.family == "Retour à la moyenne" {
@@ -613,67 +610,10 @@ fn grid(existing: &[Preset]) -> Vec<Preset> {
     v
 }
 
-/// Plancher des stops des variantes « _plancher », en % du prix : deux allers-retours
-/// de frais, 2 × (2 × 0,25 % + 2 × 2 pb) = 1,08 %, arrondi au dixième supérieur.
-pub const STOP_FLOOR_PCT: f64 = 1.1;
-
-/// Presets 15m de tendance essayés avec ce plancher (registre du 2026-10-10), choisis
-/// pour leurs réglages canoniques, pas pour leurs résultats en direct.
-pub const FEE_FLOORED: [&str; 3] = ["donchian_20_10_15m", "ema_9_21_15m", "supertrend_10_3_15m"];
-
-/// Même stratégie, mais ni le stop initial ni le stop suiveur ne s'approchent à
-/// moins de `STOP_FLOOR_PCT` % du prix.
-fn fee_floored(p: &Preset) -> Preset {
-    let floor = |d: Distance| match d {
-        Distance::Atr(m) => Distance::AtrFloor { atr: m, min_pct: STOP_FLOOR_PCT },
-        other => other,
-    };
-    let pct = STOP_FLOOR_PCT.to_string().replace('.', ",");
-    let mut v = p.clone();
-    v.id = format!("{}_plancher", p.id);
-    v.name = format!("{}, stop ≥ {pct} %", p.name);
-    v.description = format!(
-        "{} Stops jamais à moins de {pct} % du prix (deux allers-retours de frais), même en marché calme.",
-        p.description
-    );
-    v.exits.stop = p.exits.stop.map(floor);
-    v.exits.trailing = p.exits.trailing.map(|t| Trailing { distance: floor(t.distance), ..t });
-    v
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::portfolio::CostModel;
-
-    /// Une variante « _plancher » ne diffère de son original que par le plancher de ses stops.
-    #[test]
-    fn fee_floored_variants_differ_only_by_their_floor() {
-        let all = catalog();
-        let rt = CostModel::default().round_trip();
-        assert!(STOP_FLOOR_PCT / 100.0 >= 2.0 * rt, "le plancher doit couvrir deux allers-retours ({rt})");
-        let back = |d: Distance| match d {
-            Distance::AtrFloor { atr, .. } => Distance::Atr(atr),
-            other => other,
-        };
-        for id in FEE_FLOORED {
-            let o = all.iter().find(|p| p.id == id).expect("original au catalogue");
-            let v = all.iter().find(|p| p.id == format!("{id}_plancher")).expect("variante au catalogue");
-            assert_eq!(v.exits.stop, Some(Distance::AtrFloor { atr: 2.5, min_pct: STOP_FLOOR_PCT }), "{id}");
-            assert_eq!(
-                v.exits.trailing.map(|t| t.distance),
-                Some(Distance::AtrFloor { atr: 3.0, min_pct: STOP_FLOOR_PCT }),
-                "{id} : sans plancher sur le stop suiveur, il remonterait aussitôt au-dessus du plancher"
-            );
-            let mut undone = v.clone();
-            undone.id = o.id.clone();
-            undone.name = o.name.clone();
-            undone.description = o.description.clone();
-            undone.exits.stop = v.exits.stop.map(back);
-            undone.exits.trailing = v.exits.trailing.map(|t| Trailing { distance: back(t.distance), ..t });
-            assert_eq!(&undone, o, "{id} : autre différence que le plancher");
-        }
-    }
 
     #[test]
     fn catalog_is_consistent() {

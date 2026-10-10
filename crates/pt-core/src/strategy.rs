@@ -368,10 +368,6 @@ pub fn compute_signals(rule: &Rule, c: &[Candle], ext: &External, trend_sma: Opt
 pub enum Distance {
     Percent(f64),
     Atr(f64),
-    /// `atr` multiples d'ATR(14), mais jamais plus près que `min_pct` % du prix :
-    /// en marché calme, un stop à quelques ATR peut tomber sous le coût d'un
-    /// aller-retour et vendre sur du bruit. Avec `min_pct` = 0, identique à `Atr`.
-    AtrFloor { atr: f64, min_pct: f64 },
 }
 
 impl Distance {
@@ -383,12 +379,6 @@ impl Distance {
                     return None;
                 }
                 price - m * atr
-            }
-            Distance::AtrFloor { atr: m, min_pct } => {
-                if atr.is_nan() {
-                    return None;
-                }
-                price - (m * atr).max(price * min_pct / 100.0)
             }
         };
         (p > 0.0).then_some(p)
@@ -484,17 +474,6 @@ impl Preset {
                 return Err(format!("{} : stop {p}% trop serré face aux frais", self.id));
             }
         }
-        // Même règle pour un plancher : il n'a de sens que s'il couvre deux allers-retours.
-        for d in [self.exits.stop, self.exits.trailing.map(|t| t.distance)].into_iter().flatten() {
-            if let Distance::AtrFloor { min_pct, .. } = d {
-                if !(min_pct / 100.0 >= 2.0 * round_trip && min_pct < 100.0) {
-                    return Err(format!(
-                        "{} : plancher de stop {min_pct}% hors de [2 allers-retours, 100 %[",
-                        self.id
-                    ));
-                }
-            }
-        }
         if let Some(py) = self.pyramid {
             if py.max_layers == 0 || py.max_layers > 5 {
                 return Err(format!("{} : renforcement non borné", self.id));
@@ -521,60 +500,6 @@ mod tests {
     use super::*;
     use crate::catalog::catalog;
     use crate::testutil::synthetic;
-
-    /// Cas limites du plancher : le plancher décide en marché calme, l'ATR en
-    /// marché agité, frontière exacte, ATR inconnu, plancher de 100 % ou plus.
-    #[test]
-    fn atr_floor_never_stops_closer_than_its_floor() {
-        let f = Distance::AtrFloor { atr: 2.5, min_pct: 1.1 };
-        // 2,5 ATR = 0,5 % du prix < 1,1 % : stop au plancher.
-        assert!((f.below(100.0, 0.2).unwrap() - 98.9).abs() < 1e-9, "{:?}", f.below(100.0, 0.2));
-        // 2,5 ATR = 5 % > 1,1 % : stop à 2,5 ATR, exactement comme `Atr`.
-        assert_eq!(f.below(100.0, 2.0), Distance::Atr(2.5).below(100.0, 2.0));
-        // 2,5 ATR = 1,1 % exactement : même stop des deux côtés de la frontière.
-        assert!((f.below(100.0, 0.44).unwrap() - 98.9).abs() < 1e-9);
-        // ATR encore inconnu (préchauffage) : pas de stop, comme `Atr`.
-        assert_eq!(f.below(100.0, f64::NAN), None);
-        assert_eq!(Distance::Atr(2.5).below(100.0, f64::NAN), None);
-        // Plancher de 100 % ou plus : aucun prix positif, donc aucun stop.
-        assert_eq!(Distance::AtrFloor { atr: 2.5, min_pct: 100.0 }.below(100.0, 0.2), None);
-    }
-
-    /// Jumeau : un plancher nul ne change rien, pour tous les ordres de grandeur.
-    #[test]
-    fn atr_floor_at_zero_is_exactly_atr() {
-        let cases = [(100.0, 0.2), (100.0, 2.0), (0.0069, 0.000027), (73_683.0, 363.67), (5.0, 3.0), (100.0, f64::NAN)];
-        for (price, atr) in cases {
-            for m in [2.0, 2.5, 3.0] {
-                assert_eq!(
-                    Distance::AtrFloor { atr: m, min_pct: 0.0 }.below(price, atr),
-                    Distance::Atr(m).below(price, atr),
-                    "prix {price}, ATR {atr}, {m} ATR"
-                );
-            }
-        }
-    }
-
-    /// Refus et jumeau accepté, à la même borne : deux allers-retours (1,08 % aux frais par défaut).
-    #[test]
-    fn a_stop_floor_under_two_round_trips_is_refused() {
-        let rt = crate::portfolio::CostModel::default().round_trip();
-        let mut p = catalog().into_iter().find(|p| p.id == "ema_9_21_15m").expect("preset 15m");
-        let with = |p: &mut Preset, stop: f64, trail: f64| {
-            p.exits.stop = Some(Distance::AtrFloor { atr: 2.5, min_pct: stop });
-            p.exits.trailing = Some(Trailing { activation_pct: 0.0, distance: Distance::AtrFloor { atr: 3.0, min_pct: trail } });
-        };
-        with(&mut p, 1.1, 1.1);
-        assert!(p.validate(rt).is_ok(), "1,1 % ≥ 2 × {rt}");
-        with(&mut p, 2.0 * rt * 100.0, 99.9);
-        assert!(p.validate(rt).is_ok(), "bornes : 2 allers-retours inclus, 99,9 %");
-        for bad in [1.0, 0.0, -1.0, 100.0, f64::NAN] {
-            with(&mut p, bad, 1.1);
-            assert!(p.validate(rt).unwrap_err().contains("plancher"), "stop {bad}");
-            with(&mut p, 1.1, bad);
-            assert!(p.validate(rt).unwrap_err().contains("plancher"), "stop suiveur {bad}");
-        }
-    }
 
     /// Aucune stratégie ne doit changer d'avis sur le passé quand de nouvelles
     /// bougies arrivent : c'est la garantie « pas de regard vers le futur ».

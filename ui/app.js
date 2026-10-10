@@ -49,7 +49,6 @@ async function call(cmd, args) {
 
 function distance(d) {
   if (!d) return "";
-  if (d.type === "atr_floor") return `${num(d.value.atr, 1)} ATR, au moins ${num(d.value.min_pct, 1)} %`;
   return d.type === "atr" ? `${num(d.value, 1)} ATR` : `${num(d.value, 1)} %`;
 }
 function exitsText(p) {
