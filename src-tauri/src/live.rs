@@ -177,8 +177,9 @@ pub async fn tick(state: &AppState) -> Result<(u64, Vec<String>)> {
             // Journal des décisions : instantané des indicateurs à chaque entrée,
             // sortie et signal écarté, enregistré par `save_progress`.
             p.engine.record = true;
-            let n = p.engine.advance(&feeds, &ext, |_, _| {});
-            p.benchmark.advance(&feeds, &ext, |_, _| {});
+            // Mode direct : au redémarrage, rien n'est exécuté aux prix de la fermeture.
+            let n = p.engine.advance_live(&feeds, &ext, now, |_, _| {});
+            p.benchmark.advance_live(&feeds, &ext, now, |_, _| {});
             total += n as u64;
             p.last_error = None;
             let row = EquityRow {
