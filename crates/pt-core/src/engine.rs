@@ -1084,6 +1084,264 @@ mod tests {
         }
     }
 
+    // --- Bougie suivante pas encore cotée (2026-10-11) ---------------------------------------
+    // Bitvavo ne rend une bougie qu'après son premier échange (`/{market}/candles` : « zero
+    // trades are represented by zero candlesticks »). Mesuré le 2026-10-11 sur 24 h de direct :
+    // 8 191 entrées décidées jamais exécutées, 515 achats de référence en attente.
+
+    const M: i64 = 60_000;
+
+    fn single<'a>(closed: &'a [Candle], forming: Option<&'a Candle>) -> BTreeMap<String, Feed<'a>> {
+        [("A".to_string(), Feed { closed, forming })].into()
+    }
+
+    /// Toutes les cryptos avec la même bougie en cours, sauf `quiet` (pas encore d'échange).
+    fn basket<'a>(syms: &[String], closed: &'a [Candle], next: &'a Candle, quiet: Option<&str>) -> BTreeMap<String, Feed<'a>> {
+        syms.iter().map(|s| (s.clone(), Feed { closed, forming: (Some(s.as_str()) != quiet).then_some(next) })).collect()
+    }
+
+    /// Une heure sur 7 sans aucun échange (bougie absente).
+    fn gapped(n: usize, seed: u64, shift_h: i64) -> Vec<Candle> {
+        crate::testutil::synthetic(n, seed)
+            .into_iter()
+            .map(|mut c| {
+                c.open_time += shift_h * 3_600_000;
+                c.close_time += shift_h * 3_600_000;
+                c
+            })
+            .filter(|c| c.open_time == shift_h * 3_600_000 || (c.open_time / 3_600_000) % 7 != 3)
+            .collect()
+    }
+
+    /// Ce que Bitvavo montre à `now` : les bougies closes, et la bougie en cours seulement
+    /// après son premier échange — 7 min après l'ouverture pour une heure sur 11.
+    fn seen_at(s: &[Candle], now: i64) -> (usize, Option<&Candle>) {
+        let k = s.partition_point(|c| c.close_time < now);
+        let forming = s.get(k).filter(|c| {
+            let first_trade = c.open_time + if (c.open_time / 3_600_000) % 11 == 5 { 7 * M } else { 0 };
+            first_trade <= now
+        });
+        (k, forming)
+    }
+
+    /// Passages d'une application allumée : toutes les 30 s pendant les 10 premières minutes
+    /// de chaque heure, puis toutes les 4 min. Jamais plus de 5 min entre deux passages.
+    fn running_passes(first: i64, last: i64) -> Vec<i64> {
+        let mut v = Vec::new();
+        let mut h = first - first.rem_euclid(3_600_000);
+        while h <= last {
+            v.extend((1..=20).map(|j| h + j * 30_000));
+            v.extend((1..=12).map(|j| h + 10 * M + j * 4 * M));
+            h += 3_600_000;
+        }
+        v
+    }
+
+    /// Une seule crypto, des heures sans échange, des premiers échanges tardifs : le direct
+    /// (avec horloge, application allumée) et l'avance par morceaux (sans horloge) doivent
+    /// rendre EXACTEMENT le backtest d'un bloc. Aujourd'hui, un ordre décidé avant une heure
+    /// sans échange est sauté puis écrasé.
+    #[test]
+    fn gapped_feed_live_equals_one_shot_backtest() {
+        let a = gapped(1600, 21, 0);
+        assert!(a.len() < 1500, "des heures sans échange : {}", a.len());
+        let ext = External::default();
+        for id in ["supertrend_7_2_1h", "bollinger_reversion_1h", "dip_buyer_4h", "buy_hold"] {
+            let preset = find(id).unwrap();
+            let syms = vec!["A".to_string()];
+            let mut one = Engine::new(preset.clone(), syms.clone(), 10_000.0, CostModel::default(), 200 * 3_600_000);
+            let all: BTreeMap<String, Feed> = [("A".to_string(), Feed { closed: &a, forming: None })].into();
+            one.advance(&all, &ext, |_, _| {});
+
+            let mut live = Engine::new(preset.clone(), syms.clone(), 10_000.0, CostModel::default(), 200 * 3_600_000);
+            let mut plain = Engine::new(preset, syms, 10_000.0, CostModel::default(), 200 * 3_600_000);
+            let mut waited = 0;
+            for now in running_passes(a[0].open_time, a.last().unwrap().close_time) {
+                let (k, forming) = seen_at(&a, now);
+                let feeds: BTreeMap<String, Feed> = [("A".to_string(), Feed { closed: &a[..k], forming })].into();
+                live.advance_live(&feeds, &ext, now, |_, _| {});
+                plain.advance(&feeds, &ext, |_, _| {});
+                if forming.is_none() && live.states["A"].pending.is_some() {
+                    waited += 1;
+                }
+            }
+            let end = a.last().unwrap().close_time + 30_000;
+            live.advance_live(&all, &ext, end, |_, _| {});
+            plain.advance(&all, &ext, |_, _| {});
+            assert!(waited > 0, "{id} : aucun ordre n'a attendu sa bougie suivante, test sans valeur");
+            assert!(!one.portfolio.fills.is_empty(), "{id} : aucun trade, test sans valeur");
+            assert_eq!(one.portfolio, plain.portfolio, "{id} : par morceaux, des ordres en attente sont perdus");
+            assert_eq!(one.states, plain.states, "{id}");
+            assert_eq!(one.portfolio, live.portfolio, "{id} : en direct, des ordres en attente sont perdus");
+            assert_eq!(one.states, live.states, "{id}");
+        }
+    }
+
+    /// Plusieurs cryptos aux trous différents : sans connaître les prix futurs, le direct ne
+    /// peut pas dépenser la trésorerie dans l'ordre du backtest (qui exécute un ordre à
+    /// l'ouverture suivante AVANT les bougies des autres cryptos de l'heure sans échange) ;
+    /// les quantités peuvent donc différer. Mais ce sont les MÊMES ordres : crypto, sens,
+    /// heure et prix.
+    #[test]
+    fn gapped_multi_symbol_live_has_same_orders_as_backtest() {
+        let a = gapped(1600, 21, 0);
+        let b = gapped(1550, 22, 50);
+        let ext = External::default();
+        let key = |e: &Engine| -> Vec<(String, crate::portfolio::Side, i64, u64)> {
+            e.portfolio.fills.iter().map(|f| (f.symbol.clone(), f.side, f.time, f.price.to_bits())).collect()
+        };
+        for id in ["supertrend_7_2_1h", "bollinger_reversion_1h", "dip_buyer_4h", "buy_hold"] {
+            let preset = find(id).unwrap();
+            let syms = vec!["A".to_string(), "B".to_string()];
+            let mut one = Engine::new(preset.clone(), syms.clone(), 10_000.0, CostModel::zero(), 200 * 3_600_000);
+            let all: BTreeMap<String, Feed> = [
+                ("A".to_string(), Feed { closed: &a, forming: None }),
+                ("B".to_string(), Feed { closed: &b, forming: None }),
+            ]
+            .into();
+            one.advance(&all, &ext, |_, _| {});
+
+            let mut live = Engine::new(preset, syms, 10_000.0, CostModel::zero(), 200 * 3_600_000);
+            for now in running_passes(a[0].open_time, a.last().unwrap().close_time) {
+                let (ka, fa) = seen_at(&a, now);
+                let (kb, fb) = seen_at(&b, now);
+                let feeds: BTreeMap<String, Feed> = [
+                    ("A".to_string(), Feed { closed: &a[..ka], forming: fa }),
+                    ("B".to_string(), Feed { closed: &b[..kb], forming: fb }),
+                ]
+                .into();
+                live.advance_live(&feeds, &ext, now, |_, _| {});
+            }
+            live.advance_live(&all, &ext, a.last().unwrap().close_time + 30_000, |_, _| {});
+            assert!(!one.portfolio.fills.is_empty(), "{id} : aucun trade, test sans valeur");
+            assert_eq!(key(&one), key(&live), "{id} : le direct n'a pas passé les ordres du backtest");
+        }
+    }
+
+    /// Premier passage : bougie de décision close, aucune bougie en cours (pas encore
+    /// d'échange). Second passage : la bougie en cours existe. L'entrée part à son ouverture.
+    #[test]
+    fn entry_waits_for_first_trade_of_next_bar() {
+        const H: i64 = 3_600_000;
+        let c: Vec<Candle> = (0..50).map(|i| candle(i, 100.0, 100.0, 100.0, 100.0)).collect();
+        let next = candle(50, 101.0, 103.0, 101.0, 103.0);
+        let ext = External::default();
+        let mut e = Engine::new(find("buy_hold").unwrap(), vec!["A".into()], 10_000.0, CostModel::zero(), 49 * H);
+        e.advance(&single(&c, None), &ext, |_, _| {});
+        assert!(e.portfolio.fills.is_empty(), "rien avant la bougie suivante");
+        e.advance(&single(&c, Some(&next)), &ext, |_, _| {});
+        let got: Vec<_> = e.portfolio.fills.iter().map(|f| (f.time, f.price)).collect();
+        assert_eq!(got, vec![(50 * H, 101.0)], "à l'ouverture de la première bougie qui existe");
+    }
+
+    /// La bougie qui suit la décision arrive déjà close au passage suivant (premier échange
+    /// juste avant sa clôture). L'ordre part à son ouverture, AVANT la décision de sa clôture,
+    /// comme dans le backtest d'un bloc ; aujourd'hui la clôture le remplace sans l'exécuter.
+    #[test]
+    fn pending_order_fills_before_next_close_overwrites_it() {
+        const H: i64 = 3_600_000;
+        let mut c: Vec<Candle> = (0..50).map(|i| candle(i, 100.0, 100.0, 100.0, 100.0)).collect();
+        c.extend((50..53).map(|i| candle(i, 51.0 + i as f64, 51.5 + i as f64, 50.5 + i as f64, 51.0 + i as f64)));
+        let mut p = find("buy_hold").unwrap();
+        p.exits.max_bars = Some(2);
+        let ext = External::default();
+        let mut e = Engine::new(p.clone(), vec!["A".into()], 10_000.0, CostModel::zero(), 49 * H);
+        e.record = true;
+        e.advance(&single(&c[..50], Some(&c[50])), &ext, |_, _| {}); // achat à 50H
+        e.advance(&single(&c[..52], None), &ext, |_, _| {}); // DURÉE MAX à la clôture de 51, rien de coté
+        assert!(e.states["A"].pending.as_ref().is_some_and(|q| q.kind == PendingKind::Exit));
+        e.advance(&single(&c[..53], None), &ext, |_, _| {}); // 52 arrive déjà close
+        let sell = e.portfolio.fills.iter().find(|f| f.side == crate::portfolio::Side::Sell);
+        assert_eq!(
+            sell.map(|f| (f.time, f.price, f.reason.as_str())),
+            Some((52 * H, 103.0, "DURÉE MAX (2 bougies)")),
+            "vendu à l'ouverture de 52, avec le motif de la décision d'origine"
+        );
+        let mut one = Engine::new(p, vec!["A".into()], 10_000.0, CostModel::zero(), 49 * H);
+        one.advance(&single(&c[..53], None), &ext, |_, _| {});
+        assert_eq!(one.portfolio, e.portfolio, "comme le backtest d'un bloc");
+        assert_eq!(one.states, e.states);
+        let after_sell = e.decisions.iter().any(|d| d.time == c[52].close_time && d.kind == DecisionKind::Entry);
+        assert!(after_sell, "la clôture de 52 décide à nouveau, après la vente : {:?}", e.decisions);
+    }
+
+    /// « Acheter et garder » sur 5 cryptos : la cinquième n'a pas encore d'échange au passage
+    /// qui suit la décision. Elle est achetée au passage suivant ; la référence est investie.
+    #[test]
+    fn buy_and_hold_fills_every_symbol_after_late_first_trade() {
+        const H: i64 = 3_600_000;
+        let c: Vec<Candle> = (0..50).map(|i| candle(i, 100.0, 100.0, 100.0, 100.0)).collect();
+        let next = candle(50, 101.0, 101.0, 101.0, 101.0);
+        let syms: Vec<String> = ["A", "B", "C", "D", "E"].iter().map(|s| s.to_string()).collect();
+        let ext = External::default();
+        let mut e = Engine::new(find("buy_hold").unwrap(), syms.clone(), 10_000.0, CostModel::zero(), 49 * H);
+        e.advance_live(&basket(&syms, &c, &next, Some("E")), &ext, 50 * H + 30_000, |_, _| {});
+        assert_eq!(e.portfolio.positions.len(), 4);
+        e.advance_live(&basket(&syms, &c, &next, None), &ext, 50 * H + 60_000, |_, _| {});
+        assert_eq!(e.portfolio.positions.len(), 5, "la référence doit tenir les 5 cryptos");
+        let fill = e.portfolio.fills.iter().find(|f| f.symbol == "E").expect("E achetée");
+        assert_eq!((fill.time, fill.price), (50 * H, 101.0));
+    }
+
+    /// Application allumée (un passage toutes les 30 s), marché calme : le premier échange
+    /// de la bougie suivante arrive 7 min après son ouverture. Ce n'est PAS une fermeture :
+    /// l'ordre part à l'ouverture, sans « réouverture » ni « ORDRE MANQUÉ » au journal.
+    #[test]
+    fn quiet_market_first_trade_after_seven_minutes_is_not_a_closure() {
+        const H: i64 = 3_600_000;
+        let c: Vec<Candle> = (0..50).map(|i| candle(i, 100.0, 100.0, 100.0, 100.0)).collect();
+        let next = candle(50, 101.0, 103.0, 101.0, 103.0);
+        let ext = External::default();
+        let mut e = Engine::new(find("buy_hold").unwrap(), vec!["A".into()], 10_000.0, CostModel::zero(), 49 * H);
+        e.record = true;
+        let mut now = 50 * H + 30_000;
+        while now <= 50 * H + 7 * M + 30_000 {
+            let forming = (now >= 50 * H + 7 * M).then_some(&next);
+            e.advance_live(&single(&c, forming), &ext, now, |_, _| {});
+            now += 30_000;
+        }
+        let got: Vec<_> = e.portfolio.fills.iter().map(|f| (f.time, f.price, f.reason.clone())).collect();
+        assert_eq!(got, vec![(50 * H, 101.0, "SIGNAL D'ENTRÉE".to_string())], "à l'ouverture, pas au prix du moment");
+        assert!(
+            e.decisions.iter().all(|d| !d.reason.contains("réouverture") && !d.reason.contains("MANQUÉ")),
+            "{:?}",
+            e.decisions
+        );
+    }
+
+    /// Un ordre en attente enregistré avant cette correction (état JSON sans le dernier
+    /// passage), puis une vraie fermeture de 2 h : il ne part jamais à un prix passé, et le
+    /// journal dit ce qu'il est devenu à l'heure où il devait partir (aujourd'hui : écrasé
+    /// à la clôture suivante, sans trace).
+    #[test]
+    fn old_saved_pending_after_real_closure_never_fills_in_the_past() {
+        const H: i64 = 3_600_000;
+        let mut c: Vec<Candle> = (0..50).map(|i| candle(i, 100.0, 100.0, 100.0, 100.0)).collect();
+        c.push(candle(50, 101.0, 101.0, 101.0, 101.0));
+        c.push(candle(51, 102.0, 102.0, 102.0, 102.0));
+        let forming = candle(52, 110.0, 120.0, 110.0, 120.0);
+        let ext = External::default();
+        let mut e = Engine::new(find("buy_hold").unwrap(), vec!["A".into()], 10_000.0, CostModel::zero(), 49 * H);
+        let last_pass = 50 * H + 30_000;
+        e.advance_live(&single(&c[..50], None), &ext, last_pass, |_, _| {});
+        assert!(e.states["A"].pending.is_some(), "ordre en attente à l'enregistrement");
+
+        let mut saved = serde_json::to_value(&e).unwrap();
+        let had = saved.as_object_mut().unwrap().remove("last_live_pass").is_some();
+        let mut e: Engine = serde_json::from_value(saved).expect("l'ancien format se relit");
+        e.record = true;
+        let now = 52 * H + 20 * M;
+        e.advance_live(&single(&c[..52], Some(&forming)), &ext, now, |_, _| {});
+        for f in &e.portfolio.fills {
+            assert!(!(f.time > last_pass && f.time < now), "exécution datée pendant la fermeture : {f:?}");
+        }
+        let trace = e.decisions.iter().any(|d| d.time == 50 * H && d.kind == DecisionKind::Skipped && d.reason.contains("ORDRE MANQUÉ"));
+        assert!(trace, "l'ordre prévu à 50H est noté manqué : {:?}", e.decisions);
+        assert_eq!(e.portfolio.fills.len(), 1, "un seul achat, au prix du moment");
+        assert_eq!((e.portfolio.fills[0].time, e.portfolio.fills[0].price), (now, 120.0));
+        assert!(had, "le dernier passage est bien enregistré dans le nouveau format");
+    }
+
     #[test]
     fn replaying_a_bar_is_a_no_op() {
         let mut e = stop_engine(5.0, None);
