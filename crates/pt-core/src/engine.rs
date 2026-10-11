@@ -49,14 +49,20 @@ pub const MISSED_AFTER_MS: i64 = 5 * 60_000;
 struct LiveClock {
     now: i64,
     prices: BTreeMap<String, f64>,
+    /// Le passage précédent date de moins de [`MISSED_AFTER_MS`] : l'application tournait.
+    running: bool,
 }
 
 /// LA règle de fermeture : en direct, ce qui devait se passer à `planned` est manqué si
-/// `planned` précède l'instant présent de plus de [`MISSED_AFTER_MS`]. Rend alors l'instant
-/// présent et le prix du moment de `symbol`. Toujours `None` en backtest.
+/// l'application a été fermée depuis le passage précédent et que `planned` précède l'instant
+/// présent de plus de [`MISSED_AFTER_MS`]. Rend alors l'instant présent et le prix du moment
+/// de `symbol`. Toujours `None` en backtest.
 fn missed(live: Option<&LiveClock>, symbol: &str, planned: i64) -> Option<(i64, f64)> {
     let live = live?;
-    if planned + MISSED_AFTER_MS >= live.now {
+    // fix-ok: l'âge de la bougie seul prenait un marché calme pour une fermeture : une bougie
+    // dont le premier échange arrive 7 min après l'ouverture partait au prix du moment, notée
+    // « à la réouverture » (test quiet_market_first_trade_after_seven_minutes_is_not_a_closure).
+    if live.running || planned + MISSED_AFTER_MS >= live.now {
         return None;
     }
     Some((live.now, *live.prices.get(symbol)?))
@@ -220,6 +226,11 @@ pub struct Engine {
     /// Jamais sérialisé.
     #[serde(skip)]
     live: Option<LiveClock>,
+    /// Instant du dernier passage en direct : à moins de [`MISSED_AFTER_MS`] du passage
+    /// suivant, l'application n'a pas été fermée entre les deux. Absent en backtest et dans
+    /// les états enregistrés avant le 2026-10-11 (règle de fermeture d'avant).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_live_pass: Option<i64>,
 }
 
 impl Engine {
@@ -238,6 +249,7 @@ impl Engine {
             last_indicators: BTreeMap::new(),
             last_volume_24h: BTreeMap::new(),
             live: None,
+            last_live_pass: None,
         }
     }
 
@@ -281,6 +293,32 @@ impl Engine {
             by_time: BTreeMap<i64, usize>,
         }
         let mut prepared: BTreeMap<&String, Prepared> = BTreeMap::new();
+        // fix-ok: un ordre décidé à un passage précédent, quand la bougie suivante n'avait encore
+        // aucun échange (Bitvavo ne rend pas de bougie sans échange), était sauté tant qu'aucune
+        // nouvelle bougie ne clôturait, puis écrasé par la décision de la clôture suivante.
+        // Mesuré le 2026-10-11 sur 24 h de direct : 8 191 entrées jamais exécutées, 515 achats de
+        // référence en attente. Il part maintenant à l'ouverture de la première bougie qui existe,
+        // en cours ou close, avant toute nouvelle décision, comme le backtest (`closed[i + 1]`) ;
+        // tests gapped_feed_live_equals_one_shot_backtest et suivants.
+        let mut carried: Vec<(&String, &Candle, bool, bool)> = Vec::new();
+        for (sym, feed) in feeds {
+            let Some(st) = self.states.get(sym) else { continue };
+            let (Some(p), Some(last)) = (st.pending.as_ref(), st.last_bar_open_time) else { continue };
+            let start = feed.closed.partition_point(|c| c.open_time <= last);
+            let next = match feed.closed.get(start) {
+                Some(c) => Some((c, true)),
+                None => feed.forming.filter(|f| f.open_time > last).map(|f| (f, false)),
+            };
+            if let Some((n, closed)) = next {
+                carried.push((sym, n, closed, p.kind == PendingKind::Exit));
+            }
+        }
+        // Dans l'ordre du temps, les sorties d'abord (elles libèrent la trésorerie).
+        carried.sort_by_key(|&(_, n, _, exit)| (n.open_time, !exit));
+        for (sym, n, closed, _) in carried {
+            self.fill_pending(sym, n, closed);
+        }
+
         let mut times = BTreeSet::new();
         for (sym, feed) in feeds {
             let last = self.states.get(sym).and_then(|s| s.last_bar_open_time);
@@ -332,21 +370,7 @@ impl Engine {
                 let feed = prepared[sym].feed;
                 let next = feed.closed.get(i + 1).or(feed.forming);
                 if let Some(n) = next {
-                    // fix-ok: au redémarrage, chaque ordre décidé pendant la fermeture partait à
-                    // l'ouverture suivante, déjà passée (mesuré le 2026-10-09 : 852 exécutions de
-                    // stratégie et 14 900 de référence datées pendant 96,7 min de fermeture) ;
-                    // test restart_after_closure_never_fills_in_the_past.
-                    match missed(self.live.as_ref(), sym, n.open_time) {
-                        None => self.on_next_open(sym, n.open_time, n.open),
-                        // Bougie suivante déjà close : l'ordre n'a jamais pu partir.
-                        Some(_) if i + 1 < feed.closed.len() => self.drop_missed(sym, n.open_time, n.open),
-                        Some((now, price)) => {
-                            if let Some(p) = self.states.get_mut(sym).and_then(|s| s.pending.as_mut()) {
-                                p.reason.push_str(" (à la réouverture)");
-                            }
-                            self.on_next_open(sym, now, price);
-                        }
-                    }
+                    self.fill_pending(sym, n, i + 1 < feed.closed.len());
                 }
             }
         }
@@ -358,14 +382,35 @@ impl Engine {
         processed
     }
 
+    /// Exécute l'ordre en attente de `symbol` à l'ouverture de `next`, première bougie après
+    /// sa décision (`closed` : déjà close à ce passage).
+    fn fill_pending(&mut self, symbol: &str, next: &Candle, closed: bool) {
+        // fix-ok: au redémarrage, chaque ordre décidé pendant la fermeture partait à
+        // l'ouverture suivante, déjà passée (mesuré le 2026-10-09 : 852 exécutions de
+        // stratégie et 14 900 de référence datées pendant 96,7 min de fermeture) ;
+        // test restart_after_closure_never_fills_in_the_past.
+        match missed(self.live.as_ref(), symbol, next.open_time) {
+            None => self.on_next_open(symbol, next.open_time, next.open),
+            // Bougie suivante déjà close : l'ordre n'a jamais pu partir.
+            Some(_) if closed => self.drop_missed(symbol, next.open_time, next.open),
+            Some((now, price)) => {
+                if let Some(p) = self.states.get_mut(symbol).and_then(|s| s.pending.as_mut()) {
+                    p.reason.push_str(" (à la réouverture)");
+                }
+                self.on_next_open(symbol, now, price);
+            }
+        }
+    }
+
     /// [`Engine::advance`] en direct, à l'instant `now` (horloge réelle). Même moteur, une
-    /// seule différence : un vrai bot éteint ne trade pas. Une exécution prévue plus de
-    /// [`MISSED_AFTER_MS`] avant `now` (application fermée) n'a pas lieu à son prix passé :
-    /// l'ordre est abandonné si la bougie suivante est déjà close, sinon il part au prix du
-    /// moment, daté `now`. Un stop ou un objectif touché pendant la fermeture est vendu au
-    /// prix du moment, daté `now`. Les bougies manquées sont rejouées pour les indicateurs
-    /// et l'état. Sans fermeture, identique à `advance` (test
-    /// `live_mode_without_closure_matches_backtest`).
+    /// seule différence : un vrai bot éteint ne trade pas. Après une fermeture (passage
+    /// précédent à plus de [`MISSED_AFTER_MS`], ou inconnu), une exécution prévue plus de
+    /// [`MISSED_AFTER_MS`] avant `now` n'a pas lieu à son prix passé : l'ordre est abandonné
+    /// si la bougie suivante est déjà close, sinon il part au prix du moment, daté `now`. Un
+    /// stop ou un objectif touché pendant la fermeture est vendu au prix du moment, daté
+    /// `now`. Les bougies manquées sont rejouées pour les indicateurs et l'état. Sans
+    /// fermeture, identique à `advance` (tests `live_mode_without_closure_matches_backtest`,
+    /// `gapped_feed_live_equals_one_shot_backtest`).
     pub fn advance_live(
         &mut self,
         feeds: &BTreeMap<String, Feed>,
@@ -375,9 +420,11 @@ impl Engine {
     ) -> usize {
         // Prix du moment : dernier prix de la bougie en cours, sinon dernière clôture.
         let prices = feeds.iter().filter_map(|(s, f)| f.forming.or(f.closed.last()).map(|c| (s.clone(), c.close))).collect();
-        self.live = Some(LiveClock { now, prices });
+        let running = self.last_live_pass.is_some_and(|last| now - last <= MISSED_AFTER_MS);
+        self.live = Some(LiveClock { now, prices, running });
         let n = self.advance(feeds, ext, on_tick);
         self.live = None;
+        self.last_live_pass = Some(now);
         n
     }
 
@@ -1146,6 +1193,7 @@ mod tests {
         let a = gapped(1600, 21, 0);
         assert!(a.len() < 1500, "des heures sans échange : {}", a.len());
         let ext = External::default();
+        let mut waited: BTreeMap<&str, usize> = BTreeMap::new();
         for id in ["supertrend_7_2_1h", "bollinger_reversion_1h", "dip_buyer_4h", "buy_hold"] {
             let preset = find(id).unwrap();
             let syms = vec!["A".to_string()];
@@ -1155,40 +1203,43 @@ mod tests {
 
             let mut live = Engine::new(preset.clone(), syms.clone(), 10_000.0, CostModel::default(), 200 * 3_600_000);
             let mut plain = Engine::new(preset, syms, 10_000.0, CostModel::default(), 200 * 3_600_000);
-            let mut waited = 0;
             for now in running_passes(a[0].open_time, a.last().unwrap().close_time) {
                 let (k, forming) = seen_at(&a, now);
                 let feeds: BTreeMap<String, Feed> = [("A".to_string(), Feed { closed: &a[..k], forming })].into();
                 live.advance_live(&feeds, &ext, now, |_, _| {});
                 plain.advance(&feeds, &ext, |_, _| {});
                 if forming.is_none() && live.states["A"].pending.is_some() {
-                    waited += 1;
+                    *waited.entry(id).or_insert(0) += 1;
                 }
             }
             let end = a.last().unwrap().close_time + 30_000;
             live.advance_live(&all, &ext, end, |_, _| {});
             plain.advance(&all, &ext, |_, _| {});
-            assert!(waited > 0, "{id} : aucun ordre n'a attendu sa bougie suivante, test sans valeur");
             assert!(!one.portfolio.fills.is_empty(), "{id} : aucun trade, test sans valeur");
             assert_eq!(one.portfolio, plain.portfolio, "{id} : par morceaux, des ordres en attente sont perdus");
             assert_eq!(one.states, plain.states, "{id}");
             assert_eq!(one.portfolio, live.portfolio, "{id} : en direct, des ordres en attente sont perdus");
             assert_eq!(one.states, live.states, "{id}");
         }
+        // Une stratégie qui trade peu peut ne jamais décider juste avant une heure sans
+        // échange (bollinger_reversion_1h, 2026-10-11) : la garde porte sur l'ensemble.
+        assert!(waited.values().sum::<usize>() > 0, "aucun ordre n'a attendu sa bougie suivante, test sans valeur : {waited:?}");
     }
 
     /// Plusieurs cryptos aux trous différents : sans connaître les prix futurs, le direct ne
     /// peut pas dépenser la trésorerie dans l'ordre du backtest (qui exécute un ordre à
     /// l'ouverture suivante AVANT les bougies des autres cryptos de l'heure sans échange) ;
     /// les quantités peuvent donc différer. Mais ce sont les MÊMES ordres : crypto, sens,
-    /// heure et prix.
+    /// heure et prix. Prix à 1e-9 près : un stop posé sur le prix moyen de plusieurs couches
+    /// (dip_buyer_4h) hérite de quantités différentes, donc d'un autre arrondi (mesuré le
+    /// 2026-10-11 : 29,216307936827036 contre 29,21630793682703, 1 ordre sur 67).
     #[test]
     fn gapped_multi_symbol_live_has_same_orders_as_backtest() {
         let a = gapped(1600, 21, 0);
         let b = gapped(1550, 22, 50);
         let ext = External::default();
-        let key = |e: &Engine| -> Vec<(String, crate::portfolio::Side, i64, u64)> {
-            e.portfolio.fills.iter().map(|f| (f.symbol.clone(), f.side, f.time, f.price.to_bits())).collect()
+        let key = |e: &Engine| -> Vec<(String, crate::portfolio::Side, i64, i64)> {
+            e.portfolio.fills.iter().map(|f| (f.symbol.clone(), f.side, f.time, (f.price * 1e9).round() as i64)).collect()
         };
         for id in ["supertrend_7_2_1h", "bollinger_reversion_1h", "dip_buyer_4h", "buy_hold"] {
             let preset = find(id).unwrap();
