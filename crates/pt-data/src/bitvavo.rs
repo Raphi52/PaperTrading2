@@ -9,10 +9,15 @@
 //! identifiant de marché Bitvavo (`BTC-EUR`).
 //!
 //! Comportements de l'API mesurés le 2026-10-08 (`/v2/{marché}/candles`) :
-//! - au plus 1 000 bougies par requête (`limit` plus grand : refus 400) ;
+//! - au plus 1 000 bougies par requête (`limit` plus grand : refus 400). Le 2026-10-11,
+//!   1 001, 1 440 et 1 441 ont été acceptés ; le client reste à 1 000 (`MAX_LIMIT`) ;
 //! - les bougies arrivent de la plus RÉCENTE à la plus ancienne ;
 //! - la réponse rend toujours les `limit` bougies les plus récentes de la période
 //!   demandée : on remonte donc le temps en déplaçant la fin de période (`end`) ;
+//! - (sondé le 2026-10-09 et le 2026-10-11) une bougie close n'est rendue que si
+//!   `start ≤ ouverture` et `ouverture + durée ≤ end` ; la bougie en cours, si
+//!   `start ≤ ouverture ≤ end` ; une fenêtre où aucune ne peut l'être est refusée
+//!   (400, errorCode 205) ; un créneau sans échange n'est pas rendu ;
 //! - une bougie n'a pas d'heure de clôture : elle vaut ouverture + durée − 1 ms ;
 //! - prix et volumes arrivent en texte.
 
@@ -110,20 +115,37 @@ impl BitvavoClient {
     }
 
     /// `closed_since` vu à l'heure `now` (les tests sans réseau fixent l'heure).
+    ///
+    /// Bitvavo ne rend une bougie close que si `start ≤ ouverture` et `ouverture + Q ≤ end`
+    /// (Q = durée d'une bougie), et refuse (400, errorCode 205) une fenêtre où aucune ne
+    /// peut l'être. Après une page pleine dont la plus ancienne ouverture est F, la page
+    /// suivante se termine donc à F (elle rend F − Q), et la lecture s'arrête dès que
+    /// F − Q < `start` : il ne reste aucun créneau entier à lire.
     async fn closed_until(&self, symbol: &str, tf: Timeframe, start_ms: i64, now: i64) -> Result<Vec<Candle>> {
+        let q = tf.millis();
         let start = start_ms.max(FIRST_CANDLE_MS);
+        // Premier créneau entier à partir de `start`. S'il n'est pas clos à `now`, aucune
+        // bougie close n'existe ; `[start, now]` serait même refusée si `start` tombe dans
+        // la bougie en cours sans être aligné.
+        let first_slot = start.div_euclid(q) * q + if start.rem_euclid(q) == 0 { 0 } else { q };
+        if first_slot + q > now {
+            return Ok(Vec::new());
+        }
         let mut pages: Vec<Vec<Candle>> = Vec::new();
         let mut end = now;
         while end >= start {
-            let batch = self.candles(symbol, tf, Some(page_start(start, end, tf)), Some(end), MAX_LIMIT).await?;
+            let batch = self.candles(symbol, tf, Some(start), Some(end), MAX_LIMIT).await?;
             let Some(first) = batch.first().copied() else { break };
             let full = batch.len() == MAX_LIMIT;
             pages.push(batch);
+            // fix-ok: cause mesurée — la page suivante finissait à `F − 1` ; Bitvavo ne rendant une bougie close que si ouverture + Q ≤ end, la bougie F − Q était perdue à chaque raccord (cache BTCEUR_15m : 196 trous alignés sur les pages de 1 000 ; BTC-EUR 15m réel avant correction : 2 créneaux absents sur 2 600, tous deux détenus par Bitvavo, reseau-rouge-ffadd6f.log). La fenêtre de 21e2f5a, [S−1, S+Q−1], est refusée (400/205) par le vrai Bitvavo. Rouge sur d55849a et 21e2f5a, vert ici (preuves/2026-10-11-pagination/).
             // Page incomplète : la période est épuisée (ou la paire n'était pas encore cotée).
-            if !full || first.open_time <= start || first.open_time > end {
+            // `>=` et non plus `>` : `end` ne recule plus de lui-même, une réponse
+            // anormale (F = end) ferait boucler.
+            if !full || first.open_time - q < start || first.open_time >= end {
                 break;
             }
-            end = first.open_time - 1;
+            end = first.open_time;
         }
         Ok(assemble(pages, start_ms, now))
     }
@@ -146,18 +168,7 @@ impl BitvavoClient {
     }
 }
 
-/// Début demandé pour une page `[start, end]` : Bitvavo refuse (400, errorCode 205) une
-/// fenêtre plus étroite qu'un intervalle (sondé le 2026-10-09 sur BTC-EUR 15m :
-/// `[t, t+899999]` refusé, `[t, t+900000]` accepté). C'est le cas après une page pleine qui
-/// s'arrête une bougie après `start`. Le début est alors reculé d'assez pour couvrir un
-/// intervalle, ce qui garde la bougie ouverte à `start` ; les plus anciennes sont écartées
-/// par `assemble`.
-fn page_start(start: i64, end: i64, tf: Timeframe) -> i64 {
-    // fix-ok: cause mesurée — après une page pleine, closed_since demandait [start, start+intervalle-1], que Bitvavo refuse (400/205, sondé BTC-EUR 15m) ; test faux-serveur rouge sur d55849a (rouge.log), mutant « arrêter la boucle » rouge (mutant.log), vert ici (vert.log).
-    start.min(end - tf.millis())
-}
-
-/// Adresse d'une page de bougies : jamais plus de 1 000 par requête (au-delà, refus 400).
+/// Adresse d'une page de bougies : jamais plus de 1 000 par requête (`MAX_LIMIT`).
 fn candles_url(base: &str, market: &str, tf: Timeframe, start: Option<i64>, end: Option<i64>, limit: usize) -> String {
     let mut url = format!("{base}/v2/{market}/candles?interval={}&limit={}", tf.as_str(), limit.clamp(1, MAX_LIMIT));
     if let Some(s) = start {
@@ -284,18 +295,6 @@ mod tests {
         assert!(assemble(Vec::new(), 0, now).is_empty());
     }
 
-    /// Une fenêtre d'au moins un intervalle est envoyée telle quelle ; une plus étroite est
-    /// élargie vers le passé jusqu'à un intervalle exactement, jamais au-delà.
-    #[test]
-    fn fenetre_d_au_moins_un_intervalle() {
-        let q = Timeframe::M15.millis();
-        let t = 1_788_862_500_000; // ONDO-EUR 15m, 2026-10-09
-        assert_eq!(page_start(t, t + q, Timeframe::M15), t); // limite acceptée par Bitvavo
-        assert_eq!(page_start(t, t + 5 * q, Timeframe::M15), t);
-        assert_eq!(page_start(t, t + q - 1, Timeframe::M15), t - 1); // refusée sinon
-        assert_eq!(page_start(t, t, Timeframe::M15), t - q);
-    }
-
     /// Heure fixe des tests sans réseau : bougie en cours ouverte à `c`, `now` en son milieu.
     /// En 1j, `c` tombe le 2026-09-01, avant la date réelle.
     fn horloge(tf: Timeframe) -> (i64, i64) {
@@ -339,6 +338,12 @@ mod tests {
                 min_attendu: 1000,
             },
             Cas { nom: "start non aligné", ouvertures: epars.clone(), start: cote + 500 * q + 1, min_attendu: 2000 },
+            Cas {
+                nom: "start non aligné, page pleine qui commence au premier créneau entier",
+                ouvertures: creneaux(cote),
+                start: c - 1000 * q + 1,
+                min_attendu: 999,
+            },
             Cas {
                 nom: "créneau vide pile à start, coupure plus longue qu'une page",
                 ouvertures: coupure,

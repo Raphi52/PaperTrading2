@@ -6,6 +6,11 @@ use anyhow::{Context, Result};
 use pt_core::{Candle, Timeframe};
 use std::path::{Path, PathBuf};
 
+/// Marque des fichiers écrits depuis la correction des raccords de pages (2026-10-11).
+/// Avant elle, `closed_since` perdait une bougie toutes les 1 000, et `history` ne fait que
+/// compléter la fin d'un fichier : ces trous seraient restés pour toujours.
+const CONTENT_VERSION: &str = "2";
+
 pub struct HistoryCache {
     dir: PathBuf,
     client: BitvavoClient,
@@ -63,19 +68,33 @@ impl HistoryCache {
         self.dir.join(format!("{}_{}.depuis", symbol.to_uppercase(), tf.as_str()))
     }
 
+    /// Fichier qui porte la marque `CONTENT_VERSION` du fichier de bougies.
+    fn version_file(&self, symbol: &str, tf: Timeframe) -> PathBuf {
+        self.dir.join(format!("{}_{}.version", symbol.to_uppercase(), tf.as_str()))
+    }
+
     /// Bougies clôturées depuis `start_ms`, complétées depuis Bitvavo si besoin.
     pub async fn history(&self, symbol: &str, tf: Timeframe, start_ms: i64) -> Result<Vec<Candle>> {
         std::fs::create_dir_all(&self.dir).with_context(|| format!("création {}", self.dir.display()))?;
         let path = self.file(symbol, tf);
         let requested_path = self.requested_file(symbol, tf);
+        let version_path = self.version_file(symbol, tf);
         let mut cached = Self::read(&path);
-        let already_requested = std::fs::read_to_string(&requested_path)
-            .ok()
-            .and_then(|s| s.trim().parse::<i64>().ok())
-            .is_some_and(|from| from <= start_ms);
-        let covers_start = !cached.is_empty() && (already_requested || cached[0].open_time <= start_ms + tf.millis());
+        let requested_from = std::fs::read_to_string(&requested_path).ok().and_then(|s| s.trim().parse::<i64>().ok());
+        let already_requested = requested_from.is_some_and(|from| from <= start_ms);
+        // fix-ok: cause mesurée — `history` ne fait que compléter la fin d'un fichier ; les bougies perdues aux raccords de pages avant la correction de `closed_since` (data/cache/BTCEUR_15m.csv : 196 trous alignés sur les pages de 1 000, BTCEUR_4h : 16) y seraient restées pour toujours. Test : un_cache_d_avant_les_raccords_est_retelecharge_en_entier, rouge avant (rouge-*.log), vert ici.
+        // Fichier sans la marque : retéléchargé en entier une fois, depuis le plus ancien
+        // début connu, puis marqué.
+        let marked = std::fs::read_to_string(&version_path).is_ok_and(|v| v.trim() == CONTENT_VERSION);
+        let from = if marked {
+            start_ms
+        } else {
+            [Some(start_ms), requested_from, cached.first().map(|c| c.open_time)].into_iter().flatten().min().unwrap_or(start_ms)
+        };
+        let covers_start =
+            marked && !cached.is_empty() && (already_requested || cached[0].open_time <= start_ms + tf.millis());
         if !covers_start {
-            cached = self.client.closed_since(symbol, tf, start_ms).await?;
+            cached = self.client.closed_since(symbol, tf, from).await?;
         } else if let Some(last) = cached.last().copied() {
             let fresh = self.client.closed_since(symbol, tf, last.close_time + 1).await?;
             cached.extend(fresh.into_iter().filter(|c| c.open_time > last.open_time));
@@ -88,8 +107,10 @@ impl HistoryCache {
         // Écrit APRÈS les bougies : un téléchargement interrompu ne marque jamais
         // comme couverte une période absente du fichier.
         if !covers_start {
-            std::fs::write(&requested_path, start_ms.to_string())
+            std::fs::write(&requested_path, from.to_string())
                 .with_context(|| format!("écriture {}", requested_path.display()))?;
+            std::fs::write(&version_path, CONTENT_VERSION)
+                .with_context(|| format!("écriture {}", version_path.display()))?;
         }
         Ok(cached.into_iter().filter(|c| c.open_time >= start_ms).collect())
     }
