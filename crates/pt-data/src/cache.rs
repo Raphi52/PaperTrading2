@@ -108,3 +108,56 @@ impl HistoryCache {
         Ok(out)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::faux_bitvavo;
+
+    /// Dossier de cache neuf, propre à ce test.
+    fn dossier(nom: &str) -> PathBuf {
+        let n = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        std::env::temp_dir().join(format!("pt-data-test-{nom}-{}-{n}", std::process::id()))
+    }
+
+    fn bougie(o: i64, q: i64) -> Candle {
+        Candle { open_time: o, open: 1.0, high: 1.0, low: 1.0, close: 1.0, volume: 1.0, close_time: o + q - 1 }
+    }
+
+    fn ouvertures(v: &[Candle]) -> Vec<i64> {
+        v.iter().map(|c| c.open_time).collect()
+    }
+
+    /// Un cache écrit avant la correction des raccords de pages (une bougie perdue toutes
+    /// les 1 000) est retéléchargé en entier une fois, depuis le plus ancien début connu,
+    /// puis marqué. Jumeau : un cache marqué n'est plus que complété par la fin.
+    #[tokio::test]
+    async fn un_cache_d_avant_les_raccords_est_retelecharge_en_entier() {
+        let tf = Timeframe::M15;
+        let q = tf.millis();
+        let t0 = 1_700_000_000_000 / q * q;
+        let marche: Vec<i64> = (0..2500).map(|i| t0 + i * q).collect(); // tout est clos depuis longtemps
+        let faux = faux_bitvavo::lancer(q, marche.clone(), crate::now_ms());
+        let cache = HistoryCache::new(dossier("raccords"), BitvavoClient::with_base(&faux.base));
+        std::fs::create_dir_all(&cache.dir).unwrap();
+        // Fichier d'avant la correction : deux bougies perdues à des raccords, demandé depuis t0.
+        let troue: Vec<Candle> =
+            marche.iter().copied().filter(|&o| o != t0 + 499 * q && o != t0 + 1499 * q).map(|o| bougie(o, q)).collect();
+        HistoryCache::write(&cache.file("BTCEUR", tf), &troue).unwrap();
+        std::fs::write(cache.requested_file("BTCEUR", tf), t0.to_string()).unwrap();
+
+        let start = t0 + 1000 * q;
+        let v = cache.history("BTCEUR", tf, start).await.unwrap();
+        assert_eq!(ouvertures(&v), marche[1000..], "bougies rendues");
+        assert_eq!(ouvertures(&HistoryCache::read(&cache.file("BTCEUR", tf))), marche, "fichier réécrit en entier");
+        assert_eq!(faux.requetes().first().map(|r| r.start), Some(t0), "retéléchargé depuis le plus ancien début connu");
+
+        faux.oublier();
+        let v2 = cache.history("BTCEUR", tf, start).await.unwrap();
+        assert_eq!(ouvertures(&v2), marche[1000..]);
+        let r = faux.requetes();
+        assert_eq!(r.len(), 1, "un cache marqué ne fait qu'une requête : {r:?}");
+        assert_eq!(r[0].start, t0 + 2500 * q, "seule la fin est demandée");
+        std::fs::remove_dir_all(&cache.dir).ok();
+    }
+}
