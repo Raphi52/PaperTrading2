@@ -66,12 +66,26 @@ pub const TIER_RESET_OFFSET_MS: i64 = 3_600_000;
 
 /// Dernier recalcul du palier (01:00 UTC) antérieur ou égal à `t`.
 pub fn tier_reset_at(t: i64) -> i64 {
-    t
+    (t - TIER_RESET_OFFSET_MS).div_euclid(DAY_MS) * DAY_MS + TIER_RESET_OFFSET_MS
 }
 
 /// Euros échangés par les exécutions `fills` datées de `[reset − 30 j, reset)`.
-pub fn volume_30d_eur(_fills: &[Fill], _reset: i64) -> f64 {
-    0.0
+pub fn volume_30d_eur(fills: &[Fill], reset: i64) -> f64 {
+    add_tier_volume(0.0, fills, reset)
+}
+
+/// Ajoute à `v`, une par une et dans l'ordre, les exécutions de la fenêtre : la mémoire et le
+/// recalcul complet font exactement les mêmes additions, donc le même résultat au bit près.
+/// Un montant illisible (non fini, négatif) ne compte pas : `buy` les refuse déjà, seule une
+/// base modifiée à la main peut en contenir.
+fn add_tier_volume(mut v: f64, fills: &[Fill], reset: i64) -> f64 {
+    for f in fills {
+        let eur = f.qty * f.price;
+        if (reset - TIER_WINDOW_MS..reset).contains(&f.time) && eur.is_finite() && eur > 0.0 {
+            v += eur;
+        }
+    }
+    v
 }
 
 /// Mémoire du volume des 30 jours d'UN compte, pour ne pas tout re-sommer à chaque ordre.
@@ -90,21 +104,34 @@ impl PartialEq for FeeTierMemo {
 }
 
 impl FeeTierMemo {
-    /// Volume des 30 jours au dernier recalcul antérieur ou égal à `time`.
+    /// Volume des 30 jours au dernier recalcul antérieur ou égal à `time`. Recalcul complet
+    /// au changement de recalcul ou si l'historique a raccourci ; sinon, seules les exécutions
+    /// ajoutées depuis l'appel précédent sont lues (dans n'importe quel ordre de dates).
     pub fn volume(&mut self, fills: &[Fill], time: i64) -> f64 {
-        volume_30d_eur(fills, tier_reset_at(time))
+        let reset = tier_reset_at(time);
+        if self.reset != Some(reset) || fills.len() < self.seen {
+            *self = FeeTierMemo { reset: Some(reset), seen: 0, volume: 0.0 };
+        }
+        self.volume = add_tier_volume(self.volume, &fills[self.seen..], reset);
+        self.seen = fills.len();
+        self.volume
     }
 
-    /// Les coûts d'UN ordre passé à `time` par le compte dont l'historique est `fills`.
+    /// Les coûts d'UN ordre passé à `time` par le compte dont l'historique est `fills` :
+    /// glissement selon la liquidité ([`CostModel::for_order`]), frais selon le palier.
     pub fn order_costs(
         &mut self,
         costs: &CostModel,
-        _fills: &[Fill],
+        fills: &[Fill],
         volume_24h: Option<f64>,
         notional: f64,
-        _time: i64,
+        time: i64,
     ) -> CostModel {
-        costs.for_order(volume_24h, notional)
+        let mut order = costs.for_order(volume_24h, notional);
+        if costs.fee_tiers {
+            order.fee_rate = costs.tier_rate(self.volume(fills, time));
+        }
+        order
     }
 }
 
@@ -200,10 +227,23 @@ impl CostModel {
         }
     }
 
+    // fix-ok: chaque ordre payait `fee_rate` (0,25 %) quel que soit le volume : `for_order`
+    // (portfolio.rs:117-121 avant ce commit) le recopiait, `buy` et `sell_all` l'appliquaient.
+    // Mesuré le 2026-10-12 dans la base : 107 stratégies sur 321 dépassaient 100 000 € sur
+    // 30 jours au recalcul de 01:00 UTC (92 à 0,20 %, 15 à 0,18 %).
     /// Frais par côté d'un compte qui a échangé `volume_30d` € sur les 30 jours du dernier
-    /// recalcul (voir [`BITVAVO_TAKER_TIERS`]).
-    pub fn tier_rate(&self, _volume_30d: f64) -> f64 {
-        self.fee_rate
+    /// recalcul (voir [`BITVAVO_TAKER_TIERS`]) : `min(fee_rate, palier)` dès 100 000 €, jamais
+    /// plus que le réglage ; sous 100 000 €, volume illisible ou paliers coupés : `fee_rate`.
+    /// `round_trip` et `breakeven` restent au taux de base : hypothèse prudente (un objectif
+    /// placé pour couvrir 0,25 % couvre a fortiori un palier plus bas).
+    pub fn tier_rate(&self, volume_30d: f64) -> f64 {
+        if !self.fee_tiers {
+            return self.fee_rate;
+        }
+        match BITVAVO_TAKER_TIERS.iter().find(|(min, _)| volume_30d >= *min) {
+            Some(&(_, tier)) => self.fee_rate.min(tier),
+            None => self.fee_rate,
+        }
     }
     pub fn buy_price(&self, p: f64) -> f64 {
         p * (1.0 + self.slippage_bps / 10_000.0)
@@ -838,9 +878,9 @@ mod tests {
         let oc = m.order_costs(&c, &more, None, 1_000.0, t + 60_000);
         assert_eq!(oc.fee_rate, 0.0020);
         assert_eq!(oc.slippage_bps, c.for_order(None, 1_000.0).slippage_bps, "le glissement ne change pas");
-        // Recalcul suivant : les deux millions comptent.
+        // Recalcul suivant : les deux millions comptent (2 125 000 €, entre 1 M€ et 2,5 M€ : 0,14 %).
         assert_eq!(m.volume(&more, R + DAY_MS), volume_30d_eur(&more, R + DAY_MS));
-        assert_eq!(m.order_costs(&c, &more, None, 1_000.0, R + DAY_MS).fee_rate, 0.0012);
+        assert_eq!(m.order_costs(&c, &more, None, 1_000.0, R + DAY_MS).fee_rate, 0.0014);
         // Historique raccourci (rechargement) : recalcul complet.
         assert_eq!(m.volume(&all[..3], t), 30_000.0);
         // Paliers coupés : le réglage, quel que soit le volume.

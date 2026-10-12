@@ -14,7 +14,7 @@
 
 use crate::candle::Candle;
 use crate::indicators::{atr, closes, rsi, sma};
-use crate::portfolio::{CostModel, Portfolio};
+use crate::portfolio::{CostModel, FeeTierMemo, Portfolio};
 use crate::strategy::{compute_signals, entry_strength, External, Preset, Signal, Sizing, TakeProfit};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -231,6 +231,10 @@ pub struct Engine {
     /// les états enregistrés avant le 2026-10-11 (règle de fermeture d'avant).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_live_pass: Option<i64>,
+    /// Volume des 30 jours au dernier recalcul du palier de frais, pour ne pas re-sommer tout
+    /// l'historique à chaque ordre. Jamais sérialisé ; toujours égal dans les comparaisons.
+    #[serde(skip)]
+    pub fee_memo: FeeTierMemo,
 }
 
 impl Engine {
@@ -250,6 +254,7 @@ impl Engine {
             last_volume_24h: BTreeMap::new(),
             live: None,
             last_live_pass: None,
+            fee_memo: FeeTierMemo::default(),
         }
     }
 
@@ -603,7 +608,7 @@ impl Engine {
                     }
                     // Pendant la bougie, seules les bougies déjà closes sont connues.
                     let before = volume_24h_eur(&hist[..hist.len() - 1], bar.open_time);
-                    let costs = self.costs.for_order(before, qty * price);
+                    let costs = self.fee_memo.order_costs(&self.costs, &self.portfolio.fills, before, qty * price, time);
                     self.portfolio.sell_all(symbol, price, time, &costs, &reason).expect("position présente");
                     state.pending = None;
                     state.trailing_active = false;
@@ -714,7 +719,8 @@ impl Engine {
         match pending.kind {
             PendingKind::Exit => {
                 if let Some(pos) = self.portfolio.positions.get(symbol) {
-                    let costs = self.costs.for_order(pending.volume_24h, pos.qty * price);
+                    let costs =
+                        self.fee_memo.order_costs(&self.costs, &self.portfolio.fills, pending.volume_24h, pos.qty * price, time);
                     self.portfolio.sell_all(symbol, price, time, &costs, &pending.reason).expect("position présente");
                     self.states.get_mut(symbol).expect("état").trailing_active = false;
                 }
@@ -735,7 +741,7 @@ impl Engine {
                     self.log(time, symbol, DecisionKind::Skipped, &why, price, ind);
                     return;
                 }
-                let costs = self.costs.for_order(pending.volume_24h, notional);
+                let costs = self.fee_memo.order_costs(&self.costs, &self.portfolio.fills, pending.volume_24h, notional, time);
                 self.portfolio
                     .buy(symbol, notional, price, time, &costs, &pending.reason)
                     .expect("trésorerie vérifiée");
@@ -750,7 +756,7 @@ impl Engine {
                     self.log(time, symbol, DecisionKind::Skipped, &why, price, ind);
                     return;
                 }
-                let costs = self.costs.for_order(pending.volume_24h, notional);
+                let costs = self.fee_memo.order_costs(&self.costs, &self.portfolio.fills, pending.volume_24h, notional, time);
                 self.portfolio
                     .buy(symbol, notional, price, time, &costs, &pending.reason)
                     .expect("trésorerie vérifiée");
