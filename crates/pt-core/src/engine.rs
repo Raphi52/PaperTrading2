@@ -1613,4 +1613,71 @@ mod tests {
         let open = series.iter().find(|c| c.open_time == f.time).unwrap().open;
         assert_eq!(f.price, open);
     }
+
+    // --- Paliers de frais Bitvavo (audit de réalisme du 2026-10-12) ---
+
+    const TIER_H: i64 = 3_600_000;
+    /// Minuit UTC du jour 100 depuis 1970.
+    const TIER_D: i64 = 100 * crate::portfolio::DAY_MS;
+
+    /// Capital de 200 000 € ; 120 000 € échangés le jour D à 02:00 et 03:00 par de vrais
+    /// achat et vente sans frais (invariants tenus), sur une autre crypto.
+    fn tier_engine_with_volume() -> Engine {
+        let mut e = Engine::new(find("buy_hold").unwrap(), vec!["A".into()], 200_000.0, CostModel::default(), 0);
+        let z = CostModel::zero();
+        e.portfolio.buy("B", 60_000.0, 100.0, TIER_D + 2 * TIER_H, &z, "volume").unwrap();
+        e.portfolio.sell_all("B", 100.0, TIER_D + 3 * TIER_H, &z, "volume").unwrap();
+        e
+    }
+
+    fn tier_order(e: &mut Engine, kind: PendingKind, time: i64) -> f64 {
+        let n = e.portfolio.fills.len();
+        let reason = "test".to_string();
+        e.states.get_mut("A").expect("état").pending = Some(Pending { kind, reason, atr: 1.0, volume_24h: None });
+        e.on_next_open("A", time, 100.0);
+        assert_eq!(e.portfolio.fills.len(), n + 1, "l'ordre est exécuté");
+        e.portfolio.check_invariants().unwrap();
+        let f = e.portfolio.fills.last().unwrap();
+        match f.side {
+            crate::portfolio::Side::Buy => f.fee / -f.cash_delta,
+            crate::portfolio::Side::Sell => f.fee / (f.qty * f.price),
+        }
+    }
+
+    /// Cas C1 (T1) : 120 000 € dans les 30 jours du recalcul de 01:00 → 0,20 % sur l'entrée
+    /// et sur la sortie de 01:30 ; 0,25 % à 00:30 le même jour (recalcul de la veille, avant
+    /// ce volume).
+    #[test]
+    fn tier_applies_after_01h_recalc() {
+        let mut e = tier_engine_with_volume();
+        let mut before = e.clone();
+        let day1 = TIER_D + crate::portfolio::DAY_MS;
+        let r = tier_order(&mut e, PendingKind::Enter, day1 + TIER_H + 30 * 60_000);
+        assert!((r - 0.0020).abs() < 1e-12, "entrée à 01:30 : {r}");
+        let r = tier_order(&mut e, PendingKind::Exit, day1 + TIER_H + 45 * 60_000);
+        assert!((r - 0.0020).abs() < 1e-12, "sortie à 01:45 : {r}");
+        let r = tier_order(&mut before, PendingKind::Enter, day1 + 30 * 60_000);
+        assert!((r - 0.0025).abs() < 1e-12, "jumeau, entrée à 00:30 : {r}");
+    }
+
+    /// Cas C14 (T12) : après plusieurs nuits de fermeture, l'ordre prend le recalcul de 01:00
+    /// qui le précède, sans traitement particulier ; 30 jours plus tard, le volume est sorti.
+    #[test]
+    fn tier_after_several_closed_nights() {
+        let mut e = tier_engine_with_volume();
+        let mut late = e.clone();
+        let day = crate::portfolio::DAY_MS;
+        let r = tier_order(&mut e, PendingKind::Enter, TIER_D + 3 * day + TIER_H + 30 * 60_000);
+        assert!((r - 0.0020).abs() < 1e-12, "trois nuits plus tard : {r}");
+        let r = tier_order(&mut late, PendingKind::Enter, TIER_D + 31 * day + TIER_H + 30 * 60_000);
+        assert!((r - 0.0025).abs() < 1e-12, "jumeau, 31 nuits plus tard : {r}");
+    }
+
+    /// Cas C2 (T8) : un compte sans aucune exécution paie le taux de base.
+    #[test]
+    fn tier_empty_book_pays_base_rate() {
+        let mut e = Engine::new(find("buy_hold").unwrap(), vec!["A".into()], 200_000.0, CostModel::default(), 0);
+        let r = tier_order(&mut e, PendingKind::Enter, TIER_D + TIER_H + 30 * 60_000);
+        assert!((r - 0.0025).abs() < 1e-12, "{r}");
+    }
 }

@@ -26,10 +26,87 @@ pub struct CostModel {
     /// glissement fixe de `slippage_bps`.
     #[serde(default = "Liquidity::calibrated_option")]
     pub liquidity: Option<Liquidity>,
+    /// Paliers de frais Bitvavo selon le volume des 30 jours (voir [`BITVAVO_TAKER_TIERS`]).
+    /// Absent d'un réglage enregistré avant le 2026-10-12 : activés. `false` : `fee_rate`
+    /// sur chaque ordre, quel que soit le volume.
+    #[serde(default = "fee_tiers_on")]
+    pub fee_tiers: bool,
+}
+
+fn fee_tiers_on() -> bool {
+    true
 }
 
 /// Durée de la fenêtre de volume : 24 h.
 pub const DAY_MS: i64 = 86_400_000;
+
+/// Grille « taker » de Bitvavo par volume échangé sur 30 jours, du palier le plus haut au plus
+/// bas : (volume minimal en €, frais par côté). Sous 100 000 € : `fee_rate` (0,25 % par défaut).
+/// Source : <https://bitvavo.com/en/fees>, relevée le 2026-10-10 par moteur de recherche (la page
+/// répond HTTP 403 à une lecture directe) ; 0,20 % et 0,18 % revérifiés de même le 2026-10-12.
+/// Le volume des paires de stablecoins ne compte pas chez Bitvavo : l'univers n'en contient pas.
+pub const BITVAVO_TAKER_TIERS: [(f64, f64); 9] = [
+    (100_000_000.0, 0.0002),
+    (25_000_000.0, 0.0004),
+    (10_000_000.0, 0.0008),
+    (5_000_000.0, 0.0010),
+    (2_500_000.0, 0.0012),
+    (1_000_000.0, 0.0014),
+    (500_000.0, 0.0016),
+    (250_000.0, 0.0018),
+    (100_000.0, 0.0020),
+];
+
+/// Fenêtre de volume des paliers : 30 jours.
+pub const TIER_WINDOW_MS: i64 = 30 * DAY_MS;
+
+/// Heure du recalcul quotidien du palier : 01:00 UTC (article d'aide Bitvavo 4405175148689,
+/// lu par moteur de recherche le 2026-10-12).
+pub const TIER_RESET_OFFSET_MS: i64 = 3_600_000;
+
+/// Dernier recalcul du palier (01:00 UTC) antérieur ou égal à `t`.
+pub fn tier_reset_at(t: i64) -> i64 {
+    t
+}
+
+/// Euros échangés par les exécutions `fills` datées de `[reset − 30 j, reset)`.
+pub fn volume_30d_eur(_fills: &[Fill], _reset: i64) -> f64 {
+    0.0
+}
+
+/// Mémoire du volume des 30 jours d'UN compte, pour ne pas tout re-sommer à chaque ordre.
+/// Jamais enregistrée ni comparée : deux moteurs égaux restent égaux quel que soit leur cache.
+#[derive(Debug, Clone, Default)]
+pub struct FeeTierMemo {
+    reset: Option<i64>,
+    seen: usize,
+    volume: f64,
+}
+
+impl PartialEq for FeeTierMemo {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+impl FeeTierMemo {
+    /// Volume des 30 jours au dernier recalcul antérieur ou égal à `time`.
+    pub fn volume(&mut self, fills: &[Fill], time: i64) -> f64 {
+        volume_30d_eur(fills, tier_reset_at(time))
+    }
+
+    /// Les coûts d'UN ordre passé à `time` par le compte dont l'historique est `fills`.
+    pub fn order_costs(
+        &mut self,
+        costs: &CostModel,
+        _fills: &[Fill],
+        volume_24h: Option<f64>,
+        notional: f64,
+        _time: i64,
+    ) -> CostModel {
+        costs.for_order(volume_24h, notional)
+    }
+}
 
 /// Coût d'un ordre au marché, en points de base par côté :
 /// `spread_bps × (V / 1 M€)^−spread_exponent + impact_bps × √(M / (V / 96))`, borné
@@ -82,13 +159,13 @@ impl Liquidity {
 
 impl Default for CostModel {
     fn default() -> Self {
-        CostModel { fee_rate: 0.0025, slippage_bps: 2.0, liquidity: Some(Liquidity::CALIBRATED) }
+        CostModel { fee_rate: 0.0025, slippage_bps: 2.0, liquidity: Some(Liquidity::CALIBRATED), fee_tiers: true }
     }
 }
 
 impl CostModel {
     pub fn zero() -> Self {
-        CostModel { fee_rate: 0.0, slippage_bps: 0.0, liquidity: None }
+        CostModel { fee_rate: 0.0, slippage_bps: 0.0, liquidity: None, fee_tiers: false }
     }
 
     // fix-ok: le glissement était fixé à 2 pb pour toute paire (ancien portfolio.rs:27, appliqué
@@ -119,7 +196,14 @@ impl CostModel {
             fee_rate: self.fee_rate,
             slippage_bps: self.order_slippage_bps(volume_24h, notional),
             liquidity: None,
+            fee_tiers: self.fee_tiers,
         }
+    }
+
+    /// Frais par côté d'un compte qui a échangé `volume_30d` € sur les 30 jours du dernier
+    /// recalcul (voir [`BITVAVO_TAKER_TIERS`]).
+    pub fn tier_rate(&self, _volume_30d: f64) -> f64 {
+        self.fee_rate
     }
     pub fn buy_price(&self, p: f64) -> f64 {
         p * (1.0 + self.slippage_bps / 10_000.0)
@@ -384,7 +468,7 @@ mod tests {
 
     #[test]
     fn pnl_includes_both_fees() {
-        let costs = CostModel { fee_rate: 0.001, slippage_bps: 0.0, liquidity: None };
+        let costs = CostModel { fee_rate: 0.001, slippage_bps: 0.0, liquidity: None, fee_tiers: false };
         let mut p = Portfolio::new(10_000.0);
         p.buy("BTCEUR", 1_000.0, 100.0, 0, &costs, "test").unwrap();
         // Prix inchangé : on doit perdre exactement les deux frais.
@@ -591,5 +675,176 @@ mod tests {
             assert!(bad.validate().is_err(), "{bad:?}");
         }
         assert!(Liquidity { spread_bps: 0.0, impact_bps: 500.0, ..l }.validate().is_ok(), "bornes incluses");
+    }
+
+    // --- Paliers de frais Bitvavo (audit de réalisme du 2026-10-12) ---
+
+    const H: i64 = 3_600_000;
+    /// 01:00 UTC du jour 100 depuis 1970 : un recalcul.
+    const R: i64 = 100 * DAY_MS + TIER_RESET_OFFSET_MS;
+
+    fn tier_fill(time: i64, eur: f64) -> Fill {
+        Fill {
+            time,
+            symbol: "BTCEUR".into(),
+            side: Side::Buy,
+            qty: eur / 100.0,
+            price: 100.0,
+            fee: 0.0,
+            cash_delta: -eur,
+            reason: "volume".into(),
+        }
+    }
+
+    /// Cas C8 et C9 : seuils de la grille, bornes atteintes comprises ; jamais sous 0,02 %.
+    #[test]
+    fn tier_grid_thresholds() {
+        let c = CostModel::default();
+        for (v, want) in [
+            (0.0, 0.0025),
+            (99_999.99, 0.0025),
+            (100_000.0, 0.0020),
+            (249_999.99, 0.0020),
+            (250_000.0, 0.0018),
+            (500_000.0, 0.0016),
+            (1_000_000.0, 0.0014),
+            (2_500_000.0, 0.0012),
+            (5_000_000.0, 0.0010),
+            (10_000_000.0, 0.0008),
+            (25_000_000.0, 0.0004),
+            (99_999_999.0, 0.0004),
+            (100_000_000.0, 0.0002),
+            (1e15, 0.0002),
+        ] {
+            assert_eq!(c.tier_rate(v), want, "{v} €");
+        }
+    }
+
+    /// Cas C10 et C12 : le palier ne fait jamais payer plus que le réglage.
+    #[test]
+    fn tier_rate_never_above_setting() {
+        let base = CostModel::default();
+        let zero = CostModel { fee_rate: 0.0, ..base };
+        let low = CostModel { fee_rate: 0.001, ..base };
+        let high = CostModel { fee_rate: 0.005, ..base };
+        for v in [0.0, 120_000.0, 1e6, 1e9] {
+            assert_eq!(zero.tier_rate(v), 0.0, "sans frais reste sans frais, {v} €");
+        }
+        assert_eq!(low.tier_rate(120_000.0), 0.001, "un réglage sous la grille reste plus bas");
+        assert_eq!(low.tier_rate(1e8), 0.0002, "jumeau : la grille passe dessous quand elle descend plus bas");
+        assert_eq!(base.tier_rate(120_000.0), 0.0020);
+        assert_eq!(high.tier_rate(50_000.0), 0.005, "sous le premier palier, le réglage reste tel quel");
+        assert_eq!(high.tier_rate(120_000.0), 0.0020);
+    }
+
+    /// Cas C3 et C15 : un réglage enregistré sans le champ se charge, paliers ACTIVÉS ;
+    /// un réglage coupé reste coupé.
+    #[test]
+    fn tier_old_settings_load_with_tiers_on() {
+        let old: CostModel = serde_json::from_str(r#"{"fee_rate":0.0025,"slippage_bps":2.0}"#).unwrap();
+        assert!(old.fee_tiers);
+        assert_eq!(old.tier_rate(1_000_000.0), 0.0014);
+        let off = CostModel { fee_tiers: false, ..old };
+        let back: CostModel = serde_json::from_str(&serde_json::to_string(&off).unwrap()).unwrap();
+        assert!(!back.fee_tiers, "un réglage coupé reste coupé une fois relu");
+        for v in [0.0, 120_000.0, 1e6, 1e9] {
+            assert_eq!(back.tier_rate(v), 0.0025, "coupé : {v} €");
+        }
+    }
+
+    /// Cas C4 : un champ mal typé est refusé, jamais remplacé par la valeur par défaut.
+    #[test]
+    fn tier_flag_wrong_type_is_refused() {
+        for bad in [r#""oui""#, "1", "null"] {
+            let json = format!(r#"{{"fee_rate":0.0025,"slippage_bps":2.0,"fee_tiers":{bad}}}"#);
+            assert!(serde_json::from_str::<CostModel>(&json).is_err(), "{json}");
+        }
+        // Jumeau : la même entrée bien typée est acceptée.
+        let ok: CostModel =
+            serde_json::from_str(r#"{"fee_rate":0.0025,"slippage_bps":2.0,"fee_tiers":false}"#).unwrap();
+        assert!(!ok.fee_tiers);
+    }
+
+    /// Cas C6 : le recalcul de 01:00:00,000 vaut pour l'ordre de 01:00:00,000.
+    #[test]
+    fn tier_reset_is_01h_utc() {
+        assert_eq!(tier_reset_at(R), R, "01:00:00,000 pile : recalcul du jour");
+        assert_eq!(tier_reset_at(R - 1), R - DAY_MS, "00:59:59,999 : recalcul de la veille");
+        assert_eq!(tier_reset_at(R + 22 * H), R, "23:00 : recalcul du jour");
+        assert_eq!(tier_reset_at(R - H), R - DAY_MS, "minuit : recalcul de la veille");
+        for t in [-1, 0, 1, R + 1, R + DAY_MS - 1] {
+            let r = tier_reset_at(t);
+            assert!(r <= t && t - r < DAY_MS, "{t} → {r}");
+        }
+    }
+
+    /// Cas C7 : fenêtre `[r − 30 j, r)` ; un volume vieux de plus de 30 jours ne compte plus.
+    #[test]
+    fn tier_volume_window_bounds() {
+        let fills = vec![
+            tier_fill(R - TIER_WINDOW_MS, 1_000.0),
+            tier_fill(R - TIER_WINDOW_MS - 1, 20_000.0),
+            tier_fill(R, 300_000.0),
+            tier_fill(R - 1, 4.0),
+        ];
+        assert_eq!(volume_30d_eur(&fills, R), 1_004.0);
+        // Jumeau, recalcul suivant : l'exécution datée de R compte, celle de R − 30 j est sortie.
+        assert_eq!(volume_30d_eur(&fills, R + DAY_MS), 300_004.0);
+        assert_eq!(volume_30d_eur(&[], R), 0.0);
+    }
+
+    /// Cas C5 : une exécution au montant illisible est ignorée ; le taux reste fini.
+    #[test]
+    fn tier_non_finite_fill_is_ignored() {
+        let mut fills = vec![tier_fill(R - 10, 120_000.0)];
+        let mut nan = tier_fill(R - 5, 1.0);
+        nan.price = f64::NAN;
+        let mut inf = tier_fill(R - 4, 1.0);
+        inf.qty = f64::INFINITY;
+        fills.extend([nan, inf]);
+        let v = volume_30d_eur(&fills, R);
+        assert_eq!(v, 120_000.0);
+        assert_eq!(CostModel::default().tier_rate(v), 0.0020);
+        let r = CostModel::default().tier_rate(f64::NAN);
+        assert!(r.is_finite() && r == 0.0025, "volume illisible : taux de base, {r}");
+    }
+
+    /// Cas C13 : la mémoire donne le volume d'un recalcul complet, quel que soit l'ordre
+    /// d'arrivée des exécutions ; une exécution datée de R ou après attend le recalcul suivant.
+    #[test]
+    fn tier_cache_equals_full_recompute() {
+        let t = R + 30 * 60_000; // 01:30
+        let all: Vec<Fill> = (1..=12).map(|i| tier_fill(R - i * DAY_MS, 10_000.0)).collect();
+        let mut m = FeeTierMemo::default();
+        for k in 0..=all.len() {
+            assert_eq!(m.volume(&all[..k], t), volume_30d_eur(&all[..k], R), "après {k} exécutions");
+        }
+        assert_eq!(m.volume(&all, t), 120_000.0);
+        let rev: Vec<Fill> = all.iter().rev().cloned().collect();
+        let mut m2 = FeeTierMemo::default();
+        for k in 0..rev.len() {
+            m2.volume(&rev[..k], t);
+        }
+        assert!((m2.volume(&rev, t) - 120_000.0).abs() < 1e-9 * 120_000.0, "à l'envers");
+        // Exécution arrivée tard mais datée d'avant R : comptée.
+        let mut more = all.clone();
+        more.push(tier_fill(R - 1, 5_000.0));
+        assert_eq!(m.volume(&more, t), 125_000.0);
+        // Datée de R ou après : rien ne change avant le recalcul suivant.
+        more.push(tier_fill(R, 1_000_000.0));
+        more.push(tier_fill(t, 1_000_000.0));
+        assert_eq!(m.volume(&more, t + 60_000), 125_000.0);
+        let c = CostModel::default();
+        let oc = m.order_costs(&c, &more, None, 1_000.0, t + 60_000);
+        assert_eq!(oc.fee_rate, 0.0020);
+        assert_eq!(oc.slippage_bps, c.for_order(None, 1_000.0).slippage_bps, "le glissement ne change pas");
+        // Recalcul suivant : les deux millions comptent.
+        assert_eq!(m.volume(&more, R + DAY_MS), volume_30d_eur(&more, R + DAY_MS));
+        assert_eq!(m.order_costs(&c, &more, None, 1_000.0, R + DAY_MS).fee_rate, 0.0012);
+        // Historique raccourci (rechargement) : recalcul complet.
+        assert_eq!(m.volume(&all[..3], t), 30_000.0);
+        // Paliers coupés : le réglage, quel que soit le volume.
+        let off = CostModel { fee_tiers: false, ..c };
+        assert_eq!(m.order_costs(&off, &more, None, 1_000.0, R + DAY_MS).fee_rate, 0.0025);
     }
 }
