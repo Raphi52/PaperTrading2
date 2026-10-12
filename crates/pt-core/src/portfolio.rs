@@ -808,6 +808,10 @@ mod tests {
     /// Cas C6 : le recalcul de 01:00:00,000 vaut pour l'ordre de 01:00:00,000.
     #[test]
     fn tier_reset_is_01h_utc() {
+        // En clair, sans passer par les constantes : 2026-10-12 01:00:00,000 UTC = 1 791 766 800 000 ms.
+        assert_eq!(tier_reset_at(1_791_766_800_000), 1_791_766_800_000, "01:00 UTC pile");
+        assert_eq!(tier_reset_at(1_791_766_799_999), 1_791_680_400_000, "00:59:59,999 : la veille à 01:00");
+        assert_eq!(tier_reset_at(1_791_763_200_000), 1_791_680_400_000, "minuit : la veille à 01:00");
         assert_eq!(tier_reset_at(R), R, "01:00:00,000 pile : recalcul du jour");
         assert_eq!(tier_reset_at(R - 1), R - DAY_MS, "00:59:59,999 : recalcul de la veille");
         assert_eq!(tier_reset_at(R + 22 * H), R, "23:00 : recalcul du jour");
