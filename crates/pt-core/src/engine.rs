@@ -1540,7 +1540,7 @@ mod tests {
         p.sizing = Sizing::Fixed { position_pct: 40.0 };
         p.switch_margin = margin;
         let syms = ["A", "B", "C", "D", "E"].iter().map(|s| s.to_string()).collect();
-        let mut e = Engine::new(p, syms, 1_000.0, CostModel { fee_rate: 0.0, slippage_bps: 0.0, liquidity: None }, 0);
+        let mut e = Engine::new(p, syms, 1_000.0, CostModel { fee_rate: 0.0, slippage_bps: 0.0, liquidity: None, fee_tiers: false }, 0);
         e.record = true;
         e
     }
@@ -1801,7 +1801,7 @@ mod tests {
     fn tier_order(e: &mut Engine, kind: PendingKind, time: i64) -> f64 {
         let n = e.portfolio.fills.len();
         let reason = "test".to_string();
-        e.states.get_mut("A").expect("état").pending = Some(Pending { kind, reason, atr: 1.0, volume_24h: None });
+        e.states.get_mut("A").expect("état").pending = Some(Pending { kind, reason, atr: 1.0, volume_24h: None, budget: None });
         e.on_next_open("A", time, 100.0);
         assert_eq!(e.portfolio.fills.len(), n + 1, "l'ordre est exécuté");
         e.portfolio.check_invariants().unwrap();
