@@ -174,6 +174,19 @@ enum Cmd {
         #[arg(long)]
         donnees: Option<PathBuf>,
     },
+    /// Archive des portefeuilles suivis en direct : inactifs, historique gardé, motif
+    /// affiché dans l'application. Tout ou rien, 20 au plus. Rien n'est supprimé.
+    Archiver {
+        /// Numéros des portefeuilles, ex. --id 12,15 ou --id 12 --id 15.
+        #[arg(long = "id", required = true, value_delimiter = ',')]
+        ids: Vec<i64>,
+        /// Règle appliquée, écrite sur chaque portefeuille archivé.
+        #[arg(long)]
+        motif: String,
+        /// Dossier des données de l'application (même défaut que `suivre`).
+        #[arg(long)]
+        donnees: Option<PathBuf>,
+    },
     /// Est-ce un coup de chance ? Rejoue des stratégies sur des fenêtres glissantes.
     Validate {
         /// Stratégie à valider (option répétable).
@@ -393,6 +406,18 @@ fn app_data_dir(asked: Option<PathBuf>) -> Result<PathBuf> {
         .or_else(|_| std::env::var("HOME").map(|h| format!("{h}/.local/share")))
         .map_err(|_| anyhow::anyhow!("dossier de données introuvable : précise --donnees"))?;
     Ok(PathBuf::from(base).join("com.raphi52.papertrading"))
+}
+
+/// Archive `ids` dans la base de l'application rangée dans `dir`. Refuse un dossier
+/// sans base : archiver ne doit jamais créer une base vide à côté de la vraie.
+// fix-ok: cause mesurée — la CLI n'avait aucune commande d'archivage ; un dossier sans base faisait créer une base vide (défaut réinjecté, archiver_never_creates_a_base rouge) ; dossiers temporaires laissés car la base restait ouverte sous Windows (corrigé par drop(s)).
+fn archive_in(dir: &std::path::Path, ids: &[i64], motif: &str) -> Result<Vec<(i64, String)>> {
+    if !dir.join(pt_store::DB_FILE).exists() {
+        bail!("aucune base {} dans {} : précise --donnees", pt_store::DB_FILE, dir.display());
+    }
+    let mut store = pt_store::open_app_store(dir)?;
+    store.archive(ids, motif)?;
+    ids.iter().map(|&id| Ok((id, store.load(id)?.name))).collect()
 }
 
 fn outcome_label(o: Outcome) -> &'static str {
@@ -772,6 +797,13 @@ async fn main() -> Result<()> {
                 eprintln!("rapport écrit : {}", path.display());
             }
         }
+        Cmd::Archiver { ids, motif, donnees } => {
+            let dir = app_data_dir(donnees)?;
+            for (id, name) in archive_in(&dir, &ids, &motif)? {
+                println!("portefeuille n° {id} « {name} » archivé : {}", motif.trim());
+            }
+            println!("{} archivé(s) dans {}. Historique gardé.", ids.len(), dir.display());
+        }
         Cmd::Suivre { preset, symbols: raw, cash, nom, donnees } => {
             let Some(p) = pt_core::find(&preset) else { bail!("stratégie inconnue : {preset} (voir `pt presets`)") };
             if p.is_benchmark() {
@@ -849,6 +881,51 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn temp_dir(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("pt-archiver-{tag}-{}-{}", std::process::id(), pt_data::now_ms()));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn archiver_deactivates_in_the_app_base() {
+        let dir = temp_dir("ok");
+        let id = {
+            let mut s = pt_store::Store::open(dir.join(pt_store::DB_FILE)).unwrap();
+            let syms = vec!["BTCEUR".to_string()];
+            let e = pt_core::Engine::new(pt_core::find("buy_hold").unwrap(), syms.clone(), 1_000.0, CostModel::default(), 0);
+            s.create("Essai", 1, &e, &e).unwrap()
+        };
+        let done = archive_in(&dir, &[id], " doublon de 3 ").unwrap();
+        assert_eq!(done, vec![(id, "Essai".to_string())]);
+        let s = pt_store::Store::open(dir.join(pt_store::DB_FILE)).unwrap();
+        let p = s.load(id).unwrap();
+        assert!(!p.active);
+        assert_eq!(p.last_error.as_deref(), Some("doublon de 3"));
+        assert!(archive_in(&dir, &[id + 1], "motif").unwrap_err().to_string().contains("introuvable"));
+        drop(s); // Windows : la base doit être fermée pour supprimer le dossier
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn archiver_never_creates_a_base() {
+        let dir = temp_dir("vide");
+        let err = archive_in(&dir, &[1], "motif").unwrap_err().to_string();
+        assert!(err.contains("--donnees"), "{err}");
+        assert!(!dir.join(pt_store::DB_FILE).exists(), "aucune base créée");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn archiver_cli_parses_ids() {
+        let cli = Cli::try_parse_from(["pt", "archiver", "--id", "12,15", "--id", "20", "--motif", "x"]).unwrap();
+        let Cmd::Archiver { ids, motif, .. } = cli.cmd else { panic!("mauvaise commande") };
+        assert_eq!(ids, vec![12, 15, 20]);
+        assert_eq!(motif, "x");
+        assert!(Cli::try_parse_from(["pt", "archiver", "--motif", "x"]).is_err(), "--id obligatoire");
+        assert!(Cli::try_parse_from(["pt", "archiver", "--id", "3"]).is_err(), "--motif obligatoire");
+    }
 
     #[test]
     fn lookback_values_are_checked() {

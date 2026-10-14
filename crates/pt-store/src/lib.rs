@@ -259,6 +259,34 @@ impl Store {
         Ok(())
     }
 
+    /// Archive des portefeuilles : inactifs (via `set_active`), motif écrit dans
+    /// `last_error`, historique gardé. Tout ou rien : un numéro inconnu ou répété,
+    /// un motif vide ou plus de `MAX_ARCHIVE` numéros, et rien n'est écrit.
+    // fix-ok: cause mesurée — aucune commande n'archivait hors de l'interface (enum Cmd sans variante d'archivage, set_active n'écrit pas de motif) ; sans transaction un numéro inconnu archivait quand même les autres (défaut réinjecté, archive_is_all_or_nothing rouge).
+    pub fn archive(&mut self, ids: &[i64], reason: &str) -> Result<()> {
+        let reason = reason.trim();
+        if ids.is_empty() {
+            bail!("aucun portefeuille à archiver");
+        }
+        if ids.len() > MAX_ARCHIVE {
+            bail!("au plus {MAX_ARCHIVE} portefeuilles par archivage ({} demandés)", ids.len());
+        }
+        if reason.is_empty() {
+            bail!("donne le motif de l'archivage (la règle appliquée)");
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        if let Some(d) = ids.iter().find(|i| !seen.insert(**i)) {
+            bail!("portefeuille {d} demandé deux fois");
+        }
+        let tx = self.conn.unchecked_transaction()?;
+        for &id in ids {
+            self.set_active(id, false)?; // « portefeuille {id} introuvable » annule tout
+            self.conn.execute("UPDATE portfolios SET last_error=?2 WHERE id=?1", params![id, reason])?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Enregistre l'avancement du moteur (état + NOUVELLES exécutions), dans une
     /// transaction, sans toucher au nom ni à l'activation : une mise en pause
     /// faite pendant un passage du mode direct n'est donc jamais écrasée.
@@ -521,6 +549,67 @@ mod tests {
     }
 
     #[test]
+    fn archive_deactivates_with_reason_and_keeps_history() {
+        let mut s = Store::in_memory().unwrap();
+        let (mut e, b) = engines();
+        let a = s.create("A", 1, &e, &b).unwrap();
+        let other = s.create("B", 1, &e, &b).unwrap();
+        e.portfolio.buy("BTCEUR", 1_000.0, 50_000.0, 10, &CostModel::default(), "entrée").unwrap();
+        let mut p = s.load(a).unwrap();
+        p.engine = e.clone();
+        s.save(&p).unwrap();
+        s.push_equity(a, EquityRow { time: 5, equity: 1.0, benchmark: 1.0, exposure: 0.0 }).unwrap();
+        s.archive(&[a], "archivé : doublon de 12").unwrap();
+        let back = s.load(a).unwrap();
+        assert!(!back.active);
+        assert_eq!(back.last_error.as_deref(), Some("archivé : doublon de 12"));
+        assert_eq!(back.engine.portfolio.fills.len(), 1, "l'historique est gardé");
+        assert_eq!(s.equity_curve(a).unwrap().len(), 1, "la courbe est gardée");
+        assert!(s.load(other).unwrap().active, "seuls les numéros donnés sont archivés");
+    }
+
+    #[test]
+    fn archive_is_all_or_nothing() {
+        let mut s = Store::in_memory().unwrap();
+        let (e, b) = engines();
+        let a = s.create("A", 1, &e, &b).unwrap();
+        let err = s.archive(&[a, 999_999], "motif").unwrap_err().to_string();
+        assert!(err.contains("999999"), "{err}");
+        let back = s.load(a).unwrap();
+        assert!(back.active, "un numéro inconnu n'archive rien");
+        assert_eq!(back.last_error, None);
+    }
+
+    #[test]
+    fn archive_bounds_are_enforced() {
+        let mut s = Store::in_memory().unwrap();
+        let (e, b) = engines();
+        let ids: Vec<i64> = (0..21).map(|i| s.create(&format!("P{i}"), 1, &e, &b).unwrap()).collect();
+        // Refus : 21 numéros. Jumeau accepté : 20 numéros, la borne exacte.
+        assert!(s.archive(&ids, "motif").unwrap_err().to_string().contains("20"));
+        assert!(ids.iter().all(|&i| s.load(i).unwrap().active));
+        s.archive(&ids[..20], "motif").unwrap();
+        assert!(ids[..20].iter().all(|&i| !s.load(i).unwrap().active));
+        assert!(s.load(ids[20]).unwrap().active);
+        // Refus : aucun numéro, motif vide, numéro répété.
+        assert!(s.archive(&[], "motif").is_err());
+        assert!(s.archive(&[ids[20]], "  ").is_err());
+        assert!(s.archive(&[ids[20], ids[20]], "motif").is_err());
+        assert!(s.load(ids[20]).unwrap().active);
+    }
+
+    #[test]
+    fn archived_stays_archived_after_a_live_pass() {
+        let mut s = Store::in_memory().unwrap();
+        let (e, b) = engines();
+        let id = s.create("A", 1, &e, &b).unwrap();
+        let running_copy = s.load(id).unwrap(); // chargé par le mode direct avant l'archivage
+        s.archive(&[id], "archivé : règle X").unwrap();
+        s.save_progress(&running_copy).unwrap();
+        assert!(!s.load(id).unwrap().active, "un passage du mode direct ne réactive pas");
+    }
+
+    #[test]
     fn delete_cascades_and_settings_roundtrip() {
         let mut s = Store::in_memory().unwrap();
         let (e, b) = engines();
@@ -533,6 +622,9 @@ mod tests {
         assert_eq!(s.get_setting::<CostModel>("costs").unwrap(), Some(CostModel::default()));
     }
 }
+
+/// Nombre maximal de portefeuilles archivés en une fois.
+pub const MAX_ARCHIVE: usize = 20;
 
 /// Nom du fichier de base dans le dossier de l'application.
 pub const DB_FILE: &str = "papertrading.sqlite";
