@@ -11,6 +11,9 @@ pub mod cache;
 pub mod fear_greed;
 pub mod universe;
 
+#[cfg(test)]
+mod faux_bitvavo;
+
 pub use bitvavo::{BitvavoClient, Recent};
 pub use cache::HistoryCache;
 pub use fear_greed::fetch_fear_greed;

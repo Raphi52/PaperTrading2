@@ -9,10 +9,15 @@
 //! identifiant de marché Bitvavo (`BTC-EUR`).
 //!
 //! Comportements de l'API mesurés le 2026-10-08 (`/v2/{marché}/candles`) :
-//! - au plus 1 000 bougies par requête (`limit` plus grand : refus 400) ;
+//! - au plus 1 000 bougies par requête (`limit` plus grand : refus 400). Le 2026-10-11,
+//!   1 001, 1 440 et 1 441 ont été acceptés ; le client reste à 1 000 (`MAX_LIMIT`) ;
 //! - les bougies arrivent de la plus RÉCENTE à la plus ancienne ;
 //! - la réponse rend toujours les `limit` bougies les plus récentes de la période
 //!   demandée : on remonte donc le temps en déplaçant la fin de période (`end`) ;
+//! - (sondé le 2026-10-09 et le 2026-10-11) une bougie close n'est rendue que si
+//!   `start ≤ ouverture` et `ouverture + durée ≤ end` ; la bougie en cours, si
+//!   `start ≤ ouverture ≤ end` ; une fenêtre où aucune ne peut l'être est refusée
+//!   (400, errorCode 205) ; un créneau sans échange n'est pas rendu ;
 //! - une bougie n'a pas d'heure de clôture : elle vaut ouverture + durée − 1 ms ;
 //! - prix et volumes arrivent en texte.
 
@@ -106,8 +111,26 @@ impl BitvavoClient {
 
     /// Toutes les bougies CLÔTURÉES entre `start_ms` et maintenant, par ouverture croissante.
     pub async fn closed_since(&self, symbol: &str, tf: Timeframe, start_ms: i64) -> Result<Vec<Candle>> {
-        let now = crate::now_ms();
+        self.closed_until(symbol, tf, start_ms, crate::now_ms()).await
+    }
+
+    /// `closed_since` vu à l'heure `now` (les tests sans réseau fixent l'heure).
+    ///
+    /// Bitvavo ne rend une bougie close que si `start ≤ ouverture` et `ouverture + Q ≤ end`
+    /// (Q = durée d'une bougie), et refuse (400, errorCode 205) une fenêtre où aucune ne
+    /// peut l'être. Après une page pleine dont la plus ancienne ouverture est F, la page
+    /// suivante se termine donc à F (elle rend F − Q), et la lecture s'arrête dès que
+    /// F − Q < `start` : il ne reste aucun créneau entier à lire.
+    async fn closed_until(&self, symbol: &str, tf: Timeframe, start_ms: i64, now: i64) -> Result<Vec<Candle>> {
+        let q = tf.millis();
         let start = start_ms.max(FIRST_CANDLE_MS);
+        // Premier créneau entier à partir de `start`. S'il n'est pas clos à `now`, aucune
+        // bougie close n'existe ; `[start, now]` serait même refusée si `start` tombe dans
+        // la bougie en cours sans être aligné.
+        let first_slot = start.div_euclid(q) * q + if start.rem_euclid(q) == 0 { 0 } else { q };
+        if first_slot + q > now {
+            return Ok(Vec::new());
+        }
         let mut pages: Vec<Vec<Candle>> = Vec::new();
         let mut end = now;
         while end >= start {
@@ -115,11 +138,14 @@ impl BitvavoClient {
             let Some(first) = batch.first().copied() else { break };
             let full = batch.len() == MAX_LIMIT;
             pages.push(batch);
+            // fix-ok: cause mesurée — la page suivante finissait à `F − 1` ; Bitvavo ne rendant une bougie close que si ouverture + Q ≤ end, la bougie F − Q était perdue à chaque raccord (cache BTCEUR_15m : 196 trous alignés sur les pages de 1 000 ; BTC-EUR 15m réel avant correction : 2 créneaux absents sur 2 600, tous deux détenus par Bitvavo, reseau-rouge-ffadd6f.log). La fenêtre de 21e2f5a, [S−1, S+Q−1], est refusée (400/205) par le vrai Bitvavo. Rouge sur d55849a et 21e2f5a, vert ici (preuves/2026-10-11-pagination/).
             // Page incomplète : la période est épuisée (ou la paire n'était pas encore cotée).
-            if !full || first.open_time <= start || first.open_time > end {
+            // `>=` et non plus `>` : `end` ne recule plus de lui-même, une réponse
+            // anormale (F = end) ferait boucler.
+            if !full || first.open_time - q < start || first.open_time >= end {
                 break;
             }
-            end = first.open_time - 1;
+            end = first.open_time;
         }
         Ok(assemble(pages, start_ms, now))
     }
@@ -142,7 +168,7 @@ impl BitvavoClient {
     }
 }
 
-/// Adresse d'une page de bougies : jamais plus de 1 000 par requête (au-delà, refus 400).
+/// Adresse d'une page de bougies : jamais plus de 1 000 par requête (`MAX_LIMIT`).
 fn candles_url(base: &str, market: &str, tf: Timeframe, start: Option<i64>, end: Option<i64>, limit: usize) -> String {
     let mut url = format!("{base}/v2/{market}/candles?interval={}&limit={}", tf.as_str(), limit.clamp(1, MAX_LIMIT));
     if let Some(s) = start {
@@ -201,6 +227,7 @@ pub fn parse_candles(body: &Value, tf: Timeframe) -> Result<Vec<Candle>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::faux_bitvavo;
 
     const H: i64 = 3_600_000;
 
@@ -266,6 +293,236 @@ mod tests {
         pt_core::candle::validate_series(&v).unwrap();
         // Aucune page (paire pas encore cotée) : série vide, pas d'erreur.
         assert!(assemble(Vec::new(), 0, now).is_empty());
+    }
+
+    /// Heure fixe des tests sans réseau : bougie en cours ouverte à `c`, `now` en son milieu.
+    /// En 1j, `c` tombe le 2026-09-01, avant la date réelle.
+    fn horloge(tf: Timeframe) -> (i64, i64) {
+        let q = tf.millis();
+        let c = FIRST_CANDLE_MS + 2800 * q;
+        (c, c + q / 2 + 7)
+    }
+
+    /// Ce que `closed_since` doit rendre : chaque bougie que le serveur détient, ouverte à
+    /// partir de `start` et close à `now`, par ouverture croissante.
+    fn attendu(ouvertures: &[i64], q: i64, start: i64, now: i64) -> Vec<i64> {
+        let mut v: Vec<i64> = ouvertures.iter().copied().filter(|&o| o >= start && o + q <= now).collect();
+        v.sort_unstable();
+        v
+    }
+
+    struct Cas {
+        nom: &'static str,
+        ouvertures: Vec<i64>,
+        start: i64,
+        /// Garde contre un cas mal construit (qui ne testerait plus rien).
+        min_attendu: usize,
+    }
+
+    /// Les cas limites d'entrée de `closed_since` (consigne du 2026-10-11).
+    fn cas_limites(tf: Timeframe) -> Vec<Cas> {
+        let q = tf.millis();
+        let (c, _) = horloge(tf);
+        let cote = FIRST_CANDLE_MS + 20 * q; // cotation de la paire
+        let creneaux = |de: i64| -> Vec<i64> { (0..).map(|i| de + i * q).take_while(|&o| o <= c).collect() };
+        // Créneaux sans échange épars : un sur 97 (la bougie en cours s'échange).
+        let epars: Vec<i64> = creneaux(cote).into_iter().filter(|o| ((o - cote) / q) % 97 != 5).collect();
+        // En plus, 1 200 créneaux vides d'affilée : plus long qu'une page.
+        let coupure: Vec<i64> = epars.iter().copied().filter(|o| !(300..1500).contains(&((o - cote) / q))).collect();
+        vec![
+            Cas { nom: "nominal : plusieurs pages, créneaux vides épars", ouvertures: epars.clone(), start: cote + 3 * q, min_attendu: 2500 },
+            Cas {
+                nom: "page pleine qui s'arrête un créneau après start (cas ONDO)",
+                ouvertures: creneaux(cote),
+                start: c - 1000 * q,
+                min_attendu: 1000,
+            },
+            Cas { nom: "start non aligné", ouvertures: epars.clone(), start: cote + 500 * q + 1, min_attendu: 2000 },
+            Cas {
+                nom: "start non aligné, page pleine qui commence au premier créneau entier",
+                ouvertures: creneaux(cote),
+                start: c - 1000 * q + 1,
+                min_attendu: 999,
+            },
+            Cas {
+                nom: "créneau vide pile à start, coupure plus longue qu'une page",
+                ouvertures: coupure,
+                start: cote + 5 * q,
+                min_attendu: 1500,
+            },
+            Cas { nom: "start avant FIRST_CANDLE_MS et avant la cotation", ouvertures: epars.clone(), start: 0, min_attendu: 2500 },
+            Cas {
+                nom: "cotation pile sur un raccord de page",
+                ouvertures: creneaux(c - 1999 * q),
+                start: FIRST_CANDLE_MS,
+                min_attendu: 1999,
+            },
+            Cas { nom: "paire sans aucune bougie", ouvertures: Vec::new(), start: c - 10 * q, min_attendu: 0 },
+            Cas { nom: "start dans la bougie en cours, non aligné", ouvertures: epars.clone(), start: c + 1, min_attendu: 0 },
+            Cas { nom: "start = ouverture de la bougie en cours", ouvertures: epars.clone(), start: c, min_attendu: 0 },
+            Cas { nom: "start une ms après la dernière ouverture close", ouvertures: epars, start: c - q + 1, min_attendu: 0 },
+        ]
+    }
+
+    /// `closed_since` rend exactement les bougies que Bitvavo détient, en 15m et en 1j :
+    /// aucune perdue aux raccords de pages, aucun doublon, aucune requête refusée, pas de
+    /// boucle. Faux serveur : `crate::faux_bitvavo` (règles sondées sur la vraie API).
+    #[tokio::test]
+    async fn rend_exactement_les_bougies_du_serveur() {
+        for tf in [Timeframe::M15, Timeframe::D1] {
+            let q = tf.millis();
+            let (_, now) = horloge(tf);
+            for cas in cas_limites(tf) {
+                let faux = faux_bitvavo::lancer(q, cas.ouvertures.clone(), now);
+                let attendu = attendu(&cas.ouvertures, q, cas.start, now);
+                assert!(attendu.len() >= cas.min_attendu, "{tf} {} : cas mal construit ({} bougies)", cas.nom, attendu.len());
+                let v = BitvavoClient::with_base(&faux.base).closed_until("BTCEUR", tf, cas.start, now).await;
+                let requetes = faux.requetes();
+                let v = v.unwrap_or_else(|e| panic!("{tf} {} : {e:#} ; requêtes {requetes:?}", cas.nom));
+                let obtenu: Vec<i64> = v.iter().map(|c| c.open_time).collect();
+                if obtenu != attendu {
+                    let recus: BTreeSet<i64> = obtenu.iter().copied().collect();
+                    let perdues: Vec<i64> = attendu.iter().copied().filter(|o| !recus.contains(o)).collect();
+                    panic!(
+                        "{tf} {} : {} bougies au lieu de {}, {} perdues (ex. {:?}) ; requêtes {requetes:?}",
+                        cas.nom,
+                        obtenu.len(),
+                        attendu.len(),
+                        perdues.len(),
+                        &perdues[..perdues.len().min(3)]
+                    );
+                }
+                assert!(requetes.iter().all(|r| !r.refusee), "{tf} {} : requête refusée {requetes:?}", cas.nom);
+                assert!(requetes.len() <= attendu.len() / 1000 + 2, "{tf} {} : {} requêtes", cas.nom, requetes.len());
+                pt_core::candle::validate_series(&v).unwrap();
+            }
+        }
+    }
+
+    /// Fenêtres exactes demandées pour 1 000 bougies closes plus celle en cours : la page
+    /// pleine s'arrête un créneau après `start`, la suivante se termine à sa première
+    /// ouverture (`[start, start+Q]`, qui rend `start`), puis plus rien.
+    #[tokio::test]
+    async fn page_suivante_finit_a_la_premiere_ouverture() {
+        let tf = Timeframe::M15;
+        let q = tf.millis();
+        let (c, now) = horloge(tf);
+        let start = c - 1000 * q;
+        let faux = faux_bitvavo::lancer(q, (0..=1000).map(|i| start + i * q).collect(), now);
+        let v = BitvavoClient::with_base(&faux.base).closed_until("ONDOEUR", tf, start, now).await;
+        let fenetres: Vec<(i64, i64)> = faux.requetes().iter().map(|r| (r.start, r.end)).collect();
+        assert_eq!(fenetres, [(start, now), (start, start + q)]);
+        assert_eq!(v.unwrap().len(), 1000);
+    }
+
+    /// Une période de 1 001 bougies (1 000 clôturées + celle en cours) : la page pleine
+    /// s'arrête une bougie après le début, et la page suivante ne doit pas demander une
+    /// fenêtre de moins d'un intervalle (cas ONDO-EUR 15m du 2026-10-09). Entrée qui ferait
+    /// échouer une correction fausse : `start = ouverture en cours − 1 000 intervalles`
+    /// — arrêter la boucle au lieu d'élargir la fenêtre perdrait la bougie ouverte à `start`.
+    #[tokio::test]
+    async fn jamais_de_fenetre_plus_etroite_qu_un_intervalle() {
+        for tf in [Timeframe::M15, Timeframe::D1] {
+            let step = tf.millis();
+            let (forming, now) = horloge(tf);
+            // Bougies cotées depuis FIRST_CANDLE_MS, jusqu'à celle en cours.
+            let cotees: Vec<i64> = (0..).map(|i| FIRST_CANDLE_MS + i * step).take_while(|&o| o <= forming).collect();
+            let faux = faux_bitvavo::lancer(step, cotees, now);
+            let start = forming - 1000 * step;
+            let v = BitvavoClient::with_base(&faux.base).closed_until("ONDOEUR", tf, start, now).await.unwrap();
+            let windows: Vec<(i64, i64)> = faux.requetes().iter().map(|r| (r.start, r.end)).collect();
+            assert!(windows.iter().all(|(s, e)| e - s >= step), "{tf} : fenêtres demandées {windows:?}");
+            assert_eq!(v.first().map(|c| c.open_time), Some(start), "{tf} : bougie de début perdue");
+            assert_eq!(v.len(), 1000, "{tf}");
+            pt_core::candle::validate_series(&v).unwrap();
+        }
+    }
+
+    /// Test réseau : chaque fenêtre sondée, rejouée sur Bitvavo (BTC-EUR 15m, qui s'échange
+    /// dans chaque créneau), reçoit la même réponse que du faux serveur des tests sans réseau.
+    #[tokio::test]
+    #[ignore]
+    async fn live_regles_de_fenetre_bitvavo() {
+        let client = BitvavoClient::new();
+        let tf = Timeframe::M15;
+        let q = tf.millis();
+        // Loin d'un changement de bougie, pour que la bougie en cours ne change pas pendant le test.
+        while {
+            let t = crate::now_ms() % q;
+            t < 60_000 || t > q - 60_000
+        } {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        }
+        let now = crate::now_ms();
+        let c = now / q * q;
+        let s = c - 10 * q;
+        let tout: Vec<i64> = (0..40).map(|i| c - i * q).collect();
+        let fenetres = [
+            (s, s + q),
+            (s - 1, s + q),
+            (s - q, s + q - 1),
+            (s + 1, s + 2 * q),
+            (s - 3 * q, s - 1),
+            (s - 3 * q, s),
+            (s, s + q - 1),
+            (s - 1, s + q - 1),
+            (s + 1, s + q + 1),
+            (s + 1, s + 2 * q - 1),
+            (s - q + 1, s + q - 1),
+            (c, now),
+            (c - q, now),
+            (c, c + q - 1),
+            (c - q + 1, now),
+            (c + 1, now),
+            (c - q, c - 1),
+        ];
+        for (a, b) in fenetres {
+            let reel = match client.candles("BTCEUR", tf, Some(a), Some(b), MAX_LIMIT).await {
+                Ok(v) => Some(v.iter().rev().map(|c| c.open_time).collect::<Vec<i64>>()),
+                Err(e) => {
+                    let e = format!("{e:#}");
+                    assert!(e.contains("400"), "[{a}, {b}] : {e}");
+                    None
+                }
+            };
+            let faux = faux_bitvavo::repondre(&tout, q, now, a, b, MAX_LIMIT);
+            let rel = |v: &Vec<i64>| v.iter().map(|o| (o - s) / q).collect::<Vec<_>>();
+            eprintln!("[S{:+}, S{:+}] : Bitvavo {:?}, faux serveur {:?}", a - s, b - s, reel.as_ref().map(rel), faux.as_ref().map(rel));
+            assert_eq!(reel, faux, "[{a}, {b}] (S = {s}, C = {c})");
+        }
+    }
+
+    /// Test réseau : au moins 2 500 créneaux de BTC-EUR 15m ; chaque créneau absent du
+    /// résultat est redemandé seul (`[o, o+Q]`), et Bitvavo doit le rendre vide. Une bougie
+    /// perdue à un raccord de page, elle, serait rendue.
+    #[tokio::test]
+    #[ignore]
+    async fn live_creneaux_absents_vraiment_vides() {
+        let client = BitvavoClient::new();
+        let tf = Timeframe::M15;
+        let q = tf.millis();
+        let avant = crate::now_ms();
+        let start = (avant / q - 2600) * q;
+        let v = client.closed_since("BTCEUR", tf, start).await.unwrap();
+        pt_core::candle::validate_series(&v).unwrap();
+        let recus: BTreeSet<i64> = v.iter().map(|c| c.open_time).collect();
+        // Créneaux clos avant l'appel : closed_since devait tous les voir.
+        let absents: Vec<i64> =
+            (0..).map(|i| start + i * q).take_while(|&o| o + q <= avant).filter(|o| !recus.contains(o)).collect();
+        assert!(recus.len() >= 2500, "{} bougies", recus.len());
+        let mut perdus = Vec::new();
+        for &o in &absents {
+            if !client.candles("BTCEUR", tf, Some(o), Some(o + q), MAX_LIMIT).await.unwrap().is_empty() {
+                perdus.push(o);
+            }
+        }
+        eprintln!(
+            "BTC-EUR 15m : {} bougies, {} créneaux absents, dont {} détenus par Bitvavo",
+            recus.len(),
+            absents.len(),
+            perdus.len()
+        );
+        assert!(perdus.is_empty(), "créneaux absents du résultat mais détenus par Bitvavo : {perdus:?}");
     }
 
     /// Test réseau, lancé seulement avec `cargo test -- --ignored`.
