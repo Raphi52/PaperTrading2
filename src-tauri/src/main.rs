@@ -4,6 +4,7 @@
 mod accounts;
 mod commands;
 mod live;
+mod migration_eur;
 mod state;
 mod tray;
 
@@ -31,7 +32,8 @@ fn main() {
                 Err(_) => app.path().app_data_dir()?,
             };
             std::fs::create_dir_all(&dir)?;
-            let store = pt_store::open_app_store(&dir)?;
+            let mut store = pt_store::open_app_store(&dir)?;
+            migration_eur::run(&mut store, &dir);
             let state = Arc::new(AppState::new(store, dir));
             app.manage(state.clone());
             tauri::async_runtime::spawn(live::run_loop(state, app.handle().clone()));

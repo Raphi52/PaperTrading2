@@ -66,6 +66,15 @@ pub fn tradable_eur(markets: &Value) -> BTreeSet<String> {
         .collect()
 }
 
+/// Relevé figé de `/v2/markets` (2026-10-08, champs utiles seulement) : sert sans
+/// réseau, au démarrage, pour convertir les anciens portefeuilles.
+pub const MARKETS_SNAPSHOT: &str = include_str!("../fixtures/bitvavo-markets.json");
+
+/// Paires EUR ouvertes au négoce dans le relevé figé.
+pub fn snapshot_tradable_eur() -> BTreeSet<String> {
+    tradable_eur(&serde_json::from_str(MARKETS_SNAPSHOT).unwrap_or(Value::Null))
+}
+
 /// Refuse la première paire qui ne s'achète pas en EUR maintenant.
 pub fn check_tradable(symbols: &[String], tradable: &BTreeSet<String>) -> Result<(), String> {
     match symbols.iter().find(|s| !tradable.contains(*s)) {

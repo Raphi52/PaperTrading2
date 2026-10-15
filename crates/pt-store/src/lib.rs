@@ -14,6 +14,8 @@ use rusqlite::{params, Connection, OptionalExtension};
 use serde::{de::DeserializeOwned, Serialize};
 use std::path::Path;
 
+pub mod migration;
+
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS portfolios (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -249,6 +251,12 @@ impl Store {
         p.engine.decisions.clear();
         p.benchmark.decisions.clear();
         Ok(())
+    }
+
+    /// Nombre total d'exécutions enregistrées, tous portefeuilles confondus
+    /// (contrôle d'intégrité : une migration ne doit en perdre aucune).
+    pub fn fill_count(&self) -> Result<i64> {
+        Ok(self.conn.query_row("SELECT COUNT(*) FROM fills", [], |r| r.get(0))?)
     }
 
     pub fn set_active(&self, id: i64, active: bool) -> Result<()> {
