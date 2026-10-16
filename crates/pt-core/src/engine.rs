@@ -338,8 +338,9 @@ impl Engine {
         }
         // fix-ok: trié par ouverture de la bougie suivante, un achat décidé à t passait avant la
         // vente décidée au même t dont la bougie suivante venait plus tard, et tombait à « montant
-        // 0.00 » (direct du 15-16/10 : 453 annulations sur 683 après une vente pas encore partie) ;
-        // test reserve_entry_waits_for_sale_next_hour. Dans l'ordre des décisions, les sorties
+        // 0.00 » (journal du direct du 15-16/10 : 453 annulations sur 683 après une vente pas encore
+        // partie, dont 239 prouvées et 214 déduites) ; test reserve_entry_waits_for_sale_next_hour.
+        // Dans l'ordre des décisions, les sorties
         // d'abord (elles libèrent la trésorerie), comme le backtest (`done`, ventes d'abord).
         carried.sort_by_key(|&(_, n, _, exit, decided)| (decided, !exit, n.open_time));
         for (sym, n, closed, _, _) in carried {
@@ -846,9 +847,10 @@ impl Engine {
                     .min(valid_budget(pending.budget).unwrap_or(f64::INFINITY));
                 // fix-ok: en direct, l'achat partait sans l'argent d'une vente comptée par `allocate`
                 // mais pas encore partie (la crypto vendue n'avait pas encore de bougie) : « montant
-                // 0.00 », puis la vente quand même (direct du 15-16/10 : 453 annulations sur 683, 389
-                // remplacements vendus sans rachat) ; tests reserve_entry_waits_for_sale_same_hour et
-                // suivants. Il attend cette vente, puis part à son ouverture prévue, comme le backtest
+                // 0.00 », puis la vente quand même (journal du direct du 15-16/10 : 453 annulations
+                // sur 683, dont 239 prouvées et 214 déduites ; 304 remplacements vendus sans rachat,
+                // dont 162 déduits) ; tests reserve_entry_waits_for_sale_same_hour et suivants.
+                // Il attend cette vente, puis part à son ouverture prévue, comme le backtest
                 // qui vend d'abord. Pas après une fermeture (`running`), jamais au-delà de
                 // WAIT_FOR_SALE_BARS bougies.
                 let sales = self.pending_sales();
@@ -1941,7 +1943,10 @@ mod tests {
     // Journal du direct, 15/10 13:30 → 16/10 09:15 UTC : 683 « ENTRÉE ANNULÉE (montant »
     // (34,6 par heure). 453 suivent une vente comptée pour payer l'achat mais pas encore
     // partie : la crypto vendue n'avait pas encore de bougie (Bitvavo n'en rend aucune sans
-    // échange). 50 suivent un achat encore en attente dont l'argent n'était pas mis de côté.
+    // échange). Sur ces 453, 239 sont prouvées par l'heure ou l'ordre d'écriture de la vente,
+    // 214 sont déduites (vente à la même heure, achat à 0,00, aucun autre achat à cet instant).
+    // 50 suivent un achat encore en attente dont l'argent n'était pas mis de côté. 180 restent
+    // sans cause établie.
     // Le backtest ne les voit pas : il exécute toutes les décisions d'une clôture dans le
     // même tour, ventes d'abord. Le direct doit passer les MÊMES ordres.
     // ------------------------------------------------------------------------------------
