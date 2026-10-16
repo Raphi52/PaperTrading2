@@ -104,6 +104,16 @@ pub struct Pending {
     /// même ouverture. Absent (ordre enregistré avant le 2026-10-09) : pas de plafond.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub budget: Option<f64>,
+    /// Entrée qui a attendu, en direct, la vente qui devait la payer (voir
+    /// [`WAIT_FOR_SALE_BARS`]). Elle part au prix du moment, datée du passage où elle part, et
+    /// non à son ouverture prévue. Enregistré avec l'ordre : le direct recharge chaque
+    /// portefeuille à chaque passage. Absent d'un ordre enregistré avant le 2026-10-16 : faux.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub waited_for_sale: bool,
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -561,6 +571,7 @@ impl Engine {
                     atr: c.atr,
                     volume_24h: c.volume_24h,
                     budget: Some(budget),
+                    waited_for_sale: false,
                 });
                 self.log(c.time, &c.symbol, DecisionKind::Entry, "SIGNAL D'ENTRÉE", c.price, c.indicators);
                 continue;
@@ -620,6 +631,7 @@ impl Engine {
                 atr: c.atr,
                 volume_24h: weak_volume,
                 budget: None,
+                waited_for_sale: false,
             });
             // La vente de la plus faible paie l'entrée : elle s'ajoute à la trésorerie disponible.
             available += self.exit_proceeds(&weak, weak_volume);
@@ -633,6 +645,7 @@ impl Engine {
                 atr: c.atr,
                 volume_24h: c.volume_24h,
                 budget: Some(budget),
+                waited_for_sale: false,
             });
             let weak_price = self.marks.get(&weak).copied().unwrap_or(f64::NAN);
             let mut weak_ind = self.last_snap(&weak);
@@ -730,6 +743,15 @@ impl Engine {
         // 2. Décision à la clôture.
         let exits = self.preset.exits.clone();
         if let Some(pos) = self.portfolio.positions.get_mut(symbol) {
+            // fix-ok: une bougie close AVANT l'achat comptait pour la position (durée tenue, plus
+            // haut, stop suiveur, signal de sortie). Un achat parti au prix du moment après avoir
+            // attendu sa vente voit rejouer ensuite les bougies de son attente : un signal de sortie
+            // de l'une d'elles le revendait à l'ouverture suivante, avant l'heure même de l'achat ;
+            // test a_bar_closed_before_the_purchase_never_touches_the_position. Un vrai compte ne
+            // tenait pas encore la crypto : la bougie ne décide rien pour elle.
+            if bar.close_time < pos.entry_time {
+                return None;
+            }
             pos.bars_held += 1;
             pos.highest = pos.highest.max(bar.high);
             if let Some(tr) = exits.trailing {
@@ -750,6 +772,7 @@ impl Engine {
                     atr,
                     volume_24h,
                     budget: None,
+                    waited_for_sale: false,
                 })
             } else if sig.exit {
                 Some(Pending {
@@ -758,6 +781,7 @@ impl Engine {
                     atr,
                     volume_24h,
                     budget: None,
+                    waited_for_sale: false,
                 })
             } else if let Some(py) = self.preset.pyramid {
                 (pos.layers < py.max_layers && bar.close <= pos.last_fill_price * (1.0 - py.step_pct / 100.0)).then(
@@ -767,6 +791,7 @@ impl Engine {
                         atr,
                         volume_24h,
                         budget: None,
+                        waited_for_sale: false,
                     },
                 )
             } else {
@@ -804,6 +829,7 @@ impl Engine {
                 atr,
                 volume_24h,
                 budget: None,
+                waited_for_sale: false,
             });
             if can_enter {
                 self.log(bar.close_time, symbol, DecisionKind::Entry, "SIGNAL D'ENTRÉE", bar.close, snap());
@@ -837,6 +863,22 @@ impl Engine {
                     self.log(time, symbol, DecisionKind::Skipped, why, price, ind);
                     return;
                 }
+                // fix-ok: un achat qui avait attendu sa vente partait au prix et à l'heure de son
+                // ouverture prévue, jusqu'à WAIT_FOR_SALE_BARS bougies dans le passé (30 min de
+                // retard en médiane, 105 min au plus dans le direct du 15-16/10) : un prix qu'aucun
+                // vrai compte n'aurait eu. Il part maintenant au prix du moment, daté du passage où
+                // il part (choix de l'utilisateur, 2026-10-16) ; tests
+                // reserve_entry_waits_for_sale_same_hour et _next_hour. L'attente se mesure
+                // toujours depuis l'ouverture prévue (`planned`).
+                let planned = time;
+                let (time, price) = match (pending.waited_for_sale, self.live.as_ref()) {
+                    (true, Some(l)) => match l.prices.get(symbol) {
+                        Some(&now_price) => (l.now, now_price),
+                        None => (time, price),
+                    },
+                    _ => (time, price),
+                };
+                self.marks.insert(symbol.to_string(), price);
                 let fill = self.costs.buy_price(price);
                 let stop = self.preset.exits.stop.and_then(|d| d.below(fill, pending.atr));
                 // fix-ok: l'achat recalculait son montant à l'ouverture (prix ≠ clôture) sans plafond de réservation et prenait la part des entrées suivantes (ordre alphabétique) ; mesuré : 41 des 42 « montant » du backtest donchian_5_3_15m top 50, 66 sur la marche aléatoire.
@@ -850,13 +892,18 @@ impl Engine {
                 // 0.00 », puis la vente quand même (journal du direct du 15-16/10 : 453 annulations
                 // sur 683, dont 239 prouvées et 214 déduites ; 304 remplacements vendus sans rachat,
                 // dont 162 déduits) ; tests reserve_entry_waits_for_sale_same_hour et suivants.
-                // Il attend cette vente, puis part à son ouverture prévue, comme le backtest
-                // qui vend d'abord. Pas après une fermeture (`running`), jamais au-delà de
-                // WAIT_FOR_SALE_BARS bougies.
+                // Il attend cette vente, puis part au prix du moment (voir `waited_for_sale`
+                // plus haut). Pas après une fermeture (`running`), jamais au-delà de
+                // WAIT_FOR_SALE_BARS bougies après son ouverture prévue.
                 let sales = self.pending_sales();
                 let short = self.portfolio.cash < want && !sales.is_empty();
                 let bar = self.preset.timeframe.millis();
-                if short && self.live.as_ref().is_some_and(|l| l.running && l.now - time <= WAIT_FOR_SALE_BARS * bar) {
+                if short && self.live.as_ref().is_some_and(|l| l.running && l.now - planned <= WAIT_FOR_SALE_BARS * bar) {
+                    let mut pending = pending;
+                    if !pending.waited_for_sale {
+                        pending.waited_for_sale = true;
+                        pending.reason.push_str(" (après sa vente)");
+                    }
                     self.states.get_mut(symbol).expect("état").pending = Some(pending);
                     return;
                 }
@@ -1890,7 +1937,7 @@ mod tests {
     fn tier_order(e: &mut Engine, kind: PendingKind, time: i64) -> f64 {
         let n = e.portfolio.fills.len();
         let reason = "test".to_string();
-        e.states.get_mut("A").expect("état").pending = Some(Pending { kind, reason, atr: 1.0, volume_24h: None, budget: None });
+        e.states.get_mut("A").expect("état").pending = Some(Pending { kind, reason, atr: 1.0, volume_24h: None, budget: None, waited_for_sale: false });
         e.on_next_open("A", time, 100.0);
         assert_eq!(e.portfolio.fills.len(), n + 1, "l'ordre est exécuté");
         e.portfolio.check_invariants().unwrap();
@@ -2092,30 +2139,52 @@ mod tests {
         }
     }
 
+    /// Premier achat de `sym` au journal des exécutions.
+    fn first_buy(e: &Engine, sym: &str) -> Option<crate::portfolio::Fill> {
+        e.portfolio.fills.iter().find(|f| f.symbol == sym && f.side == crate::portfolio::Side::Buy).cloned()
+    }
+
     /// Cas 3. W (tenue) est remplacée par X à 50 h. X a son premier échange de 51 h tout de
     /// suite ; W à 51:08 seulement. X partait seul, sans l'argent de W : « ENTRÉE ANNULÉE
     /// (montant 0.00 < minimum 5) », et W était vendue quand même. Attendu : X attend la
-    /// vente de W et achète au prix d'ouverture de 51 h, comme le backtest.
+    /// vente de W, puis achète au passage où elle part (après 51:08), AU PRIX DU MOMENT (112,
+    /// dernier prix de sa bougie de 51 h) et non au prix d'ouverture prévu (110) : un vrai
+    /// programme achète quand l'argent de la vente arrive (choix de l'utilisateur, 2026-10-16).
+    /// Le backtest, qui vend et achète à la même ouverture, garde 51:00 à 110 ; tous les autres
+    /// ordres sont identiques.
     #[test]
     fn reserve_entry_waits_for_sale_same_hour() {
         let w: Vec<Candle> = (0..60).map(slow).collect();
-        let x: Vec<Candle> = (0..60).map(|i| jumper(i, 50)).collect();
+        let x: Vec<Candle> =
+            (0..60).map(|i| if i == 51 { candle(51, 110.0, 112.5, 109.5, 112.0) } else { jumper(i, 50) }).collect();
         let late_w = |i: i64| if i == 51 { 8 * M } else { 0 };
         let (live, one, waited, _) = live_and_one_shot(&one_seat(1.0), 1_000.0, &[("W", &w, &late_w), ("X", &x, &on_time)]);
-        let switched =
-            one.portfolio.fills.iter().any(|f| f.symbol == "X" && f.side == crate::portfolio::Side::Buy && f.time == 51 * RH);
-        assert!(switched, "le backtest doit remplacer W par X à 51 h : {:?}", orders(&one));
+        let b = first_buy(&one, "X").expect("backtest : X achetée");
+        assert_eq!((b.time, b.price), (51 * RH, 110.0), "backtest : X achetée à l'ouverture de 51 h : {:?}", orders(&one));
         assert!(unfunded(&live).is_empty(), "entrée annulée faute de la vente de W : {:?}", unfunded(&live));
-        assert_eq!(orders(&one), orders(&live), "le direct n'a pas passé les ordres du backtest");
+        let l = first_buy(&live, "X").expect("direct : X achetée");
+        assert!(
+            l.time >= 51 * RH + 8 * M && l.time < 51 * RH + 10 * M,
+            "direct : X achète au passage où la vente de W part (après 51:08), pas à son ouverture prévue : {}",
+            l.time
+        );
+        assert_eq!(l.price, 112.0, "direct : X achète au prix du moment, pas au prix d'ouverture prévu");
+        assert!(l.reason.contains("après sa vente"), "le journal dit que l'achat a attendu sa vente : {}", l.reason);
+        let others = |e: &Engine, skip: i64| -> Vec<(String, bool, i64, i64)> {
+            orders(e).into_iter().filter(|o| !(o.0 == "X" && o.1 && o.2 == skip)).collect()
+        };
+        assert_eq!(others(&one, b.time), others(&live, l.time), "hors l'achat de X, le direct passe les ordres du backtest");
         assert!(waited > 0, "X n'a jamais attendu la vente, test sans valeur");
         live.portfolio.check_invariants().unwrap();
     }
 
     /// Cas 4. Même remplacement, mais W n'a aucune bougie à 51 h ni à 52 h : sa vente part à
     /// 53 h. Pendant l'attente, les bougies 51 h et 52 h de X se clôturent : elles ne doivent
-    /// ni effacer l'achat (`state.pending = None` à la clôture) ni être jouées sans lui. X
-    /// achète au prix et à l'heure du backtest (51 h), puis son stop de 5 % (106,4) joue sur
-    /// la bougie 52 h, qui descend à 100.
+    /// pas effacer l'achat (`state.pending = None` à la clôture). Le backtest achète X à 51 h,
+    /// puis son stop de 5 % (104,5) joue sur la bougie 52 h, qui descend à 100. En direct, X
+    /// achète quand la vente de W part (53 h), au prix du moment (110) : un vrai compte ne
+    /// tenait pas X pendant la baisse de 52 h, son stop n'y joue donc pas (voir aussi
+    /// `a_bar_closed_before_the_purchase_never_touches_the_position`).
     #[test]
     fn reserve_entry_waits_for_sale_next_hour() {
         let mut p = one_seat(1.0);
@@ -2125,23 +2194,30 @@ mod tests {
             .map(|i| if i == 52 { candle(52, 110.0, 110.5, 100.0, 109.0) } else { jumper(i, 50) })
             .collect();
         let (live, one, waited, _) = live_and_one_shot(&p, 1_000.0, &[("W", &w, &on_time), ("X", &x, &on_time)]);
-        let first_x =
-            one.portfolio.fills.iter().find(|f| f.symbol == "X" && f.side == crate::portfolio::Side::Buy).map(|f| f.time);
-        assert_eq!(first_x, Some(51 * RH), "backtest : X achetée à 51 h : {:?}", orders(&one));
-        let stopped = one.portfolio.fills.iter().any(|f| f.symbol == "X" && f.side == crate::portfolio::Side::Sell);
-        assert!(stopped, "backtest : le stop de X joue à 52 h : {:?}", orders(&one));
+        assert_eq!(first_buy(&one, "X").map(|f| f.time), Some(51 * RH), "backtest : X achetée à 51 h : {:?}", orders(&one));
+        let sells = |e: &Engine| -> Vec<crate::portfolio::Fill> {
+            e.portfolio.fills.iter().filter(|f| f.symbol == "X" && f.side == crate::portfolio::Side::Sell).cloned().collect()
+        };
+        assert!(sells(&one).iter().any(|f| f.time < 53 * RH), "backtest : le stop de X joue à 52 h : {:?}", orders(&one));
         assert!(unfunded(&live).is_empty(), "entrée annulée faute de la vente de W : {:?}", unfunded(&live));
-        assert_eq!(orders(&one), orders(&live), "le direct n'a pas passé les ordres du backtest");
+        let l = first_buy(&live, "X").expect("direct : X achetée");
+        assert!(l.time >= 53 * RH, "direct : X achète quand la vente de W part (53 h), pas à 51 h : {}", l.time);
+        assert_eq!(l.price, 110.0, "direct : au prix du moment");
+        let early: Vec<_> = sells(&live).into_iter().filter(|f| f.time < 54 * RH).collect();
+        assert!(early.is_empty(), "direct : une bougie close avant l'achat a joué sur la position : {early:?}");
         assert!(waited > 0, "X n'a jamais attendu avec sa bougie suivante close, test sans valeur");
         live.portfolio.check_invariants().unwrap();
     }
 
     /// Cas 7, 8 et 9, en grand : 3 cryptos aux heures sans échange décalées et aux premiers
     /// échanges tardifs différents, 45 % par position, 2 places, remplacement à 0,5. Le direct
-    /// passe les ordres du backtest et n'annule pas plus d'entrées pour leur montant que lui
-    /// (les siennes viennent d'une vente exécutée sous la clôture, voir
-    /// `on_a_random_walk_no_announced_entry_is_cancelled_for_its_amount`). Tous les écarts
-    /// sont rapportés, préset par préset, avant d'échouer.
+    /// n'annule pas plus d'entrées pour leur montant que le backtest (les siennes viennent d'une
+    /// vente exécutée sous la clôture, voir
+    /// `on_a_random_walk_no_announced_entry_is_cancelled_for_its_amount`). Il passe les ordres du
+    /// backtest jusqu'au premier achat qui a attendu sa vente : celui-ci part au prix du moment
+    /// (choix du 2026-10-16), et la suite peut donc diverger. Chaque achat qui a attendu est noté
+    /// au journal, et aucune vente n'est datée avant l'achat de sa position. Tous les écarts sont
+    /// rapportés, préset par préset, avant d'échouer.
     #[test]
     fn reserve_live_matches_backtest_when_cash_is_tight() {
         let hole = |n: usize, seed: u64, m: i64, r: i64| -> Vec<Candle> {
@@ -2164,7 +2240,27 @@ mod tests {
                 live_and_one_shot(&p, 10_000.0, &[("S0", &s0, &on_time), ("S1", &s1, &l1), ("S2", &s2, &l2)]);
             assert!(!one.portfolio.fills.is_empty(), "{id} : aucun trade, test sans valeur");
             live.portfolio.check_invariants().unwrap_or_else(|m| panic!("{id} : {m}"));
-            let (a, b) = (orders(&one), orders(&live));
+            // Ouverture prévue du premier achat qui a attendu : au plus WAIT_FOR_SALE_BARS bougies
+            // avant son exécution. Avant elle, aucun ordre ne peut différer du backtest.
+            let first_wait = live.portfolio.fills.iter().filter(|f| f.reason.contains("après sa vente")).map(|f| f.time).min();
+            let cut = first_wait.map_or(i64::MAX, |t| t - (WAIT_FOR_SALE_BARS + 1) * RH);
+            let before = |e: &Engine| -> Vec<(String, bool, i64, i64)> { orders(e).into_iter().filter(|o| o.2 < cut).collect() };
+            let mut held_since: BTreeMap<String, i64> = BTreeMap::new();
+            for f in &live.portfolio.fills {
+                match f.side {
+                    crate::portfolio::Side::Buy => {
+                        held_since.entry(f.symbol.clone()).or_insert(f.time);
+                    }
+                    crate::portfolio::Side::Sell => {
+                        if let Some(t) = held_since.remove(&f.symbol) {
+                            if f.time < t {
+                                gaps.push(format!("{id} : vente de {} datée {} avant son achat {t}", f.symbol, f.time));
+                            }
+                        }
+                    }
+                }
+            }
+            let (a, b) = (before(&one), before(&live));
             if a != b {
                 let k = a.iter().zip(&b).position(|(x, y)| x != y).unwrap_or(a.len().min(b.len()));
                 gaps.push(format!(
@@ -2187,6 +2283,27 @@ mod tests {
         assert!(waited_all > 0, "aucun achat n'a attendu sa vente, test sans valeur");
     }
 
+    /// Un achat qui a attendu sa vente part au prix du moment, après l'ouverture prévue : les
+    /// bougies closes entre les deux sont rejouées APRÈS lui. Elles ne doivent pas compter pour
+    /// la position (durée tenue, plus haut, stop suiveur, signal de sortie) : un vrai compte ne
+    /// la tenait pas encore. Sans cette règle, un signal de sortie d'une bougie close avant
+    /// l'achat le revendait à l'ouverture suivante, avant même l'heure de l'achat. Jumeau : une
+    /// bougie close après l'achat compte.
+    #[test]
+    fn a_bar_closed_before_the_purchase_never_touches_the_position() {
+        let mut e = Engine::new(find("buy_hold").unwrap(), vec!["A".into()], 1_000.0, CostModel::zero(), 0);
+        e.portfolio.buy("A", 500.0, 100.0, 10 * RH + 30_000, &CostModel::zero(), "test").unwrap();
+        let exit = Signal { enter: false, exit: true };
+        e.on_bar_close("A", &candle(9, 100.0, 130.0, 99.0, 100.0), exit, 1.0);
+        let pos = &e.portfolio.positions["A"];
+        assert_eq!(pos.bars_held, 0, "bougie de 9 h, close avant l'achat de 10:00:30, comptée comme tenue");
+        assert!(pos.highest < 130.0, "plus haut d'avant l'achat pris pour la position : {}", pos.highest);
+        assert!(e.states["A"].pending.is_none(), "sortie décidée sur une bougie d'avant l'achat : {:?}", e.states["A"].pending);
+        e.on_bar_close("A", &candle(10, 100.0, 101.0, 99.0, 100.0), exit, 1.0);
+        assert_eq!(e.portfolio.positions["A"].bars_held, 1, "jumeau : la bougie de 10 h, close après l'achat, compte");
+        assert!(e.states["A"].pending.as_ref().is_some_and(|p| p.kind == PendingKind::Exit), "jumeau : sa sortie est décidée");
+    }
+
     /// Engine `cash_bound` (40 % par position, 1 000 €) avec un achat de A encore en attente,
     /// au montant réservé `budget`, décidé à une clôture précédente.
     fn with_pending_a(budget: Option<f64>) -> Engine {
@@ -2199,6 +2316,7 @@ mod tests {
             atr: 1.0,
             volume_24h: None,
             budget,
+            waited_for_sale: false,
         });
         e
     }
@@ -2252,6 +2370,7 @@ mod tests {
             atr: 1.0,
             volume_24h: None,
             budget: None,
+            waited_for_sale: false,
         });
         close_all(&mut e, 1, &[("B", true, 2.0), ("C", true, 1.0)]);
         e.on_next_open("A", candle(1, 0.0, 0.0, 0.0, 0.0).close_time + 1, 100.0);
@@ -2281,6 +2400,7 @@ mod tests {
                     atr: 1.0,
                     volume_24h: None,
                     budget: None,
+                    waited_for_sale: false,
                 });
             }
             e.states.get_mut("X").expect("état").pending = Some(Pending {
@@ -2289,6 +2409,7 @@ mod tests {
                 atr: 1.0,
                 volume_24h: None,
                 budget: Some(1_000.0),
+                waited_for_sale: false,
             });
             e
         };
