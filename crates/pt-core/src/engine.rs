@@ -1975,6 +1975,10 @@ mod tests {
     /// Joue les cryptos d'un bloc (backtest), puis en direct, passage après passage
     /// (`running_passes`), sans frais. Rend (direct, backtest, passages où un achat attendait
     /// alors que sa bougie suivante existait déjà, passages finis avec un achat en attente).
+    /// Échoue si un passage finit avec un achat prêt (sa bougie suivante existe) alors qu'aucune
+    /// vente ne reste à attendre : l'achat part au passage où sa vente part, juste après elle
+    /// (cas 3 et 4). Trié par bougie suivante, il partait un passage plus tard
+    /// (preuves/2026-10-16-reserve/mutant2-b.log).
     fn live_and_one_shot(preset: &Preset, cash: f64, src: &[(&str, &[Candle], Late)]) -> (Engine, Engine, usize, usize) {
         let syms: Vec<String> = src.iter().map(|x| x.0.to_string()).collect();
         let ext = External::default();
@@ -1989,6 +1993,7 @@ mod tests {
         let last = src.iter().map(|x| x.1.last().expect("bougies").close_time).max().expect("cryptos");
         let mut waited = 0;
         let mut carried = 0;
+        let mut idle = Vec::new();
         for now in running_passes(first, last) {
             let feeds: BTreeMap<String, Feed> = src
                 .iter()
@@ -1998,7 +2003,7 @@ mod tests {
                 })
                 .collect();
             live.advance_live(&feeds, &ext, now, |_, _| {});
-            waited += live
+            let ready = live
                 .states
                 .iter()
                 .filter(|(s, st)| {
@@ -2009,8 +2014,13 @@ mod tests {
                         })
                 })
                 .count();
+            waited += ready;
+            if ready > 0 && live.pending_sales().is_empty() {
+                idle.push(now);
+            }
             carried += live.states.values().filter(|st| matches!(&st.pending, Some(p) if p.kind == PendingKind::Enter)).count();
         }
+        assert!(idle.is_empty(), "achat prêt resté en attente sans vente à attendre, passages {idle:?}");
         live.advance_live(&all, &ext, last + 30_000, |_, _| {});
         (live, one, waited, carried)
     }
