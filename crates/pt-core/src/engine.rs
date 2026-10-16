@@ -1848,4 +1848,366 @@ mod tests {
         let r = tier_order(&mut e, PendingKind::Enter, TIER_D + TIER_H + 30 * 60_000);
         assert!((r - 0.0025).abs() < 1e-12, "{r}");
     }
+
+    // ------------------------------------------------------------------------------------
+    // Réserve des achats en attente, et attente de la vente qui les paie (2026-10-16).
+    // Journal du direct, 15/10 13:30 → 16/10 09:15 UTC : 683 « ENTRÉE ANNULÉE (montant »
+    // (34,6 par heure). 453 suivent une vente comptée pour payer l'achat mais pas encore
+    // partie : la crypto vendue n'avait pas encore de bougie (Bitvavo n'en rend aucune sans
+    // échange). 50 suivent un achat encore en attente dont l'argent n'était pas mis de côté.
+    // Le backtest ne les voit pas : il exécute toutes les décisions d'une clôture dans le
+    // même tour, ventes d'abord. Le direct doit passer les MÊMES ordres.
+    // ------------------------------------------------------------------------------------
+
+    const RH: i64 = 3_600_000;
+
+    /// Ce que Bitvavo montre à `now` d'une crypto dont le premier échange de la bougie
+    /// d'indice `i` arrive `late(i)` ms après son ouverture.
+    fn seen_late<'a>(s: &'a [Candle], now: i64, late: &dyn Fn(i64) -> i64) -> (usize, Option<&'a Candle>) {
+        let k = s.partition_point(|c| c.close_time < now);
+        let forming = s.get(k).filter(|c| c.open_time + late(c.open_time / RH) <= now);
+        (k, forming)
+    }
+
+    type Late<'a> = &'a dyn Fn(i64) -> i64;
+
+    /// Les ordres passés (crypto, achat ou vente, heure, prix à 1e-9 près), triés : le direct
+    /// enregistre un ordre au passage où sa bougie apparaît, le backtest écrit les ventes d'une
+    /// clôture d'abord ; seul l'ordre d'écriture peut différer, pas les ordres.
+    fn orders(e: &Engine) -> Vec<(String, bool, i64, i64)> {
+        let mut v: Vec<(String, bool, i64, i64)> = e
+            .portfolio
+            .fills
+            .iter()
+            .map(|f| (f.symbol.clone(), f.side == crate::portfolio::Side::Buy, f.time, (f.price * 1e9).round() as i64))
+            .collect();
+        v.sort();
+        v
+    }
+
+    /// Joue les cryptos d'un bloc (backtest), puis en direct, passage après passage
+    /// (`running_passes`), sans frais. Rend (direct, backtest, passages où un achat attendait
+    /// alors que sa bougie suivante existait déjà).
+    fn live_and_one_shot(preset: &Preset, cash: f64, src: &[(&str, &[Candle], Late)]) -> (Engine, Engine, usize) {
+        let syms: Vec<String> = src.iter().map(|x| x.0.to_string()).collect();
+        let ext = External::default();
+        let all: BTreeMap<String, Feed> =
+            src.iter().map(|(s, c, _)| (s.to_string(), Feed { closed: c, forming: None })).collect();
+        let mut one = Engine::new(preset.clone(), syms.clone(), cash, CostModel::zero(), 0);
+        one.record = true;
+        one.advance(&all, &ext, |_, _| {});
+        let mut live = Engine::new(preset.clone(), syms, cash, CostModel::zero(), 0);
+        live.record = true;
+        let first = src.iter().map(|x| x.1[0].open_time).min().expect("cryptos");
+        let last = src.iter().map(|x| x.1.last().expect("bougies").close_time).max().expect("cryptos");
+        let mut waited = 0;
+        for now in running_passes(first, last) {
+            let feeds: BTreeMap<String, Feed> = src
+                .iter()
+                .map(|(s, c, late)| {
+                    let (k, forming) = seen_late(c, now, *late);
+                    (s.to_string(), Feed { closed: &c[..k], forming })
+                })
+                .collect();
+            live.advance_live(&feeds, &ext, now, |_, _| {});
+            waited += live
+                .states
+                .iter()
+                .filter(|(s, st)| {
+                    matches!(&st.pending, Some(p) if p.kind == PendingKind::Enter)
+                        && st.last_bar_open_time.is_some_and(|t| {
+                            let f = &feeds[*s];
+                            f.closed.last().is_some_and(|c| c.open_time > t) || f.forming.is_some_and(|c| c.open_time > t)
+                        })
+                })
+                .count();
+        }
+        live.advance_live(&all, &ext, last + 30_000, |_, _| {});
+        (live, one, waited)
+    }
+
+    /// Une place, tout le capital dans la position, remplacement au-delà de `margin`.
+    fn one_seat(margin: f64) -> Preset {
+        let mut p = find("buy_hold").unwrap();
+        p.max_positions = Some(1);
+        p.switch_margin = Some(margin);
+        p.sizing = Sizing::Fixed { position_pct: 100.0 };
+        p
+    }
+
+    /// Hausse douce (force ≈ 1) : la crypto tenue au départ.
+    fn slow(i: i64) -> Candle {
+        let c = 100.0 + 0.05 * i as f64;
+        candle(i, c - 0.05, c + 0.5, c - 0.5, c)
+    }
+
+    /// Plate à 100 (force 0) jusqu'à `jump`, saut à 110 en `jump` (force ≈ 6), plate ensuite.
+    fn jumper(i: i64, jump: i64) -> Candle {
+        if i < jump {
+            candle(i, 100.0, 100.5, 99.5, 100.0)
+        } else if i == jump {
+            candle(i, 100.0, 110.5, 99.5, 110.0)
+        } else {
+            candle(i, 110.0, 110.5, 109.5, 110.0)
+        }
+    }
+
+    fn on_time(_: i64) -> i64 {
+        0
+    }
+
+    /// Cas 6 (réserve, cause de la spécification du matin). A et B entrent à 45 h pour 50 %
+    /// chacune. B n'a pas de bougie à 46 h, et son premier échange de 47 h arrive à 47:07 :
+    /// son achat attend. À 46 h, C donne son premier signal. Le direct lui donnait l'argent
+    /// de B (1 000 − 500 de A = 500) ; B, exécuté à 47:07, tombait à 0,00. Attendu, comme le
+    /// backtest : C n'a pas d'argent (1 000 − 500 − 500 = 0), B achète pour 500.
+    /// Jumeau accepté, à 40 % : il reste 200 pour C, qui entre.
+    #[test]
+    fn reserve_a_pending_entry_keeps_its_cash() {
+        for (pct, c_bought) in [(50.0, 0.0), (40.0, 200.0)] {
+            let mut p = find("buy_hold").unwrap();
+            p.max_positions = Some(10);
+            p.switch_margin = None;
+            p.sizing = Sizing::Fixed { position_pct: pct };
+            let flat = |i: i64| candle(i, 100.0, 100.5, 99.5, 100.0);
+            let a: Vec<Candle> = (0..60).map(flat).collect();
+            let b: Vec<Candle> = (0..60).filter(|i| *i != 46).map(flat).collect();
+            let c: Vec<Candle> = (1..60).map(flat).collect(); // cotée une heure plus tard
+            let late_b = |i: i64| if i == 47 { 7 * M } else { 0 };
+            let (live, one, waited) =
+                live_and_one_shot(&p, 1_000.0, &[("A", &a, &on_time), ("B", &b, &late_b), ("C", &c, &on_time)]);
+            assert!(unfunded(&live).is_empty(), "{pct} % : entrée annoncée sans son argent : {:?}", unfunded(&live));
+            assert_eq!(orders(&one), orders(&live), "{pct} % : le direct n'a pas passé les ordres du backtest");
+            assert!(waited > 0, "{pct} % : l'achat de B n'a jamais attendu sa bougie, test sans valeur");
+            let spent = |s: &str| -> f64 {
+                live.portfolio.fills.iter().filter(|f| f.symbol == s).map(|f| -f.cash_delta).sum()
+            };
+            assert!((spent("B") - pct * 10.0).abs() < 1e-6, "{pct} % : B achète sa part : {}", spent("B"));
+            assert!((spent("C") - c_bought).abs() < 1e-6, "{pct} % : C : {}", spent("C"));
+            live.portfolio.check_invariants().unwrap();
+        }
+    }
+
+    /// Cas 3. W (tenue) est remplacée par X à 50 h. X a son premier échange de 51 h tout de
+    /// suite ; W à 51:08 seulement. X partait seul, sans l'argent de W : « ENTRÉE ANNULÉE
+    /// (montant 0.00 < minimum 5) », et W était vendue quand même. Attendu : X attend la
+    /// vente de W et achète au prix d'ouverture de 51 h, comme le backtest.
+    #[test]
+    fn reserve_entry_waits_for_sale_same_hour() {
+        let w: Vec<Candle> = (0..60).map(slow).collect();
+        let x: Vec<Candle> = (0..60).map(|i| jumper(i, 50)).collect();
+        let late_w = |i: i64| if i == 51 { 8 * M } else { 0 };
+        let (live, one, waited) = live_and_one_shot(&one_seat(1.0), 1_000.0, &[("W", &w, &late_w), ("X", &x, &on_time)]);
+        let switched =
+            one.portfolio.fills.iter().any(|f| f.symbol == "X" && f.side == crate::portfolio::Side::Buy && f.time == 51 * RH);
+        assert!(switched, "le backtest doit remplacer W par X à 51 h : {:?}", orders(&one));
+        assert!(unfunded(&live).is_empty(), "entrée annulée faute de la vente de W : {:?}", unfunded(&live));
+        assert_eq!(orders(&one), orders(&live), "le direct n'a pas passé les ordres du backtest");
+        assert!(waited > 0, "X n'a jamais attendu la vente, test sans valeur");
+        live.portfolio.check_invariants().unwrap();
+    }
+
+    /// Cas 4. Même remplacement, mais W n'a aucune bougie à 51 h ni à 52 h : sa vente part à
+    /// 53 h. Pendant l'attente, les bougies 51 h et 52 h de X se clôturent : elles ne doivent
+    /// ni effacer l'achat (`state.pending = None` à la clôture) ni être jouées sans lui. X
+    /// achète au prix et à l'heure du backtest (51 h), puis son stop de 5 % (106,4) joue sur
+    /// la bougie 52 h, qui descend à 100.
+    #[test]
+    fn reserve_entry_waits_for_sale_next_hour() {
+        let mut p = one_seat(1.0);
+        p.exits.stop = Some(Distance::Percent(5.0));
+        let w: Vec<Candle> = (0..60).filter(|i| !(51..=52).contains(i)).map(slow).collect();
+        let x: Vec<Candle> = (0..60)
+            .map(|i| if i == 52 { candle(52, 110.0, 110.5, 100.0, 109.0) } else { jumper(i, 50) })
+            .collect();
+        let (live, one, waited) = live_and_one_shot(&p, 1_000.0, &[("W", &w, &on_time), ("X", &x, &on_time)]);
+        let first_x =
+            one.portfolio.fills.iter().find(|f| f.symbol == "X" && f.side == crate::portfolio::Side::Buy).map(|f| f.time);
+        assert_eq!(first_x, Some(51 * RH), "backtest : X achetée à 51 h : {:?}", orders(&one));
+        let stopped = one.portfolio.fills.iter().any(|f| f.symbol == "X" && f.side == crate::portfolio::Side::Sell);
+        assert!(stopped, "backtest : le stop de X joue à 52 h : {:?}", orders(&one));
+        assert!(unfunded(&live).is_empty(), "entrée annulée faute de la vente de W : {:?}", unfunded(&live));
+        assert_eq!(orders(&one), orders(&live), "le direct n'a pas passé les ordres du backtest");
+        assert!(waited > 0, "X n'a jamais attendu avec sa bougie suivante close, test sans valeur");
+        live.portfolio.check_invariants().unwrap();
+    }
+
+    /// Cas 7, 8 et 9, en grand : 3 cryptos aux heures sans échange décalées et aux premiers
+    /// échanges tardifs différents, 45 % par position, 2 places, remplacement à 0,5. Le direct
+    /// passe les ordres du backtest et n'annule pas plus d'entrées pour leur montant que lui
+    /// (les siennes viennent d'une vente exécutée sous la clôture, voir
+    /// `on_a_random_walk_no_announced_entry_is_cancelled_for_its_amount`). Tous les écarts
+    /// sont rapportés, préset par préset, avant d'échouer.
+    #[test]
+    fn reserve_live_matches_backtest_when_cash_is_tight() {
+        let hole = |n: usize, seed: u64, m: i64, r: i64| -> Vec<Candle> {
+            crate::testutil::synthetic(n, seed).into_iter().filter(|c| c.open_time == 0 || (c.open_time / RH) % m != r).collect()
+        };
+        let s0 = hole(1600, 31, 7, 3);
+        let s1 = hole(1600, 32, 5, 1);
+        let s2 = hole(1600, 33, 6, 4);
+        let l1 = |i: i64| if i % 4 == 2 { 7 * M } else { 0 };
+        let l2 = |i: i64| if i % 9 == 7 { 12 * M } else { 0 };
+        let mut gaps: Vec<String> = Vec::new();
+        let mut waited_all = 0;
+        let mut switches = 0;
+        for id in ["supertrend_7_2_1h", "bollinger_reversion_1h", "buy_hold"] {
+            let mut p = find(id).unwrap();
+            p.max_positions = Some(2);
+            p.switch_margin = Some(0.5);
+            p.sizing = Sizing::Fixed { position_pct: 45.0 };
+            let (live, one, waited) =
+                live_and_one_shot(&p, 10_000.0, &[("S0", &s0, &on_time), ("S1", &s1, &l1), ("S2", &s2, &l2)]);
+            assert!(!one.portfolio.fills.is_empty(), "{id} : aucun trade, test sans valeur");
+            live.portfolio.check_invariants().unwrap_or_else(|m| panic!("{id} : {m}"));
+            let (a, b) = (orders(&one), orders(&live));
+            if a != b {
+                let k = a.iter().zip(&b).position(|(x, y)| x != y).unwrap_or(a.len().min(b.len()));
+                gaps.push(format!(
+                    "{id} : ordres différents ({} en backtest, {} en direct) ; premier écart n° {k} : backtest {:?}, direct {:?}",
+                    a.len(),
+                    b.len(),
+                    a.get(k),
+                    b.get(k)
+                ));
+            }
+            let (ul, uo) = (unfunded(&live), unfunded(&one));
+            if ul.len() > uo.len() {
+                gaps.push(format!("{id} : {} entrées annulées pour leur montant en direct, {} en backtest : {:?}", ul.len(), uo.len(), ul.first()));
+            }
+            waited_all += waited;
+            switches += one.portfolio.fills.iter().filter(|f| f.reason.starts_with("CHANGEMENT")).count();
+        }
+        assert!(gaps.is_empty(), "{gaps:#?}");
+        assert!(switches > 0, "aucun remplacement, test sans valeur");
+        assert!(waited_all > 0, "aucun achat n'a attendu sa vente, test sans valeur");
+    }
+
+    /// Engine `cash_bound` (40 % par position, 1 000 €) avec un achat de A encore en attente,
+    /// au montant réservé `budget`, décidé à une clôture précédente.
+    fn with_pending_a(budget: Option<f64>) -> Engine {
+        let mut e = cash_bound(None);
+        e.marks.insert("A".into(), 100.0);
+        e.states.get_mut("A").expect("état").last_bar_open_time = Some(-RH);
+        e.states.get_mut("A").expect("état").pending = Some(Pending {
+            kind: PendingKind::Enter,
+            reason: "SIGNAL D'ENTRÉE".into(),
+            atr: 1.0,
+            volume_24h: None,
+            budget,
+        });
+        e
+    }
+
+    /// Puis B, C, D signalent ; l'achat de A part en dernier.
+    fn then_bcd(e: &mut Engine) {
+        close_all(e, 0, &[("B", true, 3.0), ("C", true, 2.0), ("D", true, 1.0)]);
+        e.on_next_open("A", candle(0, 0.0, 0.0, 0.0, 0.0).close_time + 1, 100.0);
+    }
+
+    /// Cas 5 : un achat en attente sans montant réservé (ordre enregistré avant le 09/10, ou
+    /// décidé par `on_bar_close`) garde quand même sa part : une estimation au dernier prix
+    /// (400 €), plafonnée par la trésorerie. Sans elle, B, C et D prenaient les 1 000 € et A
+    /// tombait à 0,00.
+    #[test]
+    fn reserve_entry_without_budget_reserves_estimate() {
+        let mut e = with_pending_a(None);
+        then_bcd(&mut e);
+        assert!(unfunded(&e).is_empty(), "{:?}", unfunded(&e));
+        let held: Vec<&String> = e.portfolio.positions.keys().collect();
+        assert_eq!(held, ["A", "B", "C"], "400 réservés pour A, 400 pour B, les 200 restants pour C");
+        let d = e.decisions.iter().find(|d| d.symbol == "D").expect("D au journal");
+        assert!(d.reason.starts_with("PLUS DE TRÉSORERIE"), "{}", d.reason);
+        e.portfolio.check_invariants().unwrap();
+    }
+
+    /// Cas 13 : un montant réservé illisible (NaN, infini, négatif, lu d'un état enregistré)
+    /// vaut absent : même estimation, jamais utilisé tel quel (un négatif annulait l'achat).
+    #[test]
+    fn reserve_invalid_budget_treated_as_absent() {
+        for b in [f64::NAN, f64::INFINITY, -50.0] {
+            let mut e = with_pending_a(Some(b));
+            then_bcd(&mut e);
+            assert!(unfunded(&e).is_empty(), "montant réservé {b} : {:?}", unfunded(&e));
+            let held: Vec<&String> = e.portfolio.positions.keys().collect();
+            assert_eq!(held, ["A", "B", "C"], "montant réservé {b}");
+        }
+    }
+
+    /// Cas 12 : un renforcement décidé à une clôture précédente, encore en attente, garde sa
+    /// couche (400 €). Sans elle, B et C prenaient les 600 € restants et le renforcement
+    /// tombait à 0,00.
+    #[test]
+    fn reserve_pending_add_reserves_its_layer() {
+        let mut e = cash_bound(None);
+        close_all(&mut e, 0, &[("A", true, 1.0)]);
+        assert_eq!(e.portfolio.positions["A"].layer_notional, 400.0);
+        e.states.get_mut("A").expect("état").pending = Some(Pending {
+            kind: PendingKind::Add,
+            reason: "RENFORCEMENT 2/3".into(),
+            atr: 1.0,
+            volume_24h: None,
+            budget: None,
+        });
+        close_all(&mut e, 1, &[("B", true, 2.0), ("C", true, 1.0)]);
+        e.on_next_open("A", candle(1, 0.0, 0.0, 0.0, 0.0).close_time + 1, 100.0);
+        let cancelled: Vec<&Decision> = e.decisions.iter().filter(|d| d.reason.contains("ANNUL")).collect();
+        assert!(cancelled.is_empty(), "{cancelled:?}");
+        assert_eq!(e.portfolio.positions["A"].layers, 2, "le renforcement est exécuté");
+        assert!(e.portfolio.positions.contains_key("B"), "B prend les 200 restants");
+        assert!(!e.portfolio.positions.contains_key("C"), "plus rien pour C");
+        e.portfolio.check_invariants().unwrap();
+    }
+
+    /// Cas 10 : la vente qui devait payer l'achat n'arrive jamais. L'achat n'attend pas sans
+    /// fin : jusqu'à 8 bougies après son ouverture prévue il attend (jumeau accepté), au-delà
+    /// il part avec l'argent présent ou il est annulé, et le motif nomme la vente manquante.
+    /// Vente abandonnée (« ORDRE MANQUÉ ») : plus rien à attendre, décision immédiate.
+    #[test]
+    fn reserve_vanished_sale_never_waits_forever() {
+        let planned = 10 * RH;
+        let setup = |exit_pending: bool| -> Engine {
+            let mut e = Engine::new(one_seat(1.0), vec!["W".into(), "X".into()], 1_000.0, CostModel::zero(), 0);
+            e.record = true;
+            e.portfolio.buy("W", 1_000.0, 100.0, 0, &CostModel::zero(), "test").unwrap();
+            if exit_pending {
+                e.states.get_mut("W").expect("état").pending = Some(Pending {
+                    kind: PendingKind::Exit,
+                    reason: "CHANGEMENT → X".into(),
+                    atr: 1.0,
+                    volume_24h: None,
+                    budget: None,
+                });
+            }
+            e.states.get_mut("X").expect("état").pending = Some(Pending {
+                kind: PendingKind::Enter,
+                reason: "CHANGEMENT (remplace W)".into(),
+                atr: 1.0,
+                volume_24h: None,
+                budget: Some(1_000.0),
+            });
+            e
+        };
+        let at = |e: &mut Engine, now: i64| {
+            e.live = Some(LiveClock { now, prices: BTreeMap::new(), running: true });
+            e.on_next_open("X", planned, 100.0);
+            e.live = None;
+        };
+        let bar = find("buy_hold").unwrap().timeframe.millis();
+        let mut e = setup(true);
+        at(&mut e, planned + 30_000);
+        at(&mut e, planned + 8 * bar);
+        assert!(e.states["X"].pending.is_some(), "à 8 bougies, l'achat attend encore la vente de W");
+        assert!(e.decisions.is_empty(), "attendre n'écrit rien au journal : {:?}", e.decisions);
+        at(&mut e, planned + 8 * bar + 1);
+        assert!(e.states["X"].pending.is_none(), "au-delà de 8 bougies, il n'attend plus");
+        let d = unfunded(&e);
+        assert_eq!(d.len(), 1, "{:?}", e.decisions);
+        assert!(d[0].reason.contains("W"), "le motif nomme la vente manquante : {}", d[0].reason);
+
+        let mut gone = setup(false);
+        at(&mut gone, planned + 30_000);
+        assert!(gone.states["X"].pending.is_none(), "sans vente en attente, rien à attendre");
+        assert_eq!(unfunded(&gone).len(), 1, "{:?}", gone.decisions);
+    }
 }
