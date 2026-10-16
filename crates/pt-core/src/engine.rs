@@ -43,6 +43,13 @@ pub const MIN_NOTIONAL: f64 = 5.0;
 /// 0,86 min au plus entre l'ouverture d'une bougie et son traitement.
 pub const MISSED_AFTER_MS: i64 = 5 * 60_000;
 
+/// En direct, un achat dont l'argent doit venir d'une vente pas encore partie (la crypto vendue
+/// n'a pas encore de bougie : aucun échange) attend cette vente au plus ce nombre de bougies
+/// après son ouverture prévue, puis part avec l'argent présent ou est annulé. Mesuré le
+/// 2026-10-16 : les ventes parties après l'achat qu'elles devaient payer avaient 30 min de
+/// retard en médiane, 105 min au plus (7 bougies 15m).
+pub const WAIT_FOR_SALE_BARS: i64 = 8;
+
 /// Mode direct : l'instant présent et le prix du moment de chaque crypto, posés par
 /// [`Engine::advance_live`] le temps d'un passage.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -316,7 +323,7 @@ impl Engine {
         // référence en attente. Il part maintenant à l'ouverture de la première bougie qui existe,
         // en cours ou close, avant toute nouvelle décision, comme le backtest (`closed[i + 1]`) ;
         // tests gapped_feed_live_equals_one_shot_backtest et suivants.
-        let mut carried: Vec<(&String, &Candle, bool, bool)> = Vec::new();
+        let mut carried: Vec<(&String, &Candle, bool, bool, i64)> = Vec::new();
         for (sym, feed) in feeds {
             let Some(st) = self.states.get(sym) else { continue };
             let (Some(p), Some(last)) = (st.pending.as_ref(), st.last_bar_open_time) else { continue };
@@ -326,12 +333,16 @@ impl Engine {
                 None => feed.forming.filter(|f| f.open_time > last).map(|f| (f, false)),
             };
             if let Some((n, closed)) = next {
-                carried.push((sym, n, closed, p.kind == PendingKind::Exit));
+                carried.push((sym, n, closed, p.kind == PendingKind::Exit, last));
             }
         }
-        // Dans l'ordre du temps, les sorties d'abord (elles libèrent la trésorerie).
-        carried.sort_by_key(|&(_, n, _, exit)| (n.open_time, !exit));
-        for (sym, n, closed, _) in carried {
+        // fix-ok: trié par ouverture de la bougie suivante, un achat décidé à t passait avant la
+        // vente décidée au même t dont la bougie suivante venait plus tard, et tombait à « montant
+        // 0.00 » (direct du 15-16/10 : 453 annulations sur 683 après une vente pas encore partie) ;
+        // test reserve_entry_waits_for_sale_next_hour. Dans l'ordre des décisions, les sorties
+        // d'abord (elles libèrent la trésorerie), comme le backtest (`done`, ventes d'abord).
+        carried.sort_by_key(|&(_, n, _, exit, decided)| (decided, !exit, n.open_time));
+        for (sym, n, closed, _, _) in carried {
             self.fill_pending(sym, n, closed);
         }
 
@@ -364,6 +375,13 @@ impl Engine {
             let mut candidates = Vec::new();
             for (sym, p) in &prepared {
                 if let Some(&i) = p.by_time.get(&t) {
+                    // fix-ok: la clôture suivante d'un achat qui attend sa vente effaçait l'achat sans
+                    // trace (`state.pending = None` dans `close_bar`) ; test
+                    // reserve_entry_waits_for_sale_next_hour. Un ordre encore en attente ici n'a pas
+                    // pu partir : ses bougies sont jouées après lui, au passage où il part.
+                    if self.states.get(*sym).is_some_and(|s| s.pending.is_some()) {
+                        continue;
+                    }
                     let bar = &p.feed.closed[i];
                     let mut sig = p.signals[i];
                     // Préchauffage propre à chaque crypto : cotée tard, elle entre tard.
@@ -821,14 +839,31 @@ impl Engine {
                 let fill = self.costs.buy_price(price);
                 let stop = self.preset.exits.stop.and_then(|d| d.below(fill, pending.atr));
                 // fix-ok: l'achat recalculait son montant à l'ouverture (prix ≠ clôture) sans plafond de réservation et prenait la part des entrées suivantes (ordre alphabétique) ; mesuré : 41 des 42 « montant » du backtest donchian_5_3_15m top 50, 66 sur la marche aléatoire.
-                let notional = self
+                let want = self
                     .entry_notional(fill, stop)
                     // fix-ok: un montant réservé illisible lu d'un état enregistré était pris tel
                     // quel ; négatif, il annulait l'achat ; test reserve_invalid_budget_treated_as_absent.
-                    .min(valid_budget(pending.budget).unwrap_or(f64::INFINITY))
-                    .min(self.portfolio.cash);
+                    .min(valid_budget(pending.budget).unwrap_or(f64::INFINITY));
+                // fix-ok: en direct, l'achat partait sans l'argent d'une vente comptée par `allocate`
+                // mais pas encore partie (la crypto vendue n'avait pas encore de bougie) : « montant
+                // 0.00 », puis la vente quand même (direct du 15-16/10 : 453 annulations sur 683, 389
+                // remplacements vendus sans rachat) ; tests reserve_entry_waits_for_sale_same_hour et
+                // suivants. Il attend cette vente, puis part à son ouverture prévue, comme le backtest
+                // qui vend d'abord. Pas après une fermeture (`running`), jamais au-delà de
+                // WAIT_FOR_SALE_BARS bougies.
+                let sales = self.pending_sales();
+                let short = self.portfolio.cash < want && !sales.is_empty();
+                let bar = self.preset.timeframe.millis();
+                if short && self.live.as_ref().is_some_and(|l| l.running && l.now - time <= WAIT_FOR_SALE_BARS * bar) {
+                    self.states.get_mut(symbol).expect("état").pending = Some(pending);
+                    return;
+                }
+                let notional = want.min(self.portfolio.cash);
                 if notional < MIN_NOTIONAL {
-                    let why = format!("ENTRÉE ANNULÉE (montant {notional:.2} < minimum {MIN_NOTIONAL})");
+                    let mut why = format!("ENTRÉE ANNULÉE (montant {notional:.2} < minimum {MIN_NOTIONAL})");
+                    if short {
+                        why.push_str(&format!(" : vente de {} toujours en attente", sales.join(", ")));
+                    }
                     let ind = self.last_snap(symbol);
                     self.log(time, symbol, DecisionKind::Skipped, &why, price, ind);
                     return;
@@ -855,6 +890,17 @@ impl Engine {
                 self.set_levels(symbol, pending.atr);
             }
         }
+    }
+
+    /// Cryptos tenues dont la vente est décidée mais pas encore exécutée.
+    fn pending_sales(&self) -> Vec<String> {
+        self.states
+            .iter()
+            .filter(|(s, st)| {
+                matches!(&st.pending, Some(p) if p.kind == PendingKind::Exit) && self.portfolio.positions.contains_key(*s)
+            })
+            .map(|(s, _)| s.clone())
+            .collect()
     }
 
     /// Euros qu'apporterait la vente de `symbol` au dernier prix connu, frais et
