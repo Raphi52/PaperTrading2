@@ -68,6 +68,12 @@ fn missed(live: Option<&LiveClock>, symbol: &str, planned: i64) -> Option<(i64, 
     Some((live.now, *live.prices.get(symbol)?))
 }
 
+/// Montant réservé utilisable : fini et positif ou nul. Sinon (NaN, infini, négatif, lu d'un
+/// état enregistré), il vaut absent.
+fn valid_budget(b: Option<f64>) -> Option<f64> {
+    b.filter(|x| x.is_finite() && *x >= 0.0)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PendingKind {
     Enter,
@@ -463,6 +469,31 @@ impl Engine {
         self.close_bar(symbol, std::slice::from_ref(bar), sig, atr, f64::NAN, false);
     }
 
+    /// Euros déjà promis aux achats qui attendent leur exécution : le montant réservé de chaque
+    /// entrée (s'il manque ou est illisible, une estimation au dernier prix, plafonnée par la
+    /// trésorerie), et la couche de chaque renforcement décidé à une clôture précédente. Un
+    /// renforcement décidé à cet instant (crypto dans `closed_now`) n'est pas compté : il passe
+    /// à la même ouverture que les entrées de cet instant, comme avant et comme en backtest.
+    fn promised_to_pending_buys(&self, closed_now: &BTreeSet<String>) -> f64 {
+        self.states
+            .iter()
+            .filter_map(|(s, st)| {
+                let p = st.pending.as_ref()?;
+                match p.kind {
+                    PendingKind::Enter => Some(valid_budget(p.budget).unwrap_or_else(|| {
+                        let fill = self.marks.get(s).map(|m| self.costs.buy_price(*m));
+                        let stop = fill.and_then(|f| self.preset.exits.stop.and_then(|d| d.below(f, p.atr)));
+                        self.entry_notional(fill.unwrap_or(f64::NAN), stop).min(self.portfolio.cash)
+                    })),
+                    PendingKind::Add if !closed_now.contains(s) => {
+                        self.portfolio.positions.get(s).map(|pos| pos.layer_notional)
+                    }
+                    _ => None,
+                }
+            })
+            .sum()
+    }
+
     /// Répartit les places entre les cryptos qui ont donné un signal d'entrée au
     /// même instant : les plus fortes d'abord. Places pleines et `switch_margin`
     /// réglée : une candidate remplace la position la plus faible (clôturée au
@@ -476,7 +507,13 @@ impl Engine {
         // la liquidité, plus la vente des positions déjà promises à la sortie (vendues d'abord).
         // Sans ce compte, une entrée était annoncée puis annulée pour « montant 0.00 » (journal
         // du 2026-10-09 : 15 681 entrées sur 25 386), et le remplacement n'était jamais tenté.
-        let mut available = self.portfolio.cash
+        // fix-ok: une entrée encore en attente (créneau sans bougie : Bitvavo n'en rend aucune sans
+        // échange) gardait sa place mais pas son argent ; une autre entrée le recevait, et la première
+        // tombait à « montant 0.00 » (direct du 15-16/10 : 50 annulations sur 683 sans autre cause) ;
+        // tests reserve_a_pending_entry_keeps_its_cash, reserve_entry_without_budget_reserves_estimate,
+        // reserve_pending_add_reserves_its_layer. Jamais négative.
+        let promised = self.promised_to_pending_buys(closed_now);
+        let mut available = (self.portfolio.cash
             + self
                 .portfolio
                 .positions
@@ -485,7 +522,9 @@ impl Engine {
                     Some(p) if p.kind == PendingKind::Exit => Some(self.exit_proceeds(s, p.volume_24h)),
                     _ => None,
                 })
-                .sum::<f64>();
+                .sum::<f64>()
+            - promised)
+            .max(0.0);
         let skip = |e: &mut Engine, c: Candidate, why: &str| {
             e.log(c.time, &c.symbol, DecisionKind::Skipped, why, c.price, c.indicators);
         };
@@ -784,7 +823,9 @@ impl Engine {
                 // fix-ok: l'achat recalculait son montant à l'ouverture (prix ≠ clôture) sans plafond de réservation et prenait la part des entrées suivantes (ordre alphabétique) ; mesuré : 41 des 42 « montant » du backtest donchian_5_3_15m top 50, 66 sur la marche aléatoire.
                 let notional = self
                     .entry_notional(fill, stop)
-                    .min(pending.budget.unwrap_or(f64::INFINITY))
+                    // fix-ok: un montant réservé illisible lu d'un état enregistré était pris tel
+                    // quel ; négatif, il annulait l'achat ; test reserve_invalid_budget_treated_as_absent.
+                    .min(valid_budget(pending.budget).unwrap_or(f64::INFINITY))
                     .min(self.portfolio.cash);
                 if notional < MIN_NOTIONAL {
                     let why = format!("ENTRÉE ANNULÉE (montant {notional:.2} < minimum {MIN_NOTIONAL})");
@@ -1887,8 +1928,8 @@ mod tests {
 
     /// Joue les cryptos d'un bloc (backtest), puis en direct, passage après passage
     /// (`running_passes`), sans frais. Rend (direct, backtest, passages où un achat attendait
-    /// alors que sa bougie suivante existait déjà).
-    fn live_and_one_shot(preset: &Preset, cash: f64, src: &[(&str, &[Candle], Late)]) -> (Engine, Engine, usize) {
+    /// alors que sa bougie suivante existait déjà, passages finis avec un achat en attente).
+    fn live_and_one_shot(preset: &Preset, cash: f64, src: &[(&str, &[Candle], Late)]) -> (Engine, Engine, usize, usize) {
         let syms: Vec<String> = src.iter().map(|x| x.0.to_string()).collect();
         let ext = External::default();
         let all: BTreeMap<String, Feed> =
@@ -1901,6 +1942,7 @@ mod tests {
         let first = src.iter().map(|x| x.1[0].open_time).min().expect("cryptos");
         let last = src.iter().map(|x| x.1.last().expect("bougies").close_time).max().expect("cryptos");
         let mut waited = 0;
+        let mut carried = 0;
         for now in running_passes(first, last) {
             let feeds: BTreeMap<String, Feed> = src
                 .iter()
@@ -1921,9 +1963,10 @@ mod tests {
                         })
                 })
                 .count();
+            carried += live.states.values().filter(|st| matches!(&st.pending, Some(p) if p.kind == PendingKind::Enter)).count();
         }
         live.advance_live(&all, &ext, last + 30_000, |_, _| {});
-        (live, one, waited)
+        (live, one, waited, carried)
     }
 
     /// Une place, tout le capital dans la position, remplacement au-delà de `margin`.
@@ -1974,11 +2017,11 @@ mod tests {
             let b: Vec<Candle> = (0..60).filter(|i| *i != 46).map(flat).collect();
             let c: Vec<Candle> = (1..60).map(flat).collect(); // cotée une heure plus tard
             let late_b = |i: i64| if i == 47 { 7 * M } else { 0 };
-            let (live, one, waited) =
+            let (live, one, _, carried) =
                 live_and_one_shot(&p, 1_000.0, &[("A", &a, &on_time), ("B", &b, &late_b), ("C", &c, &on_time)]);
             assert!(unfunded(&live).is_empty(), "{pct} % : entrée annoncée sans son argent : {:?}", unfunded(&live));
             assert_eq!(orders(&one), orders(&live), "{pct} % : le direct n'a pas passé les ordres du backtest");
-            assert!(waited > 0, "{pct} % : l'achat de B n'a jamais attendu sa bougie, test sans valeur");
+            assert!(carried > 0, "{pct} % : l'achat de B n'est jamais resté en attente d'un passage à l'autre, test sans valeur");
             let spent = |s: &str| -> f64 {
                 live.portfolio.fills.iter().filter(|f| f.symbol == s).map(|f| -f.cash_delta).sum()
             };
@@ -1997,7 +2040,7 @@ mod tests {
         let w: Vec<Candle> = (0..60).map(slow).collect();
         let x: Vec<Candle> = (0..60).map(|i| jumper(i, 50)).collect();
         let late_w = |i: i64| if i == 51 { 8 * M } else { 0 };
-        let (live, one, waited) = live_and_one_shot(&one_seat(1.0), 1_000.0, &[("W", &w, &late_w), ("X", &x, &on_time)]);
+        let (live, one, waited, _) = live_and_one_shot(&one_seat(1.0), 1_000.0, &[("W", &w, &late_w), ("X", &x, &on_time)]);
         let switched =
             one.portfolio.fills.iter().any(|f| f.symbol == "X" && f.side == crate::portfolio::Side::Buy && f.time == 51 * RH);
         assert!(switched, "le backtest doit remplacer W par X à 51 h : {:?}", orders(&one));
@@ -2020,7 +2063,7 @@ mod tests {
         let x: Vec<Candle> = (0..60)
             .map(|i| if i == 52 { candle(52, 110.0, 110.5, 100.0, 109.0) } else { jumper(i, 50) })
             .collect();
-        let (live, one, waited) = live_and_one_shot(&p, 1_000.0, &[("W", &w, &on_time), ("X", &x, &on_time)]);
+        let (live, one, waited, _) = live_and_one_shot(&p, 1_000.0, &[("W", &w, &on_time), ("X", &x, &on_time)]);
         let first_x =
             one.portfolio.fills.iter().find(|f| f.symbol == "X" && f.side == crate::portfolio::Side::Buy).map(|f| f.time);
         assert_eq!(first_x, Some(51 * RH), "backtest : X achetée à 51 h : {:?}", orders(&one));
@@ -2056,7 +2099,7 @@ mod tests {
             p.max_positions = Some(2);
             p.switch_margin = Some(0.5);
             p.sizing = Sizing::Fixed { position_pct: 45.0 };
-            let (live, one, waited) =
+            let (live, one, waited, _) =
                 live_and_one_shot(&p, 10_000.0, &[("S0", &s0, &on_time), ("S1", &s1, &l1), ("S2", &s2, &l2)]);
             assert!(!one.portfolio.fills.is_empty(), "{id} : aucun trade, test sans valeur");
             live.portfolio.check_invariants().unwrap_or_else(|m| panic!("{id} : {m}"));
