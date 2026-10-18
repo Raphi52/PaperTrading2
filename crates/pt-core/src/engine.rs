@@ -5,8 +5,10 @@
 //!   `backtest.py` et `bot.py` avaient chacun leur logique) ;
 //! - décision à la clôture d'une bougie, exécution à l'ouverture de la suivante :
 //!   aucune exécution à un prix que le bot ne pouvait pas connaître ;
-//! - les stops et objectifs agissent DANS la bougie (plus bas / plus haut), le
-//!   stop étant supposé touché en premier si les deux le sont ;
+//! - un stop touché (plus bas, ou ouverture, sous le stop) se vend à la CLÔTURE de la
+//!   bougie : l'application ne pose aucun ordre stop chez Bitvavo et ne voit le stop
+//!   qu'à la bougie close (décision du 18/10/2026) ; l'objectif agit encore DANS la
+//!   bougie, à son prix ; le stop est supposé touché en premier si les deux le sont ;
 //! - on n'achète jamais une deuxième fois un symbole déjà détenu, sauf
 //!   renforcement explicitement borné par la stratégie ;
 //! - la taille d'une position dépend du capital total et de la distance au stop,
@@ -691,12 +693,18 @@ impl Engine {
                 let qty = pos.qty;
                 let stop_label = if state.trailing_active { "STOP SUIVEUR" } else { "STOP" };
                 let mut exit: Option<(f64, String)> = None;
+                let mut seen_at_close = false;
+                // fix-ok: le stop se vendait au prix exact du stop (ou à l'ouverture), comme un
+                // ordre stop posé chez la plateforme. L'application n'en pose aucun : un vrai
+                // compte ne voit le stop touché qu'à la bougie close et vend à sa clôture
+                // (décision du propriétaire, 18/10 ; test stop_touched_sells_at_bar_close_not_at_stop_price).
                 if let Some(stop) = pos.stop {
                     if bar.open <= stop {
-                        exit = Some((bar.open, format!("{stop_label} (ouverture sous le stop)")));
+                        exit = Some((bar.close, format!("{stop_label} (ouverture sous le stop)")));
                     } else if bar.low <= stop {
-                        exit = Some((stop, stop_label.to_string()));
+                        exit = Some((bar.close, stop_label.to_string()));
                     }
+                    seen_at_close = exit.is_some();
                 }
                 if exit.is_none() {
                     if let Some(tp) = pos.take_profit {
@@ -715,9 +723,14 @@ impl Engine {
                         (price, time) = (now_price, now);
                         reason.push_str(" (touché pendant la fermeture, vendu à la réouverture)");
                     }
-                    // Pendant la bougie, seules les bougies déjà closes sont connues.
-                    let before = volume_24h_eur(&hist[..hist.len() - 1], bar.open_time);
-                    let costs = self.fee_memo.order_costs(&self.costs, &self.portfolio.fills, before, qty * price, time);
+                    // Stop vendu à la clôture : la bougie est close, sa liquidité est connue.
+                    // Objectif touché pendant la bougie : seules les bougies déjà closes le sont.
+                    let liquidity = if seen_at_close {
+                        volume_24h
+                    } else {
+                        volume_24h_eur(&hist[..hist.len() - 1], bar.open_time)
+                    };
+                    let costs = self.fee_memo.order_costs(&self.costs, &self.portfolio.fills, liquidity, qty * price, time);
                     self.portfolio.sell_all(symbol, price, time, &costs, &reason).expect("position présente");
                     state.pending = None;
                     state.trailing_active = false;
@@ -1092,29 +1105,95 @@ mod tests {
     }
 
     #[test]
-    fn stop_is_hit_inside_the_bar_and_wins_ties() {
+    fn stop_is_hit_inside_the_bar_wins_ties_and_sells_at_close() {
         let mut e = stop_engine(5.0, Some(5.0));
         let b0 = candle(0, 100.0, 100.0, 100.0, 100.0);
         e.on_bar_close("A", &b0, Signal { enter: true, exit: false }, 1.0);
         e.on_next_open("A", b0.close_time + 1, 100.0);
-        // La bougie suivante touche le stop (95) ET l'objectif (105) : le stop gagne.
+        // La bougie suivante touche le stop (95) ET l'objectif (105) : le stop gagne,
+        // vendu à la clôture de la bougie (101).
         let b1 = candle(1, 100.0, 106.0, 94.0, 101.0);
         e.on_bar_close("A", &b1, Signal::default(), 1.0);
         let t = &e.portfolio.closed[0];
         assert_eq!(t.exit_reason, "STOP");
-        assert!((t.exit_price - 95.0).abs() < 1e-9);
+        assert!((t.exit_price - 101.0).abs() < 1e-9);
         e.portfolio.check_invariants().unwrap();
     }
 
     #[test]
-    fn gap_below_stop_fills_at_open_not_at_stop() {
+    fn gap_below_stop_sells_at_close_not_at_open() {
         let mut e = stop_engine(5.0, None);
         let b0 = candle(0, 100.0, 100.0, 100.0, 100.0);
         e.on_bar_close("A", &b0, Signal { enter: true, exit: false }, 1.0);
         e.on_next_open("A", b0.close_time + 1, 100.0);
         let b1 = candle(1, 90.0, 91.0, 88.0, 89.0);
         e.on_bar_close("A", &b1, Signal::default(), 1.0);
-        assert!((e.portfolio.closed[0].exit_price - 90.0).abs() < 1e-9, "un trou d'ouverture se paie");
+        assert!((e.portfolio.closed[0].exit_price - 89.0).abs() < 1e-9, "vu à la bougie close : vendu à sa clôture");
+    }
+
+    /// Décision du propriétaire (18/10) : aucun ordre stop n'est posé chez Bitvavo, le bot ne
+    /// voit le stop touché qu'à la bougie close et vend à sa clôture, jamais au prix du stop.
+    /// Entrée qui ferait échouer une correction fausse : une clôture différente du stop
+    /// (92 sous un stop à 95, 99 au-dessus) ; un stop encore vendu à 95 la rate.
+    #[test]
+    fn stop_touched_sells_at_bar_close_not_at_stop_price() {
+        let sell = |b1: Candle| {
+            let mut e = stop_engine(5.0, None);
+            let b0 = candle(0, 100.0, 100.0, 100.0, 100.0);
+            e.on_bar_close("A", &b0, Signal { enter: true, exit: false }, 1.0);
+            e.on_next_open("A", b0.close_time + 1, 100.0);
+            e.on_bar_close("A", &b1, Signal::default(), 1.0);
+            e.portfolio.check_invariants().unwrap();
+            let t = e.portfolio.closed.first().expect("stop touché").clone();
+            assert!(t.exit_reason.starts_with("STOP"), "{}", t.exit_reason);
+            (t.exit_price, t.exit_time, b1.close_time)
+        };
+        let (price, time, close_time) = sell(candle(1, 100.0, 100.0, 90.0, 92.0));
+        assert!((price - 92.0).abs() < 1e-9, "clôture sous le stop : vendu à 92, pas à 95 ({price})");
+        assert_eq!(time, close_time, "vendu à la clôture de la bougie");
+        let (price, ..) = sell(candle(1, 100.0, 100.0, 94.0, 99.0));
+        assert!((price - 99.0).abs() < 1e-9, "jumeau : remonté au-dessus du stop, vendu à 99 ({price})");
+        let (price, ..) = sell(candle(1, 90.0, 91.0, 88.0, 89.0));
+        assert!((price - 89.0).abs() < 1e-9, "ouverture sous le stop : vendu à la clôture 89, pas à l'ouverture ({price})");
+        // Jumeau accepté : une bougie qui ne touche pas le stop ne vend rien.
+        let mut e = stop_engine(5.0, None);
+        let b0 = candle(0, 100.0, 100.0, 100.0, 100.0);
+        e.on_bar_close("A", &b0, Signal { enter: true, exit: false }, 1.0);
+        e.on_next_open("A", b0.close_time + 1, 100.0);
+        e.on_bar_close("A", &candle(1, 100.0, 100.0, 95.5, 96.0), Signal::default(), 1.0);
+        assert!(e.portfolio.closed.is_empty(), "plus bas 95,5 au-dessus du stop 95 : rien ne se vend");
+    }
+
+    /// Le stop suiveur touché se vend aussi à la clôture de la bougie.
+    #[test]
+    fn trailing_stop_touched_sells_at_bar_close() {
+        let mut e = stop_engine(50.0, None);
+        e.preset.exits.trailing =
+            Some(crate::strategy::Trailing { activation_pct: 5.0, distance: Distance::Percent(5.0) });
+        let b0 = candle(0, 100.0, 100.0, 100.0, 100.0);
+        e.on_bar_close("A", &b0, Signal { enter: true, exit: false }, 1.0);
+        e.on_next_open("A", b0.close_time + 1, 100.0);
+        e.on_bar_close("A", &candle(1, 100.0, 120.0, 100.0, 118.0), Signal::default(), 1.0);
+        let level = e.portfolio.positions["A"].stop.unwrap();
+        assert!((level - 114.0).abs() < 1e-9, "stop suiveur à 5 % sous le plus haut 120 ({level})");
+        e.on_bar_close("A", &candle(2, 117.0, 117.0, 110.0, 111.0), Signal::default(), 1.0);
+        let t = &e.portfolio.closed[0];
+        assert_eq!(t.exit_reason, "STOP SUIVEUR");
+        assert!((t.exit_price - 111.0).abs() < 1e-9, "vendu à la clôture 111, pas au stop 114 ({})", t.exit_price);
+    }
+
+    /// Garde : l'objectif n'est pas concerné par la décision du 18/10 ; seul touché, il se vend
+    /// toujours à son prix (105), pas à la clôture (101).
+    #[test]
+    fn take_profit_alone_still_sells_at_its_price() {
+        let mut e = stop_engine(5.0, Some(5.0));
+        let b0 = candle(0, 100.0, 100.0, 100.0, 100.0);
+        e.on_bar_close("A", &b0, Signal { enter: true, exit: false }, 1.0);
+        e.on_next_open("A", b0.close_time + 1, 100.0);
+        e.on_bar_close("A", &candle(1, 100.0, 107.0, 99.0, 101.0), Signal::default(), 1.0);
+        let t = &e.portfolio.closed[0];
+        assert_eq!(t.exit_reason, "OBJECTIF");
+        assert!((t.exit_price - 105.0).abs() < 1e-9, "{}", t.exit_price);
     }
 
     #[test]
@@ -1815,7 +1894,8 @@ mod tests {
             e.close_bar("A", &h2, Signal::default(), 1.0, f64::NAN, false);
             let t = e.portfolio.closed.first().expect("stop touché").clone();
             assert_eq!(t.exit_reason, "STOP");
-            t.exit_price / stop
+            assert!(stop > 92.0, "la bougie clôt sous le stop");
+            t.exit_price / 92.0 // vendu à la clôture de la bougie
         };
         let thin = exit_vs_stop(0.001);
         let deep = exit_vs_stop(1_000.0);
@@ -1879,30 +1959,42 @@ mod tests {
         assert_eq!(volume_24h_eur(&[], end), None, "aucun historique : inconnue");
     }
 
-    /// R4 : un stop touché pendant une bougie ne lit pas le volume de cette bougie (encore
-    /// inconnu à l'instant du stop), seulement celui des bougies déjà closes.
+    /// R4, revu le 18/10 : le stop est vendu à la clôture, la bougie est donc close et son
+    /// volume connu ; il compte. L'objectif, lui, se vend encore pendant la bougie : seul le
+    /// volume des bougies déjà closes compte.
     #[test]
-    fn in_bar_exit_liquidity_ignores_the_bar_in_progress() {
+    fn stop_exit_liquidity_counts_the_closed_bar_objective_does_not() {
         let hist: Vec<Candle> =
             scaled(&(0..30).map(|i| candle(i, 100.0, 101.0, 99.0, 100.0)).collect::<Vec<_>>(), 0.001);
-        let exit_price = |hist: &[Candle], stop_bar_volume: f64| {
-            let mut e = stop_engine(5.0, None);
+        // Vente sur `bar` ; prix de sortie rapporté au prix sans coût (clôture ou objectif).
+        let exit_ratio = |hist: &[Candle], tp: Option<f64>, bar: Candle, bar_volume: f64, reference: f64| {
+            let mut e = stop_engine(5.0, tp);
             e.costs = CostModel::default();
             e.close_bar("A", hist, Signal { enter: true, exit: false }, 1.0, f64::NAN, false);
             e.on_next_open("A", hist.last().unwrap().close_time + 1, 100.0);
-            let stop = e.portfolio.positions["A"].stop.expect("stop placé");
             let mut h2 = hist.to_vec();
-            h2.push(Candle { volume: stop_bar_volume, ..candle(30, 100.0, 100.0, 90.0, 92.0) });
+            h2.push(Candle { volume: bar_volume, ..bar });
             e.close_bar("A", &h2, Signal::default(), 1.0, f64::NAN, false);
-            e.portfolio.closed[0].exit_price / stop
+            e.portfolio.closed[0].exit_price / reference
         };
-        assert_eq!(exit_price(&hist, 1.0), exit_price(&hist, 1e9), "le volume de la bougie en cours ne compte pas");
+        let stop_bar = candle(30, 100.0, 100.0, 90.0, 92.0);
+        assert!(
+            exit_ratio(&hist, None, stop_bar, 1e9, 92.0) > exit_ratio(&hist, None, stop_bar, 1.0, 92.0),
+            "stop vendu à la clôture : le volume de la bougie close compte"
+        );
+        let tp_bar = candle(30, 100.0, 107.0, 99.0, 101.0);
+        let tp = 100.0 * 1.05;
+        assert_eq!(
+            exit_ratio(&hist, Some(5.0), tp_bar, 1.0, tp),
+            exit_ratio(&hist, Some(5.0), tp_bar, 1e9, tp),
+            "objectif vendu pendant la bougie : son volume ne compte pas"
+        );
         // Jumeau : le volume des bougies déjà closes, lui, compte.
         let mut busier = hist.clone();
         for c in busier.iter_mut().skip(10) {
             c.volume *= 1_000.0;
         }
-        assert!(exit_price(&busier, 1.0) > exit_price(&hist, 1.0));
+        assert!(exit_ratio(&busier, None, stop_bar, 1.0, 92.0) > exit_ratio(&hist, None, stop_bar, 1.0, 92.0));
     }
 
     /// Cas 12 côté moteur : sans coûts, l'achat se fait au prix d'ouverture exact.
