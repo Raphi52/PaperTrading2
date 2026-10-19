@@ -204,18 +204,6 @@ pub fn catalog() -> Vec<Preset> {
         preset.max_positions = Some(MAX_POSITIONS);
         preset.switch_margin = Some(SWITCH_MARGIN);
     }
-    // Essai du 2026-10-19 (inscrit au registre avant ce code) : mêmes réglages que l'original, mais
-    // un carnet plein ne remplace jamais la position la plus faible. Ajoutées APRÈS la boucle
-    // ci-dessus, sinon elle leur rendrait la marge ; la marge globale reste inchangée.
-    for id in ["sma_trend_50_15m", "donchian_20_10_15m"] {
-        let mut sans = v.iter().find(|p| p.id == id).expect("original de la variante sans remplacement").clone();
-        sans.id = format!("{id}_sans_remplacement");
-        sans.name = format!("{} — sans remplacement", sans.name);
-        sans.description =
-            format!("{} Un carnet plein ne remplace jamais la position la plus faible.", sans.description);
-        sans.switch_margin = None;
-        v.push(sans);
-    }
     v
 }
 
@@ -652,36 +640,6 @@ mod tests {
         assert!((500..=1000).contains(&all.len()), "{} stratégies", all.len());
         let intraday = all.iter().filter(|p| matches!(p.timeframe, Timeframe::M15 | Timeframe::M30)).count();
         assert!(intraday >= 100, "{intraday} stratégies en 15m/30m");
-    }
-
-    #[test]
-    fn sans_remplacement_variants_only_drop_the_switch_margin() {
-        // Essai du 2026-10-19 (lignes inscrites au registre avant ce test) : mêmes réglages que
-        // l'original, mais un carnet plein ne remplace jamais la position la plus faible.
-        const ORIGINALS: [&str; 2] = ["sma_trend_50_15m", "donchian_20_10_15m"];
-        for id in ORIGINALS {
-            let orig = find(id).expect("original au catalogue");
-            let var = find(&format!("{id}_sans_remplacement")).expect("variante absente du catalogue");
-            assert_eq!(orig.switch_margin, Some(SWITCH_MARGIN), "{id} garde sa marge de changement");
-            assert_eq!(var.switch_margin, None, "{id} : la variante ne remplace jamais");
-            assert_eq!(var.max_positions, Some(MAX_POSITIONS), "{id} : même nombre de places");
-            // Empreinte = tous les réglages (unité, règle, sorties, taille, pyramide, filtre, places) :
-            // égale à celle de l'original une fois sa marge retirée, donc rien d'autre ne change.
-            let mut expected = orig.clone();
-            expected.switch_margin = None;
-            assert_eq!(
-                crate::essais::fingerprint(&var),
-                crate::essais::fingerprint(&expected),
-                "{id} : seule la marge de changement doit différer"
-            );
-            assert_eq!(var.family, orig.family);
-        }
-        // Rien d'autre n'a perdu sa marge (la référence n'en a jamais eu) : retirer la marge de tout le
-        // catalogue ajouterait plus de 500 essais d'un coup au registre et ferait monter la barre.
-        let mut sans: Vec<String> =
-            catalog().into_iter().filter(|p| !p.is_benchmark() && p.switch_margin.is_none()).map(|p| p.id).collect();
-        sans.sort();
-        assert_eq!(sans, ["donchian_20_10_15m_sans_remplacement", "sma_trend_50_15m_sans_remplacement"]);
     }
 
     #[test]
