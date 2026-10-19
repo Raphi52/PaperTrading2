@@ -18,6 +18,9 @@
 //!   `start ≤ ouverture` et `ouverture + durée ≤ end` ; la bougie en cours, si
 //!   `start ≤ ouverture ≤ end` ; une fenêtre où aucune ne peut l'être est refusée
 //!   (400, errorCode 205) ; un créneau sans échange n'est pas rendu ;
+//! - (sondé le 2026-10-19, SYN-EUR 15m) une fenêtre de plus de 1 050 créneaux est ramenée à
+//!   ses 1 050 derniers, quel que soit `limit` : une page de moins de 1 000 bougies ne
+//!   prouve donc pas que l'historique est épuisé (paire peu échangée) ;
 //! - une bougie n'a pas d'heure de clôture : elle vaut ouverture + durée − 1 ms ;
 //! - prix et volumes arrivent en texte.
 
@@ -118,34 +121,28 @@ impl BitvavoClient {
     ///
     /// Bitvavo ne rend une bougie close que si `start ≤ ouverture` et `ouverture + Q ≤ end`
     /// (Q = durée d'une bougie), et refuse (400, errorCode 205) une fenêtre où aucune ne
-    /// peut l'être. Après une page pleine dont la plus ancienne ouverture est F, la page
-    /// suivante se termine donc à F (elle rend F − Q), et la lecture s'arrête dès que
-    /// F − Q < `start` : il ne reste aucun créneau entier à lire.
+    /// peut l'être. Il ramène aussi une fenêtre de plus de 1 050 créneaux à ses 1 050
+    /// derniers, puis n'en rend que les `limit` plus récentes (sondes du 2026-10-19,
+    /// `faux_bitvavo`, règle 5). La lecture découpe donc elle-même la période, de la plus
+    /// récente à la plus ancienne, en fenêtres `[lo, hi + Q]` d'au plus 1 000 créneaux
+    /// rendables (la bougie en cours comprise) : aucune n'est coupée par Bitvavo, et une
+    /// page incomplète ou vide ne veut dire que « créneaux sans échange ».
     async fn closed_until(&self, symbol: &str, tf: Timeframe, start_ms: i64, now: i64) -> Result<Vec<Candle>> {
         let q = tf.millis();
         let start = start_ms.max(FIRST_CANDLE_MS);
-        // Premier créneau entier à partir de `start`. S'il n'est pas clos à `now`, aucune
-        // bougie close n'existe ; `[start, now]` serait même refusée si `start` tombe dans
-        // la bougie en cours sans être aligné.
+        // Premier créneau entier à partir de `start`, et ouverture de la bougie en cours.
         let first_slot = start.div_euclid(q) * q + if start.rem_euclid(q) == 0 { 0 } else { q };
-        if first_slot + q > now {
-            return Ok(Vec::new());
-        }
+        let forming = now.div_euclid(q) * q;
         let mut pages: Vec<Vec<Candle>> = Vec::new();
-        let mut end = now;
-        while end >= start {
-            let batch = self.candles(symbol, tf, Some(start), Some(end), MAX_LIMIT).await?;
-            let Some(first) = batch.first().copied() else { break };
-            let full = batch.len() == MAX_LIMIT;
-            pages.push(batch);
-            // fix-ok: cause mesurée — la page suivante finissait à `F − 1` ; Bitvavo ne rendant une bougie close que si ouverture + Q ≤ end, la bougie F − Q était perdue à chaque raccord (cache BTCEUR_15m : 196 trous alignés sur les pages de 1 000 ; BTC-EUR 15m réel avant correction : 2 créneaux absents sur 2 600, tous deux détenus par Bitvavo, reseau-rouge-ffadd6f.log). La fenêtre de 21e2f5a, [S−1, S+Q−1], est refusée (400/205) par le vrai Bitvavo. Rouge sur d55849a et 21e2f5a, vert ici (preuves/2026-10-11-pagination/).
-            // Page incomplète : la période est épuisée (ou la paire n'était pas encore cotée).
-            // `>=` et non plus `>` : `end` ne recule plus de lui-même, une réponse
-            // anormale (F = end) ferait boucler.
-            if !full || first.open_time - q < start || first.open_time >= end {
-                break;
-            }
-            end = first.open_time;
+        // Plus récent créneau clos qui reste à lire.
+        let mut hi = forming - q;
+        // fix-ok: cause mesurée le 2026-10-19 — l'ancienne boucle demandait `[start, end]` et s'arrêtait dès qu'une page comptait moins de 1 000 bougies ; Bitvavo ne regardant que les 1 050 derniers créneaux d'une fenêtre, une paire peu échangée s'arrêtait à la première page (data/cache/LTCEUR_15m.csv : 990 bougies depuis le 2026-10-08, contre 244 849 depuis le 2019-03-08 par fenêtres de 1 000 créneaux ; sondes work/2026-10-19/telechargeur/sonde-*.txt). Test : cas « paire peu échangée » de rend_exactement_les_bougies_du_serveur, rouge avant (rouge.log), vert ici.
+        while hi >= first_slot {
+            // La fenêtre qui finit à l'ouverture de la bougie en cours la rend aussi.
+            let place = MAX_LIMIT as i64 - i64::from(hi + q == forming);
+            let lo = (hi - (place - 1) * q).max(first_slot);
+            pages.push(self.candles(symbol, tf, Some(lo), Some(hi + q), MAX_LIMIT).await?);
+            hi = lo - q;
         }
         Ok(assemble(pages, start_ms, now))
     }
@@ -329,8 +326,17 @@ mod tests {
         let epars: Vec<i64> = creneaux(cote).into_iter().filter(|o| ((o - cote) / q) % 97 != 5).collect();
         // En plus, 1 200 créneaux vides d'affilée : plus long qu'une page.
         let coupure: Vec<i64> = epars.iter().copied().filter(|o| !(300..1500).contains(&((o - cote) / q))).collect();
+        // Paire peu échangée (LTC-EUR 15m : 990 bougies sur ses 1 050 derniers créneaux le
+        // 2026-10-19, SYN-EUR 855) : un créneau sur 6 sans échange.
+        let peu: Vec<i64> = creneaux(cote).into_iter().filter(|o| ((o - cote) / q) % 6 != 2).collect();
         vec![
             Cas { nom: "nominal : plusieurs pages, créneaux vides épars", ouvertures: epars.clone(), start: cote + 3 * q, min_attendu: 2500 },
+            Cas {
+                nom: "paire peu échangée : un créneau sur 6 vide, plusieurs pages (cas LTC)",
+                ouvertures: peu,
+                start: FIRST_CANDLE_MS,
+                min_attendu: 2300,
+            },
             Cas {
                 nom: "page pleine qui s'arrête un créneau après start (cas ONDO)",
                 ouvertures: creneaux(cote),
@@ -393,15 +399,27 @@ mod tests {
                     );
                 }
                 assert!(requetes.iter().all(|r| !r.refusee), "{tf} {} : requête refusée {requetes:?}", cas.nom);
-                assert!(requetes.len() <= attendu.len() / 1000 + 2, "{tf} {} : {} requêtes", cas.nom, requetes.len());
+                // Bitvavo pagine sur le temps : une requête par tranche de 1 000 créneaux
+                // clos à lire, plus une (la première partage la sienne avec la bougie en cours).
+                let debut = cas.start.max(FIRST_CANDLE_MS);
+                let premier = debut.div_euclid(q) * q + if debut.rem_euclid(q) == 0 { 0 } else { q };
+                let creneaux = ((now.div_euclid(q) * q - premier) / q).max(0) as usize;
+                assert!(
+                    requetes.len() <= creneaux / 1000 + 1,
+                    "{tf} {} : {} requêtes pour {creneaux} créneaux",
+                    cas.nom,
+                    requetes.len()
+                );
                 pt_core::candle::validate_series(&v).unwrap();
             }
         }
     }
 
-    /// Fenêtres exactes demandées pour 1 000 bougies closes plus celle en cours : la page
-    /// pleine s'arrête un créneau après `start`, la suivante se termine à sa première
-    /// ouverture (`[start, start+Q]`, qui rend `start`), puis plus rien.
+    /// Fenêtres exactes demandées pour 1 000 bougies closes plus celle en cours : la
+    /// première finit à l'ouverture de la bougie en cours et compte 1 000 créneaux
+    /// rendables (999 clos et celui en cours), donc commence un créneau après `start` ; la
+    /// suivante se termine à sa première ouverture (`[start, start+Q]`, qui rend `start`),
+    /// puis plus rien.
     #[tokio::test]
     async fn page_suivante_finit_a_la_premiere_ouverture() {
         let tf = Timeframe::M15;
@@ -411,7 +429,7 @@ mod tests {
         let faux = faux_bitvavo::lancer(q, (0..=1000).map(|i| start + i * q).collect(), now);
         let v = BitvavoClient::with_base(&faux.base).closed_until("ONDOEUR", tf, start, now).await;
         let fenetres: Vec<(i64, i64)> = faux.requetes().iter().map(|r| (r.start, r.end)).collect();
-        assert_eq!(fenetres, [(start, now), (start, start + q)]);
+        assert_eq!(fenetres, [(start + q, c), (start, start + q)]);
         assert_eq!(v.unwrap().len(), 1000);
     }
 
@@ -557,6 +575,28 @@ mod tests {
         assert!(max_gap <= 12 * H, "trou de {} h", max_gap / H);
         let expected = (v.last().unwrap().open_time - v[0].open_time) / H + 1;
         assert!(v.len() as f64 >= 0.99 * expected as f64, "{} bougies sur {expected} heures", v.len());
+    }
+
+    /// Test réseau : LTC-EUR 15m, paire peu échangée (990 bougies sur ses 1 050 derniers
+    /// créneaux le 2026-10-19), lue depuis 2019 : plus de 200 000 bougies (244 849 par
+    /// fenêtres de 1 000 créneaux le 2026-10-19 ; l'ancienne lecture s'arrêtait à 990).
+    /// Environ 270 requêtes : à lancer seul, jamais en même temps qu'un autre téléchargement.
+    #[tokio::test]
+    #[ignore]
+    async fn live_paire_peu_echangee_lue_jusqu_a_sa_cotation() {
+        let t = std::time::Instant::now();
+        let v = BitvavoClient::new().closed_since("LTCEUR", Timeframe::M15, FIRST_CANDLE_MS).await.unwrap();
+        pt_core::candle::validate_series(&v).unwrap();
+        let q = Timeframe::M15.millis();
+        // Une requête par tranche de 1 000 créneaux depuis FIRST_CANDLE_MS, plus une.
+        let requetes = (crate::now_ms() / q * q - FIRST_CANDLE_MS) / q / 1000 + 1;
+        eprintln!(
+            "LTC-EUR 15m : {} bougies depuis {} ms, en {:.1} s ({requetes} requêtes)",
+            v.len(),
+            v[0].open_time,
+            t.elapsed().as_secs_f64()
+        );
+        assert!(v.len() > 200_000, "{} bougies", v.len());
     }
 
     /// Test réseau : une période qui commence avant la cotation part de la cotation.

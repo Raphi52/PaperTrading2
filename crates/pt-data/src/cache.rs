@@ -6,10 +6,14 @@ use anyhow::{Context, Result};
 use pt_core::{Candle, Timeframe};
 use std::path::{Path, PathBuf};
 
-/// Marque des fichiers écrits depuis la correction des raccords de pages (2026-10-11).
-/// Avant elle, `closed_since` perdait une bougie toutes les 1 000, et `history` ne fait que
-/// compléter la fin d'un fichier : ces trous seraient restés pour toujours.
-const CONTENT_VERSION: &str = "2";
+/// Marque des fichiers écrits par le téléchargeur courant. `history` ne fait que compléter
+/// la fin d'un fichier : un défaut de lecture passé y resterait pour toujours, d'où un
+/// retéléchargement complet, une fois, de tout fichier d'une autre marque.
+/// - « 2 » (2026-10-11) : correction des raccords de pages (une bougie perdue toutes les 1 000) ;
+/// - « 3 » (2026-10-19) : la lecture ne s'arrête plus à la première page de moins de 1 000
+///   bougies (une paire peu échangée ne gardait que ses ~1 050 derniers créneaux :
+///   LTCEUR_15m, 990 bougies au lieu de plus de 240 000).
+const CONTENT_VERSION: &str = "3";
 
 pub struct HistoryCache {
     dir: PathBuf,
@@ -156,9 +160,13 @@ mod tests {
     async fn un_cache_d_avant_les_raccords_est_retelecharge_en_entier() {
         let tf = Timeframe::M15;
         let q = tf.millis();
-        let t0 = 1_700_000_000_000 / q * q;
-        let marche: Vec<i64> = (0..2500).map(|i| t0 + i * q).collect(); // tout est clos depuis longtemps
-        let faux = faux_bitvavo::lancer(q, marche.clone(), crate::now_ms());
+        let now = crate::now_ms();
+        // Le marché s'arrête 10 créneaux avant maintenant : la lecture parcourt chaque
+        // créneau jusqu'à maintenant, un marché éteint depuis des années coûterait une
+        // requête par tranche de 1 000 créneaux vides.
+        let t0 = (now / q - 2510) * q;
+        let marche: Vec<i64> = (0..2500).map(|i| t0 + i * q).collect(); // tout est clos
+        let faux = faux_bitvavo::lancer(q, marche.clone(), now);
         let cache = HistoryCache::new(dossier("raccords"), BitvavoClient::with_base(&faux.base));
         std::fs::create_dir_all(&cache.dir).unwrap();
         // Fichier d'avant la correction : deux bougies perdues à des raccords, demandé depuis t0.
@@ -171,7 +179,11 @@ mod tests {
         let v = cache.history("BTCEUR", tf, start).await.unwrap();
         assert_eq!(ouvertures(&v), marche[1000..], "bougies rendues");
         assert_eq!(ouvertures(&HistoryCache::read(&cache.file("BTCEUR", tf))), marche, "fichier réécrit en entier");
-        assert_eq!(faux.requetes().first().map(|r| r.start), Some(t0), "retéléchargé depuis le plus ancien début connu");
+        assert_eq!(
+            faux.requetes().iter().map(|r| r.start).min(),
+            Some(t0),
+            "retéléchargé depuis le plus ancien début connu"
+        );
 
         faux.oublier();
         let v2 = cache.history("BTCEUR", tf, start).await.unwrap();
@@ -179,6 +191,35 @@ mod tests {
         let r = faux.requetes();
         assert_eq!(r.len(), 1, "un cache marqué ne fait qu'une requête : {r:?}");
         assert_eq!(r[0].start, t0 + 2500 * q, "seule la fin est demandée");
+        std::fs::remove_dir_all(&cache.dir).ok();
+    }
+
+    /// Un cache marqué « 2 » a été écrit par le téléchargeur qui s'arrêtait à la première
+    /// page de moins de 1 000 bougies (avant le 2026-10-19) : pour une paire peu échangée,
+    /// il ne garde que les ~1 050 derniers créneaux (data/cache/LTCEUR_15m.csv : 990
+    /// bougies depuis le 2026-10-08). Il est retéléchargé en entier une fois.
+    #[tokio::test]
+    async fn un_cache_tronque_a_la_premiere_page_incomplete_est_retelecharge() {
+        let tf = Timeframe::M15;
+        let q = tf.millis();
+        let now = crate::now_ms();
+        let c = now / q * q;
+        let t0 = c - 3000 * q;
+        // Un créneau sur 6 sans échange ; dernière bougie bien avant maintenant.
+        let marche: Vec<i64> = (0..2990).map(|i| t0 + i * q).filter(|o| ((o - t0) / q) % 6 != 2).collect();
+        let faux = faux_bitvavo::lancer(q, marche.clone(), now);
+        let cache = HistoryCache::new(dossier("tronque"), BitvavoClient::with_base(&faux.base));
+        std::fs::create_dir_all(&cache.dir).unwrap();
+        let tronque: Vec<Candle> = marche.iter().copied().filter(|&o| o >= c - 1050 * q).map(|o| bougie(o, q)).collect();
+        HistoryCache::write(&cache.file("LTCEUR", tf), &tronque).unwrap();
+        std::fs::write(cache.requested_file("LTCEUR", tf), t0.to_string()).unwrap();
+        std::fs::write(cache.version_file("LTCEUR", tf), "2").unwrap();
+
+        let v = cache.history("LTCEUR", tf, t0).await.unwrap();
+        assert_eq!(ouvertures(&v).len(), marche.len(), "bougies rendues");
+        assert_eq!(ouvertures(&v), marche);
+        assert_eq!(ouvertures(&HistoryCache::read(&cache.file("LTCEUR", tf))), marche, "fichier réécrit en entier");
+        assert_eq!(std::fs::read_to_string(cache.version_file("LTCEUR", tf)).unwrap(), CONTENT_VERSION);
         std::fs::remove_dir_all(&cache.dir).ok();
     }
 }

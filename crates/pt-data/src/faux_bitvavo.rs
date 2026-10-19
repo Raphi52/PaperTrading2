@@ -10,6 +10,14 @@
 //!    errorCode 205 (`[S, S+Q−1]`, `[S−1, S+Q−1]`, `[C+1, maintenant]` refusés).
 //! 3. Un créneau sans échange n'est pas rendu : une fenêtre valide peut rendre `[]` (200).
 //! 4. Les `limit` bougies les plus récentes de la fenêtre, la plus récente d'abord.
+//! 5. Une fenêtre plus large que `PLAFOND_CRENEAUX` (1 050) créneaux est d'abord ramenée à
+//!    ses 1 050 derniers : `start` devient `end − 1 050 Q`. Sondé le 2026-10-19 sur SYN-EUR
+//!    15m, fin E alignée (`data/agents/strategies/work/2026-10-19/telechargeur/sonde-*.txt`) :
+//!    `[E−1048Q, E]` rend jusqu'à E−1048 ; `[E−1052Q, E]`, `[E−1440Q, E]` et `[E−5000Q, E]`
+//!    rendent les mêmes 855 bougies, la plus ancienne en E−1050. Le plafond ne dépend pas de
+//!    `limit` : `[E−2000Q, E]` avec `limit=100` rend les 100 plus récentes (jusqu'à E−144).
+//!    C'est lui qui coupait les paires peu échangées : moins de 1 000 bougies sur 1 050
+//!    créneaux, la page paraissait « incomplète ». Fin non alignée : supposée de même.
 //!
 //! Il ne refuse pas un `limit` au-delà de 1 000 : le 2026-10-11, Bitvavo a accepté 1 001,
 //! 1 440 et 1 441 (le client, lui, n'en demande jamais plus de 1 000).
@@ -42,6 +50,9 @@ impl FauxBitvavo {
     }
 }
 
+/// Largeur maximale d'une fenêtre, en créneaux (règle 5).
+pub const PLAFOND_CRENEAUX: i64 = 1050;
+
 /// Le créneau `o` peut-il être rendu pour la fenêtre `[start, end]` (règle 1) ?
 fn rendable(o: i64, q: i64, c: i64, start: i64, end: i64) -> bool {
     o >= start && o <= c && (o + q <= end || (o == c && o <= end))
@@ -52,6 +63,7 @@ fn rendable(o: i64, q: i64, c: i64, start: i64, end: i64) -> bool {
 /// où il y a eu au moins un échange ; `now` fixe la bougie en cours.
 pub fn repondre(ouvertures: &[i64], q: i64, now: i64, start: i64, end: i64, limit: usize) -> Option<Vec<i64>> {
     let c = now.div_euclid(q) * q;
+    let start = start.max(end - PLAFOND_CRENEAUX * q); // règle 5
     let premier = start.div_euclid(q) * q + if start.rem_euclid(q) == 0 { 0 } else { q };
     if !rendable(premier, q, c, start, end) {
         return None;
@@ -152,5 +164,18 @@ mod tests {
         // Règle 4 : les plus récentes d'abord, `limit` au plus.
         assert_eq!(r(s - 5 * q, s + q).map(|v| v.len()), Some(6));
         assert_eq!(repondre(&tout, q, now, s - 5 * q, s + q, 2), Some(vec![s, s - q]));
+        // Règle 5 (sondes du 2026-10-19, fin E alignée, paire où un créneau sur 6 est vide).
+        let e = c - 10 * q;
+        let peu: Vec<i64> = (1..6000).map(|i| e - i * q).filter(|o| ((e - o) / q) % 6 != 3).collect();
+        let plus_ancienne = |a: i64, lim: usize| repondre(&peu, q, now, a, e, lim).and_then(|v| v.last().copied());
+        assert_eq!(plus_ancienne(e - 1048 * q, 1000), Some(e - 1048 * q));
+        for large in [1052, 1440, 1441, 5000] {
+            assert_eq!(plus_ancienne(e - large * q, 1000), Some(e - 1050 * q), "[E−{large}Q, E]");
+        }
+        assert_eq!(repondre(&peu, q, now, e - 5000 * q, e, 1000).map(|v| v.len()), Some(875));
+        // `limit` sous le plafond : les 100 plus récentes, au-delà des 100 derniers créneaux.
+        let cent = repondre(&peu, q, now, e - 2000 * q, e, 100).unwrap();
+        assert_eq!(cent.len(), 100);
+        assert!(*cent.last().unwrap() < e - 100 * q);
     }
 }
