@@ -204,6 +204,18 @@ pub fn catalog() -> Vec<Preset> {
         preset.max_positions = Some(MAX_POSITIONS);
         preset.switch_margin = Some(SWITCH_MARGIN);
     }
+    // Essai du 2026-10-19 (inscrit au registre avant ce code) : mêmes réglages que l'original, mais
+    // un carnet plein ne remplace jamais la position la plus faible. Ajoutées APRÈS la boucle
+    // ci-dessus, sinon elle leur rendrait la marge ; la marge globale reste inchangée.
+    for id in ["sma_trend_50_15m", "donchian_20_10_15m"] {
+        let mut sans = v.iter().find(|p| p.id == id).expect("original de la variante sans remplacement").clone();
+        sans.id = format!("{id}_sans_remplacement");
+        sans.name = format!("{} — sans remplacement", sans.name);
+        sans.description =
+            format!("{} Un carnet plein ne remplace jamais la position la plus faible.", sans.description);
+        sans.switch_margin = None;
+        v.push(sans);
+    }
     v
 }
 
