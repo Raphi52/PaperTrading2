@@ -204,21 +204,6 @@ pub fn catalog() -> Vec<Preset> {
         preset.max_positions = Some(MAX_POSITIONS);
         preset.switch_margin = Some(SWITCH_MARGIN);
     }
-    // Essai du 2026-10-20 (inscrit au registre avant ce code) : mêmes réglages que l'original, mais
-    // stop à 4 ATR au lieu de 2 et objectif à 1R au lieu de 2R (même niveau en prix). Ajoutées APRÈS
-    // la boucle ci-dessus, qui a déjà posé les places et la marge de changement qu'elles copient.
-    for id in ["williams_r_21_1h", "bollinger_2.5_1h", "cci_20_-100_100_1h"] {
-        let mut large = v.iter().find(|p| p.id == id).expect("original de la variante stop large").clone();
-        large.id = format!("{id}_stop_large");
-        large.name = format!("{} — stop large", large.name);
-        large.description = format!(
-            "{} Stop à 4 ATR au lieu de 2, objectif à 1R au lieu de 2R (même niveau en prix).",
-            large.description
-        );
-        large.exits.stop = Some(Distance::Atr(4.0));
-        large.exits.take_profit = Some(TakeProfit::RMultiple(1.0));
-        v.push(large);
-    }
     v
 }
 
@@ -655,47 +640,6 @@ mod tests {
         assert!((500..=1000).contains(&all.len()), "{} stratégies", all.len());
         let intraday = all.iter().filter(|p| matches!(p.timeframe, Timeframe::M15 | Timeframe::M30)).count();
         assert!(intraday >= 100, "{intraday} stratégies en 15m/30m");
-    }
-
-    #[test]
-    fn stop_large_variants_only_widen_the_stop() {
-        // Essai du 2026-10-20 (lignes inscrites au registre avant ce test) : mêmes réglages que
-        // l'original, mais stop à 4 ATR au lieu de 2 et objectif à 1R au lieu de 2R, soit le même
-        // niveau d'objectif en prix (R = distance au stop). Une seule valeur testée, sans balayage.
-        const ORIGINALS: [&str; 3] = ["williams_r_21_1h", "bollinger_2.5_1h", "cci_20_-100_100_1h"];
-        for id in ORIGINALS {
-            let orig = find(id).expect("original au catalogue");
-            let var = find(&format!("{id}_stop_large")).expect("variante absente du catalogue");
-            assert_eq!(orig.exits.stop, Some(Distance::Atr(2.0)), "{id} garde son stop à 2 ATR");
-            assert_eq!(orig.exits.take_profit, Some(TakeProfit::RMultiple(2.0)), "{id} garde son objectif à 2R");
-            assert_eq!(var.exits.stop, Some(Distance::Atr(4.0)), "{id} : la variante a un stop à 4 ATR");
-            assert_eq!(
-                var.exits.take_profit,
-                Some(TakeProfit::RMultiple(1.0)),
-                "{id} : la variante a un objectif à 1R"
-            );
-            // Empreinte = tous les réglages (unité, règle, sorties, taille, pyramide, filtre, places,
-            // marge) : égale à celle de l'original une fois son stop et son objectif changés, donc
-            // rien d'autre ne diffère (durée bornée, filtre de tendance, places, marge de changement).
-            let mut expected = orig.clone();
-            expected.exits.stop = Some(Distance::Atr(4.0));
-            expected.exits.take_profit = Some(TakeProfit::RMultiple(1.0));
-            assert_eq!(
-                crate::essais::fingerprint(&var),
-                crate::essais::fingerprint(&expected),
-                "{id} : seuls le stop et l'objectif doivent différer"
-            );
-            assert_eq!(var.family, orig.family);
-        }
-        // Rien d'autre ne porte le suffixe : élargir le stop de tout le catalogue ajouterait des
-        // centaines d'essais d'un coup au registre et ferait monter la barre.
-        let mut larges: Vec<String> =
-            catalog().into_iter().filter(|p| p.id.ends_with("_stop_large")).map(|p| p.id).collect();
-        larges.sort();
-        assert_eq!(
-            larges,
-            ["bollinger_2.5_1h_stop_large", "cci_20_-100_100_1h_stop_large", "williams_r_21_1h_stop_large"]
-        );
     }
 
     #[test]
