@@ -204,6 +204,21 @@ pub fn catalog() -> Vec<Preset> {
         preset.max_positions = Some(MAX_POSITIONS);
         preset.switch_margin = Some(SWITCH_MARGIN);
     }
+    // Essai du 2026-10-20 (inscrit au registre avant ce code) : mêmes réglages que l'original, mais
+    // stop à 4 ATR au lieu de 2 et objectif à 1R au lieu de 2R (même niveau en prix). Ajoutées APRÈS
+    // la boucle ci-dessus, qui a déjà posé les places et la marge de changement qu'elles copient.
+    for id in ["williams_r_21_1h", "bollinger_2.5_1h", "cci_20_-100_100_1h"] {
+        let mut large = v.iter().find(|p| p.id == id).expect("original de la variante stop large").clone();
+        large.id = format!("{id}_stop_large");
+        large.name = format!("{} — stop large", large.name);
+        large.description = format!(
+            "{} Stop à 4 ATR au lieu de 2, objectif à 1R au lieu de 2R (même niveau en prix).",
+            large.description
+        );
+        large.exits.stop = Some(Distance::Atr(4.0));
+        large.exits.take_profit = Some(TakeProfit::RMultiple(1.0));
+        v.push(large);
+    }
     v
 }
 
