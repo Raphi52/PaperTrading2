@@ -673,8 +673,9 @@ fn markdown(rows: &[BacktestReport], syms: &[String], c: &Common) -> String {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+    // fix-ok: cause mesurée le 2026-10-22 — le téléchargement par lot partait à 10,7 requêtes/s (644 points/min) sur la limite de 1 000/min par adresse IP que l'application partage (205 à 410 points/min) : jusqu'à 1 054. 125 ms d'écart = 8 requêtes/s au plus (480 points/min), pire cas 890.
     let mut loader = Loader {
-        cache: HistoryCache::new(&cli.cache, BitvavoClient::new()),
+        cache: HistoryCache::new(&cli.cache, BitvavoClient::new().with_min_interval(std::time::Duration::from_millis(125))),
         fear_greed: None,
         series: BTreeMap::new(),
     };

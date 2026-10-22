@@ -28,7 +28,8 @@ use anyhow::{bail, Context, Result};
 use pt_core::{Candle, Timeframe};
 use serde_json::Value;
 use std::collections::BTreeSet;
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 /// Point d'accès public, en lecture seule et sans clé, des données de marché Bitvavo.
 /// Modifiable par la variable d'environnement `PT_MARKET_URL`.
@@ -47,6 +48,11 @@ pub fn market_url() -> String {
 pub struct BitvavoClient {
     http: reqwest::Client,
     base: String,
+    /// Écart minimal entre deux requêtes. `None` : aucun frein (client de l'application).
+    gap: Option<Duration>,
+    /// Instant où la prochaine requête peut partir. Partagé par toutes les copies du client :
+    /// deux copies ne doublent pas le débit.
+    next: Arc<Mutex<Instant>>,
 }
 
 /// Dernières bougies d'un symbole : les clôturées, et celle en cours.
@@ -81,16 +87,35 @@ impl BitvavoClient {
             .user_agent("PaperTrading")
             .build()
             .expect("client HTTP");
-        BitvavoClient { http, base: base.trim_end_matches('/').to_string() }
+        BitvavoClient { http, base: base.trim_end_matches('/').to_string(), gap: None, next: Arc::new(Mutex::new(Instant::now())) }
     }
 
     // fix-ok: cause mesurée le 2026-10-22 — `pt backtest` télécharge à 10,7 requêtes/s (40 pages en 3,72 s, soit 644 points/min de la limite de 1 000/min par adresse IP) alors que l'application en demande 205 à 410 sur la même adresse : jusqu'à 1 054 pour 1 000, blocage de 15 min de l'adresse au-delà. Tests : espace_les_requetes_d_un_client et l_espacement_est_partage_entre_les_copies_du_client.
-    /// Écart minimal entre deux requêtes de ce client (et de ses copies). Sans appel, aucun écart.
-    pub fn with_min_interval(self, _gap: Duration) -> Self {
+    /// Écart minimal entre deux requêtes de ce client et de ses copies. Sans appel (ou avec un
+    /// écart nul), aucun écart : le comportement est celui d'avant.
+    pub fn with_min_interval(mut self, gap: Duration) -> Self {
+        self.gap = (!gap.is_zero()).then_some(gap);
         self
     }
 
+    /// Attend son tour : chaque requête prend le premier créneau libre, `gap` après le précédent.
+    /// Le verrou n'est jamais gardé pendant l'attente.
+    async fn attendre_son_tour(&self) {
+        let Some(gap) = self.gap else { return };
+        let depart = {
+            let mut next = self.next.lock().unwrap_or_else(|e| e.into_inner());
+            let creneau = (*next).max(Instant::now());
+            *next = creneau + gap;
+            creneau
+        };
+        let attente = depart.saturating_duration_since(Instant::now());
+        if !attente.is_zero() {
+            tokio::time::sleep(attente).await;
+        }
+    }
+
     async fn get(&self, url: &str, what: &str) -> Result<Value> {
+        self.attendre_son_tour().await;
         let resp = self.http.get(url).send().await.with_context(|| format!("requête Bitvavo {what}"))?;
         let status = resp.status();
         let body: Value = resp.json().await.with_context(|| format!("réponse Bitvavo illisible pour {what}"))?;
