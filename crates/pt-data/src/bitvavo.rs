@@ -84,6 +84,12 @@ impl BitvavoClient {
         BitvavoClient { http, base: base.trim_end_matches('/').to_string() }
     }
 
+    // fix-ok: cause mesurée le 2026-10-22 — `pt backtest` télécharge à 10,7 requêtes/s (40 pages en 3,72 s, soit 644 points/min de la limite de 1 000/min par adresse IP) alors que l'application en demande 205 à 410 sur la même adresse : jusqu'à 1 054 pour 1 000, blocage de 15 min de l'adresse au-delà. Tests : espace_les_requetes_d_un_client et l_espacement_est_partage_entre_les_copies_du_client.
+    /// Écart minimal entre deux requêtes de ce client (et de ses copies). Sans appel, aucun écart.
+    pub fn with_min_interval(self, _gap: Duration) -> Self {
+        self
+    }
+
     async fn get(&self, url: &str, what: &str) -> Result<Value> {
         let resp = self.http.get(url).send().await.with_context(|| format!("requête Bitvavo {what}"))?;
         let status = resp.status();
@@ -454,6 +460,50 @@ mod tests {
             assert_eq!(v.len(), 1000, "{tf}");
             pt_core::candle::validate_series(&v).unwrap();
         }
+    }
+
+    /// Onze requêtes d'affilée avec un écart de 100 ms : dix écarts, donc au moins 900 ms
+    /// (marge de 100 ms pour l'horloge). Toutes aboutissent, aucune n'est refusée, aucune n'est
+    /// perdue : l'écart ne fait que retarder. Mesure du 2026-10-22 : sans écart, `pt` envoie
+    /// 10,7 requêtes/s (644 points/min) alors que l'application en demande 205 à 410 par minute.
+    #[tokio::test]
+    async fn espace_les_requetes_d_un_client() {
+        let tf = Timeframe::M15;
+        let q = tf.millis();
+        let (c, now) = horloge(tf);
+        let faux = faux_bitvavo::lancer(q, (0..40).map(|i| c - i * q).collect(), now);
+        let client = BitvavoClient::with_base(&faux.base).with_min_interval(Duration::from_millis(100));
+        let debut = std::time::Instant::now();
+        for i in 0..11 {
+            let v = client.candles("BTCEUR", tf, Some(c - 5 * q), Some(c), 1000).await;
+            assert_eq!(v.unwrap_or_else(|e| panic!("requête {i} : {e:#}")).len(), 6, "requête {i}");
+        }
+        let duree = debut.elapsed();
+        let requetes = faux.requetes();
+        assert_eq!(requetes.len(), 11, "{requetes:?}");
+        assert!(requetes.iter().all(|r| !r.refusee), "{requetes:?}");
+        assert!(duree >= Duration::from_millis(900), "11 requêtes en {duree:?} : écart de 100 ms non respecté");
+    }
+
+    /// Le rythme est celui du client ET de ses copies : `closed_since` et `recent` peuvent
+    /// être appelés sur deux copies du même client sans doubler le débit.
+    #[tokio::test]
+    async fn l_espacement_est_partage_entre_les_copies_du_client() {
+        let tf = Timeframe::M15;
+        let q = tf.millis();
+        let (c, now) = horloge(tf);
+        let faux = faux_bitvavo::lancer(q, (0..40).map(|i| c - i * q).collect(), now);
+        let a = BitvavoClient::with_base(&faux.base).with_min_interval(Duration::from_millis(100));
+        let b = a.clone();
+        let debut = std::time::Instant::now();
+        for i in 0..11 {
+            let client = if i % 2 == 0 { &a } else { &b };
+            let v = client.candles("BTCEUR", tf, Some(c - 5 * q), Some(c), 1000).await;
+            assert_eq!(v.unwrap_or_else(|e| panic!("requête {i} : {e:#}")).len(), 6, "requête {i}");
+        }
+        let duree = debut.elapsed();
+        assert_eq!(faux.requetes().len(), 11);
+        assert!(duree >= Duration::from_millis(900), "11 requêtes sur 2 copies en {duree:?} : écart non partagé");
     }
 
     /// Test réseau : chaque fenêtre sondée, rejouée sur Bitvavo (BTC-EUR 15m, qui s'échange
