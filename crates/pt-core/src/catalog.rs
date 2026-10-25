@@ -643,6 +643,48 @@ mod tests {
     }
 
     #[test]
+    fn stop_large_variants_only_widen_the_stop() {
+        // Essai de confirmation du 2026-10-25 (lignes inscrites au registre avant ce test, a7d8b63) :
+        // mêmes réglages que l'original, mais stop à 4 ATR au lieu de 2 et objectif à 1R au lieu de 2R,
+        // soit le même niveau d'objectif en prix (R = distance au stop). Une seule valeur, sans balayage.
+        // Presets de retour à la moyenne en 1h jamais essayés avec ce réglage.
+        const ORIGINALS: [&str; 3] = ["rsi_reversion_1h", "stoch_rsi_1h", "vwap_reversion_1h"];
+        for id in ORIGINALS {
+            let orig = find(id).expect("original au catalogue");
+            let var = find(&format!("{id}_stop_large")).expect("variante absente du catalogue");
+            assert_eq!(orig.exits.stop, Some(Distance::Atr(2.0)), "{id} garde son stop à 2 ATR");
+            assert_eq!(orig.exits.take_profit, Some(TakeProfit::RMultiple(2.0)), "{id} garde son objectif à 2R");
+            assert_eq!(var.exits.stop, Some(Distance::Atr(4.0)), "{id} : la variante a un stop à 4 ATR");
+            assert_eq!(
+                var.exits.take_profit,
+                Some(TakeProfit::RMultiple(1.0)),
+                "{id} : la variante a un objectif à 1R"
+            );
+            // Empreinte = tous les réglages (unité, règle, sorties, taille, pyramide, filtre, places,
+            // marge) : égale à celle de l'original une fois son stop et son objectif changés, donc
+            // rien d'autre ne diffère (durée bornée, filtre de tendance, places, marge de changement).
+            let mut expected = orig.clone();
+            expected.exits.stop = Some(Distance::Atr(4.0));
+            expected.exits.take_profit = Some(TakeProfit::RMultiple(1.0));
+            assert_eq!(
+                crate::essais::fingerprint(&var),
+                crate::essais::fingerprint(&expected),
+                "{id} : seuls le stop et l'objectif doivent différer"
+            );
+            assert_eq!(var.family, orig.family);
+        }
+        // Rien d'autre ne porte le suffixe : élargir le stop de tout le catalogue ajouterait des
+        // centaines d'essais d'un coup au registre et ferait monter la barre.
+        let mut larges: Vec<String> =
+            catalog().into_iter().filter(|p| p.id.ends_with("_stop_large")).map(|p| p.id).collect();
+        larges.sort();
+        assert_eq!(
+            larges,
+            ["rsi_reversion_1h_stop_large", "stoch_rsi_1h_stop_large", "vwap_reversion_1h_stop_large"]
+        );
+    }
+
+    #[test]
     fn every_preset_has_distinct_settings() {
         let mut seen = std::collections::HashMap::new();
         for p in catalog() {
