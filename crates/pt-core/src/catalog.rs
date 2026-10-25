@@ -693,10 +693,7 @@ mod tests {
         let mut larges: Vec<String> =
             catalog().into_iter().filter(|p| p.id.ends_with("_stop_large")).map(|p| p.id).collect();
         larges.sort();
-        assert_eq!(
-            larges,
-            ["rsi_reversion_1h_stop_large", "stoch_rsi_1h_stop_large", "vwap_reversion_1h_stop_large"]
-        );
+        assert_eq!(larges, ["rsi_reversion_1h_stop_large", "stoch_rsi_1h_stop_large", "vwap_reversion_1h_stop_large"]);
     }
 
     #[test]
