@@ -207,7 +207,9 @@ pub fn catalog() -> Vec<Preset> {
     // Essai de confirmation du 2026-10-25 (inscrit au registre avant ce code) : mêmes réglages que
     // l'original, mais stop à 4 ATR au lieu de 2 et objectif à 1R au lieu de 2R (même niveau en prix).
     // Ajoutées APRÈS la boucle ci-dessus, qui a déjà posé les places et la marge de changement qu'elles copient.
-    for id in ["rsi_reversion_1h", "stoch_rsi_1h", "vwap_reversion_1h"] {
+    // Seules celles qui battent leur original selon la règle par paires (2026-10-26) restent au catalogue ;
+    // rsi_reversion_1h_stop_large n'y est plus, sa ligne reste au registre.
+    for id in ["stoch_rsi_1h", "vwap_reversion_1h"] {
         let mut large = v.iter().find(|p| p.id == id).expect("original de la variante stop large").clone();
         large.id = format!("{id}_stop_large");
         large.name = format!("{} — stop large", large.name);
@@ -663,7 +665,10 @@ mod tests {
         // mêmes réglages que l'original, mais stop à 4 ATR au lieu de 2 et objectif à 1R au lieu de 2R,
         // soit le même niveau d'objectif en prix (R = distance au stop). Une seule valeur, sans balayage.
         // Presets de retour à la moyenne en 1h jamais essayés avec ce réglage.
-        const ORIGINALS: [&str; 3] = ["rsi_reversion_1h", "stoch_rsi_1h", "vwap_reversion_1h"];
+        // Règle par paires adoptée le 2026-10-26 : seules ces deux variantes battent leur original.
+        // rsi_reversion_1h_stop_large ne la passe pas (découpage impair 10/13, p = 0,092) : retirée
+        // du catalogue, sa ligne reste au registre (il ne fait que grandir).
+        const ORIGINALS: [&str; 2] = ["stoch_rsi_1h", "vwap_reversion_1h"];
         for id in ORIGINALS {
             let orig = find(id).expect("original au catalogue");
             let var = find(&format!("{id}_stop_large")).expect("variante absente du catalogue");
@@ -693,7 +698,7 @@ mod tests {
         let mut larges: Vec<String> =
             catalog().into_iter().filter(|p| p.id.ends_with("_stop_large")).map(|p| p.id).collect();
         larges.sort();
-        assert_eq!(larges, ["rsi_reversion_1h_stop_large", "stoch_rsi_1h_stop_large", "vwap_reversion_1h_stop_large"]);
+        assert_eq!(larges, ["stoch_rsi_1h_stop_large", "vwap_reversion_1h_stop_large"]);
     }
 
     #[test]
